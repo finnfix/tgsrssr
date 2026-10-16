@@ -117,22 +117,22 @@ async fn main() -> anyhow::Result<()> {
     // full menu registered separately via a ChatMember scope.
     let all_cmds: Vec<teloxide::types::BotCommand> = Command::bot_commands()
         .into_iter()
-        .filter(|c| c.command != "start" && c.command != "/start")
+        .filter(|c| !is_hidden_from_menu(&c.command))
         .collect();
     let user_cmds: Vec<teloxide::types::BotCommand> = all_cmds
         .iter()
-        .filter(|c| c.command != "cookies" && c.command != "loget")
+        .filter(|c| !is_admin_only_command(&c.command))
         .cloned()
         .collect();
     if let Err(e) = bot.set_my_commands(user_cmds).await {
         error!(error = %e, "failed to set bot commands");
     }
-    // Register the full menu including cookies/loget for each admin
-    // (ChatMember scope has the highest priority).
+    // Register the full menu including cookies/loget for each admin.
+    // Use Chat scope (not ChatMember, which is rejected in private chats).
+    // In private chats chat_id == user_id, so this targets the admin's DM.
     for &admin in &cfg.admin_user_ids {
-        let scope = teloxide::types::BotCommandScope::ChatMember {
+        let scope = teloxide::types::BotCommandScope::Chat {
             chat_id: teloxide::types::Recipient::Id(teloxide::types::ChatId(admin)),
-            user_id: teloxide::types::UserId(admin as u64),
         };
         if let Err(e) = bot.set_my_commands(all_cmds.clone()).scope(scope).await {
             error!(admin = admin, error = %e, "failed to set admin command menu");
@@ -367,4 +367,68 @@ async fn register_pending_ops_sweep_job(
 
     info!("pending-ops sweep job registered");
     Ok(())
+}
+
+/// Commands hidden from the command menu entirely (still triggerable).
+/// teloxide 0.17 derive emits command names with a "/" prefix, but match
+/// both spellings to stay robust across versions.
+fn is_hidden_from_menu(cmd: &str) -> bool {
+    matches!(cmd.trim_start_matches('/'), "start")
+}
+
+/// Admin-only commands excluded from the default (non-admin) menu.
+fn is_admin_only_command(cmd: &str) -> bool {
+    matches!(cmd.trim_start_matches('/'), "cookies" | "loget")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_filtering_hides_start_and_admin_commands() {
+        // /start is hidden from every menu but remains triggerable.
+        assert!(is_hidden_from_menu("/start"));
+        assert!(is_hidden_from_menu("start"));
+        assert!(!is_hidden_from_menu("/set"));
+
+        // /cookies and /loget are excluded from the default user menu.
+        // Regression guard: teloxide 0.17 derive emits the "/"-prefixed
+        // form, which the old equality checks ("cookies"/"loget") missed.
+        assert!(is_admin_only_command("/cookies"));
+        assert!(is_admin_only_command("/loget"));
+        assert!(is_admin_only_command("cookies"));
+        assert!(is_admin_only_command("loget"));
+        assert!(!is_admin_only_command("/find"));
+        assert!(!is_admin_only_command("/about"));
+
+        // The derived command list must actually carry the "/" prefix;
+        // if this ever changes the filters above still work, but this
+        // assertion documents the current behaviour.
+        let names: Vec<String> = Command::bot_commands()
+            .into_iter()
+            .map(|c| c.command)
+            .collect();
+        assert!(names.contains(&"/cookies".to_string()));
+        assert!(names.contains(&"/loget".to_string()));
+        assert!(names.contains(&"/start".to_string()));
+
+        // End-to-end shape of the two menus.
+        let all_cmds: Vec<_> = Command::bot_commands()
+            .into_iter()
+            .filter(|c| !is_hidden_from_menu(&c.command))
+            .collect();
+        let user_cmds: Vec<_> = all_cmds
+            .iter()
+            .filter(|c| !is_admin_only_command(&c.command))
+            .cloned()
+            .collect();
+        assert!(!user_cmds.iter().any(|c| c.command == "/cookies"));
+        assert!(!user_cmds.iter().any(|c| c.command == "/loget"));
+        assert!(!user_cmds.iter().any(|c| c.command == "/start"));
+        assert!(all_cmds.iter().any(|c| c.command == "/cookies"));
+        assert!(all_cmds.iter().any(|c| c.command == "/loget"));
+        // loget sits between cookies and about; about stays last.
+        assert_eq!(all_cmds.last().map(|c| c.command.as_str()), Some("/about"));
+    }
 }
