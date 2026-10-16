@@ -1,0 +1,9 @@
+/target
+/data
+/media
+/logs
+# compose.yaml 含密钥（token），模板见 compose.example.yaml
+compose.yaml
+*.db
+*.db-wal
+*.db-shm

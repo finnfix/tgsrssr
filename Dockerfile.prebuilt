@@ -1,0 +1,3 @@
+FROM tgsrssr-base:latest
+COPY target/release/tgsrssr /usr/local/bin/tgsrssr
+CMD ["tgsrssr"]

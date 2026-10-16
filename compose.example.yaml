@@ -1,0 +1,167 @@
+## tgsrssr compose 模板（所有可选项均按代码默认值）。
+## tgsrssr compose template (all optional values match code defaults).
+##
+## 新部署参考：复制为 compose.yaml，填入 TELOXIDE_TOKEN / ADMIN_USER_IDS，
+## 按需取消注释调优项。除必填项外，全部注释项均与代码默认值一致，不设置时行为完全相同。
+## For new deployments: copy to compose.yaml, fill in TELOXIDE_TOKEN / ADMIN_USER_IDS,
+## and uncomment tuning options as needed. All commented values match code defaults —
+## leaving them unset behaves identically.
+##
+## 注释约定：## 为说明文字；# 开头且形如 KEY: value 的行是可取消注释的可选参数。
+## Comment convention: ## lines are documentation; lines starting with # followed by
+## KEY: value are optional parameters you can uncomment.
+##
+## 注意：本模板为 Linux / WSL2 host 网络形态。network_mode: host 仅在 Linux
+## 原生 Docker 下生效；macOS / Windows Docker Desktop 需改用 bridge 网络并相应调整代理与卷挂载配置。
+## Note: this template uses Linux / WSL2 host networking. network_mode: host only works
+## on native Linux Docker; macOS / Windows Docker Desktop requires bridge networking
+## with adjusted proxy and volume settings.
+services:
+  tgsrssr:
+    ## 默认拉取预构建镜像（无需本地编译）。如需从源码构建，注释 image 行并取消注释 build 行。
+    ## Pulls a prebuilt image by default (no local compilation). To build from source,
+    ## comment out the image line and uncomment the build line.
+    image: ghcr.io/finnfix/tgsrssr:latest
+    # build: .
+    container_name: tgsrssr
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ## ===== 必填 / Required =====
+
+      ## BotFather token
+      TELOXIDE_TOKEN: "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
+
+      ## 管理员（逗号分隔）；可用 /cookies、/loget，接收平台告警
+      ## Admins (comma-separated); can use /cookies & /loget, receive platform alerts
+      ADMIN_USER_IDS: "123456789"
+
+      ## 用户白名单（逗号分隔，可选——仅管理员使用时可留空）
+      ## User whitelist (comma-separated, optional — can be empty for admin-only use)
+      ALLOWED_USER_IDS: "123456789,987654321"
+
+      ## ===== 访问控制 / Access control =====
+
+      ## 默认 false=仅管理员+白名单可用；true=对所有用户开放
+      ## Default false = admins + whitelist only; true = open to all users
+      # OPEN_TO_ALL: "false"
+
+      ## ===== 平台/网络拓扑（按部署环境调整）/ Platform & network topology =====
+
+      ## bot-api 容器内的媒体目录路径（file:// 零拷贝），默认即此值
+      ## Media directory path inside the bot-api container (file:// zero-copy); this is the default
+      BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
+
+      ## 默认空=官方 API；本地 bot-api 时设置
+      ## Empty = official API; set when using a local bot-api
+      # BOT_API_URL: "http://127.0.0.1:8081"
+
+      ## 默认空=直连
+      ## Empty = direct connection
+      # RSS_PROXY: "socks5h://127.0.0.1:1080"
+
+      ## 默认空；直连白名单
+      ## Empty; direct-connect whitelist
+      # RSS_NO_PROXY: "localhost,127.0.0.1,.local"
+
+      ## 默认空；跳过 TLS 校验的主机
+      ## Empty; hosts skipping TLS verification
+      # RSS_INSECURE_HOSTS: ""
+
+      ## ===== 媒体 / Media =====
+
+      ## 默认 100；超限视频不推送，降级纯文本并通知
+      ## Default 100; oversized videos are not pushed, fall back to text with a notice
+      # MAX_VIDEO_PUSH_MB: "100"
+
+      ## 默认 80（须覆盖 outbox 72h 重试窗口）
+      ## Default 80 (must cover the 72h outbox retry window)
+      # MEDIA_OUTBOUND_TTL_HOURS: "80"
+
+      ## 默认 10 / Default 10
+      # MEDIA_MAX_SIZE_GB: "10"
+
+      ## 默认 8.0；高宽比超阈值的图片转文档发送
+      ## Default 8.0; images exceeding this aspect ratio are sent as documents
+      # LONG_IMAGE_ASPECT_RATIO: "8.0"
+
+      ## ===== 图片中转（默认关闭：BASE_URL 为空即不生效）=====
+      ## ===== Image relay (off by default: empty BASE_URL disables it) =====
+
+      ## 默认 true / Default true
+      # IMG_RELAY_ENABLED: "true"
+
+      ## 默认空；自建反代地址（如 Cloudflare Worker）
+      ## Empty; self-hosted reverse proxy URL (e.g. Cloudflare Worker)
+      # IMG_RELAY_BASE_URL: ""
+
+      ## 默认空；走中转的域名（逗号分隔）
+      ## Empty; domains routed through the relay (comma-separated)
+      # IMG_RELAY_DOMAINS: ""
+
+      ## ===== 调度与并发 / Scheduling & concurrency =====
+
+      ## 默认 5 / Default 5
+      # SCHEDULER_INTERVAL_MINUTES: "5"
+
+      ## 默认 8 / Default 8
+      # FETCH_CONCURRENCY: "8"
+
+      ## 默认 4 / Default 4
+      # DOWNLOAD_CONCURRENCY: "4"
+
+      ## 默认 20；连续失败停源阈值
+      ## Default 20; consecutive-failure threshold to pause a source
+      # MAX_FETCH_ERRORS: "20"
+
+      ## ===== 清理与保留 / Cleanup & retention =====
+
+      ## 默认 180 / Default 180
+      # SENT_ENTRIES_RETENTION_DAYS: "180"
+
+      ## 默认 60 / Default 60
+      # CLEANUP_INTERVAL_MINUTES: "60"
+
+      ## 默认 30 / Default 30
+      # LOG_RETENTION_DAYS: "30"
+
+      ## 默认 7；每日 WAL checkpoint 快照保留天数
+      ## Default 7; daily WAL checkpoint snapshot retention
+      # BACKUP_RETENTION_DAYS: "7"
+
+      ## 默认 30；file_id 上传去重缓存
+      ## Default 30; file_id upload dedup cache
+      # FILE_ID_CACHE_RETENTION_DAYS: "30"
+
+      ## 默认 5000；/find 反查登记表行数上限
+      ## Default 5000; /find reverse-lookup registry row limit
+      # SENT_MESSAGES_MAX_ROWS: "5000"
+
+      ## ===== 日志 / Logging =====
+
+      ## 默认 info（tracing EnvFilter 语法）
+      ## Default info (tracing EnvFilter syntax)
+      # RUST_LOG: "info"
+    volumes:
+      - ./data:/app/data
+      ## 媒体目录（单容器部署用本地目录即可）
+      ## Media directory (a local directory is fine for single-container deployments)
+      - ./media:/app/media
+      ## 仅当部署本地 telegram-bot-api 时：把上面 ./media 换成与 bot-api 共享的宿主目录，
+      ## 并追加 bot-api 容器内的映射路径（file:// 零拷贝），同时设置 BOT_API_URL 与 BOT_API_MEDIA_DIR，例如：
+      ## Only when deploying a local telegram-bot-api: replace ./media above with a host
+      ## directory shared with bot-api, add the bot-api container's mapped path (file:// zero-copy),
+      ## and set BOT_API_URL and BOT_API_MEDIA_DIR. Example:
+      # - ../telegram-bot-api/media:/app/media
+      # - ../telegram-bot-api/media:/var/lib/telegram-bot-api-media
+      - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"

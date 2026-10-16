@@ -1,0 +1,12 @@
+FROM debian:trixie-slim
+# Mirror acceleration (optional). Defaults to official sources.
+# China users: docker build -f Dockerfile.base --build-arg APT_MIRROR=mirrors.aliyun.com -t tgsrssr-base:latest .
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV DB_PATH=/app/data/rss_bot.db
+ENV MEDIA_DIR=/app/media
+ENV LOG_DIR=/app/logs

@@ -1,0 +1,1483 @@
+//! X (Twitter) native fetcher: calls x.com's internal GraphQL API using a
+//! login cookie (`auth_token`). Mirrors RSSHub's web-api approach.
+//!
+//! Cookie resolution: global runtime store (`state.cookies["x"]`)
+//! — set via the /cookies command by admins, persisted in the `settings`
+//! table under `cookie:x`. (Since v1.0.0 there is no env seed; storage is
+//! purely DB-backed.)
+//!
+//! Subscription URL format: `https://x.com/<screen_name>` (twitter.com
+//! variants also accepted).
+//!
+//! The fetched tweets are converted into feed-rs `Entry` objects with media
+//! embedded as `<img>`/`<video>` tags in the content body, so the existing
+//! media extraction / rendering pipeline works unchanged.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, OnceLock};
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use feed_rs::model::Entry;
+use serde_json::Value;
+use tokio::sync::Mutex;
+
+use crate::state::AppState;
+
+/// Public Bearer token used by x.com's web client (same for all users).
+const BEARER: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+
+const BASE_API: &str = "https://x.com/i/api";
+
+/// GraphQL query IDs — hardcoded FALLBACK only. At runtime the fresh IDs
+/// are auto-refreshed from the community-maintained TwitterInternalAPIDocument
+/// (see `refresh_query_ids`); these constants are the last-resort fallback
+/// when the document is unreachable.
+/// Last synced from RSSHub / TwitterInternalAPIDocument 2026-09-28.
+const QID_USER_BY_SCREEN_NAME: &str = "Gb-d6r0vxPOADdG62OEBpQ";
+const QID_USER_TWEETS: &str = "eoJ5zbv51Z_KVl81v9PmLQ";
+
+/// Features payload for UserByScreenName.
+const FEATURES_USER: &str = r#"{"hidden_profile_subscriptions_enabled":true,"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_is_identity_verified_enabled":true,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"responsive_web_twitter_article_notes_tab_enabled":true,"subscriptions_feature_can_gift_premium":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}"#;
+
+/// Features payload for UserTweets (timeline).
+const FEATURES_FEED: &str = r#"{"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_enhance_cards_enabled":false}"#;
+
+// ---------------------------------------------------------------------------
+// URL detection
+// ---------------------------------------------------------------------------
+
+/// True when the feed URL is an X/Twitter user profile that should be
+/// fetched natively.
+pub fn is_x_url(url: &str) -> bool {
+    parse_screen_name(url).is_some()
+}
+
+/// Parse screen_name from an X user profile URL:
+/// https://x.com/<name>, https://twitter.com/<name>, https://www.x.com/<name>
+/// Excludes paths like /i/, /home, /search, /settings, etc.
+pub fn parse_screen_name(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let host = u.host_str()?.to_lowercase();
+    let is_x_host = matches!(
+        host.as_str(),
+        "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com" | "mobile.twitter.com"
+    );
+    if !is_x_host {
+        return None;
+    }
+    let segs: Vec<&str> = u.path_segments()?.filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let name = segs[0];
+    // Reject reserved paths.
+    const RESERVED: &[&str] = &[
+        "i", "home", "search", "explore", "notifications", "messages",
+        "settings", "compose", "login", "signup", "logout", "hashtag",
+    ];
+    if RESERVED.contains(&name) {
+        return None;
+    }
+    // Screen names: 1-15 alphanumeric/underscore chars.
+    if name.is_empty() || name.len() > 15 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Main fetch entry point
+// ---------------------------------------------------------------------------
+
+/// Registry fetch entry: parse the screen name from the full feed URL, then
+/// delegate to [`fetch_x_user`]. Called via `PlatformDef.fetch` (URL passed
+/// owned so the returned future borrows only from `state`).
+pub async fn fetch_by_url(
+    state: &AppState,
+    url: String,
+) -> anyhow::Result<crate::fetcher::FetchResult> {
+    let screen_name = parse_screen_name(&url)
+        .ok_or_else(|| anyhow::anyhow!("Invalid X user profile URL: {}", url))?;
+    fetch_x_user(state, &screen_name).await
+}
+
+/// Fetch an X user's timeline and convert to FetchResult.
+pub async fn fetch_x_user(
+    state: &AppState,
+    screen_name: &str,
+) -> anyhow::Result<crate::fetcher::FetchResult> {
+    let auth_token = match state.get_cookie("x").await {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => anyhow::bail!("X feeds require an admin-configured login cookie (use the /cookies command)"),
+    };
+
+    // ct0 is cached (1h TTL): avoids every X feed hitting x.com once per fetch round.
+    let mut ct0 = obtain_ct0_cached(state, &auth_token).await?;
+
+    // The cached ct0 may have expired (403): clear the cache, re-fetch ct0 and
+    // retry the whole flow once. Only a second 403 means the auth_token cookie
+    // itself is dead.
+    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name).await;
+    let result = match result {
+        Err(e) if e.downcast_ref::<StaleCt0Error>().is_some() => {
+            tracing::info!(screen_name = screen_name, "X ct0 looks stale; refreshing and retrying once");
+            clear_ct0_cache(&auth_token).await;
+            ct0 = obtain_ct0(state, &auth_token).await?;
+            {
+                let mut cache = ct0_cache().lock().await;
+                cache.insert(auth_token.clone(), Ct0Entry {
+                    ct0: ct0.clone(),
+                    fetched_at: Instant::now(),
+                });
+            }
+            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name).await
+        }
+        other => other,
+    };
+    result.map_err(|e| {
+        if e.downcast_ref::<StaleCt0Error>().is_some() {
+            anyhow::anyhow!("X cookie expired (HTTP 403); please update via /cookies")
+        } else {
+            e
+        }
+    })
+}
+
+async fn fetch_x_user_with_ct0(
+    state: &AppState,
+    auth_token: &str,
+    ct0: &str,
+    screen_name: &str,
+) -> anyhow::Result<crate::fetcher::FetchResult> {
+    // Step 2: resolve screen_name → rest_id + display name.
+    let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;
+
+    // Step 3: fetch user timeline.
+    let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name).await?;
+
+    // Step 4: convert to entries (dedup by entry id within the batch, matching
+    // the Weibo behavior; fix for #8).
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Conversion-failure counter (summarized in a warn at batch end; ensures an
+    // API redesign that fails the whole batch doesn't leave zero traces,
+    // aligned with the None-warn convention of Weibo's mblog_to_entry).
+    let mut dropped = 0usize;
+    for tweet in &tweets {
+        if let Some(e) = tweet_to_entry(tweet, screen_name, &display_name) {
+            if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
+                entries.push(e);
+            }
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            screen_name = screen_name,
+            dropped = dropped,
+            total = tweets.len(),
+            "X tweets dropped during conversion (legacy missing?)"
+        );
+    }
+
+    // Sort newest first.
+    crate::platforms::sort_entries_newest_first(&mut entries);
+
+    Ok(crate::fetcher::FetchResult::platform(Some(display_name), entries))
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/// Visit x.com with the auth_token cookie to obtain ct0 (CSRF token).
+async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String> {
+    // Use a client with auto-redirect disabled: when the cookie is invalid
+    // x.com 302-redirects to the login page, and a redirect-following client
+    // ends up with the final page so is_redirection() never fires
+    // (same lesson as Weibo's getIndex; see the comment on
+    // fetch_client_no_redirect_for_url in weibo.rs).
+    let client = state.fetch_client_no_redirect_for_url("https://x.com");
+    let resp = client
+        .get("https://x.com")
+        .header("Cookie", format!("auth_token={}", auth_token))
+        .header("User-Agent", crate::state::BROWSER_UA)
+        .send()
+        .await
+        .context("x.com request failed")?;
+
+    // Extract ct0 from Set-Cookie headers.
+    let mut ct0 = String::new();
+    for value in resp.headers().get_all("set-cookie") {
+        if let Ok(s) = value.to_str() {
+            if let Some(token) = extract_cookie_value(s, "ct0") {
+                ct0 = token;
+                break;
+            }
+        }
+    }
+    if ct0.is_empty() {
+        // If no ct0 in response, the cookie is likely invalid (redirect to login).
+        if resp.status().is_redirection() {
+            anyhow::bail!("X cookie expired (302 redirect to login); please update via /cookies");
+        }
+        anyhow::bail!("Failed to obtain ct0 from x.com (the cookie may have expired); please update via /cookies");
+    }
+    Ok(ct0)
+}
+
+/// The ct0 lifetime is measured in hours; cache for 1 hour to avoid every X
+/// feed hitting x.com once per fetch round (on a serial channel each extra
+/// request adds extra risk-control exposure). After a cookie update the
+/// auth_token changes and the cache key no longer matches, so the entry
+/// expires automatically.
+const CT0_TTL: Duration = Duration::from_secs(3600);
+
+struct Ct0Entry {
+    ct0: String,
+    fetched_at: Instant,
+}
+
+static CT0_CACHE: OnceLock<Mutex<std::collections::HashMap<String, Ct0Entry>>> = OnceLock::new();
+
+fn ct0_cache() -> &'static Mutex<std::collections::HashMap<String, Ct0Entry>> {
+    CT0_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cached ct0 lookup: returns the cached token when it matches the current
+/// auth_token and is within TTL; otherwise fetches fresh and caches it.
+/// The HashMap is keyed by auth_token, so multiple users stay independent
+/// and never evict each other's entries.
+async fn obtain_ct0_cached(state: &AppState, auth_token: &str) -> anyhow::Result<String> {
+    {
+        let cache = ct0_cache().lock().await;
+        if let Some(entry) = cache.get(auth_token) {
+            if entry.fetched_at.elapsed() < CT0_TTL {
+                return Ok(entry.ct0.clone());
+            }
+        }
+    }
+    let ct0 = obtain_ct0(state, auth_token).await?;
+    let mut cache = ct0_cache().lock().await;
+    // Opportunistically prune expired entries: after a user switches cookies,
+    // old auth_token keys would linger forever and grow unboundedly with each
+    // cookie change (~100 bytes per entry — slow growth, but worth preventing).
+    cache.retain(|_, entry| entry.fetched_at.elapsed() < CT0_TTL);
+    cache.insert(auth_token.to_string(), Ct0Entry {
+        ct0: ct0.clone(),
+        fetched_at: Instant::now(),
+    });
+    Ok(ct0)
+}
+
+/// Invalidate the cached ct0 for a specific auth_token (called when a request signals a stale token).
+async fn clear_ct0_cache(auth_token: &str) {
+    let mut cache = ct0_cache().lock().await;
+    cache.remove(auth_token);
+}
+
+/// Extract a named cookie value from a Set-Cookie header string.
+fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}=", name);
+    let first_part = set_cookie.split(';').next()?;
+    let first_part = first_part.trim();
+    if first_part.starts_with(&prefix) {
+        let val = &first_part[prefix.len()..];
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL query-ID auto-refresh
+// ---------------------------------------------------------------------------
+
+/// Community-maintained document tracking the current x.com GraphQL query IDs.
+/// Refreshed whenever X ships a new frontend; RSSHub uses the same source.
+const QUERY_ID_DOC_URL: &str =
+    "https://cdn.jsdelivr.net/gh/fa0311/TwitterInternalAPIDocument@master/docs/json/API.json";
+
+/// Cached query IDs stay fresh this long before we re-fetch the document.
+const QUERY_ID_TTL: Duration = Duration::from_secs(6 * 3600);
+
+const OP_USER_BY_SCREEN_NAME: &str = "UserByScreenName";
+const OP_USER_TWEETS: &str = "UserTweets";
+
+struct QueryIdCache {
+    ids: HashMap<String, String>,
+    fetched_at: Option<Instant>,
+}
+
+static QUERY_IDS: OnceLock<Mutex<QueryIdCache>> = OnceLock::new();
+
+fn query_id_cache() -> &'static Mutex<QueryIdCache> {
+    QUERY_IDS.get_or_init(|| {
+        Mutex::new(QueryIdCache {
+            ids: HashMap::new(),
+            fetched_at: None,
+        })
+    })
+}
+
+/// Hardcoded fallback queryId for an operation (used when the document is
+/// unreachable and nothing has been cached yet).
+fn fallback_query_id(op: &str) -> &'static str {
+    match op {
+        OP_USER_BY_SCREEN_NAME => QID_USER_BY_SCREEN_NAME,
+        OP_USER_TWEETS => QID_USER_TWEETS,
+        _ => "",
+    }
+}
+
+/// Resolve the queryId for an operation. Prefers freshly-fetched IDs (cached
+/// for [`QUERY_ID_TTL`]); on a cache miss / expiry fetches the document; on
+/// fetch failure falls back to any stale cached ID, then to the constant.
+/// `force` bypasses the TTL (used after a suspected stale-ID 404).
+async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
+    // Fast path: a fresh cached ID.
+    {
+        let cache = query_id_cache().lock().await;
+        if !force {
+            if let Some(at) = cache.fetched_at {
+                if at.elapsed() < QUERY_ID_TTL {
+                    if let Some(id) = cache.ids.get(op) {
+                        return id.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: refresh from the document.
+    match fetch_query_ids(state).await {
+        Ok(ids) => {
+            let mut cache = query_id_cache().lock().await;
+            let resolved = ids.get(op).cloned();
+            cache.ids = ids;
+            cache.fetched_at = Some(Instant::now());
+            resolved.unwrap_or_else(|| fallback_query_id(op).to_string())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, op = op, "X query-ID refresh failed; using cached/fallback ID");
+            let cache = query_id_cache().lock().await;
+            cache
+                .ids
+                .get(op)
+                .cloned()
+                .unwrap_or_else(|| fallback_query_id(op).to_string())
+        }
+    }
+}
+
+/// Fetch and parse the current query IDs from the community document.
+async fn fetch_query_ids(state: &AppState) -> anyhow::Result<HashMap<String, String>> {
+    let client = state.client_for_url(QUERY_ID_DOC_URL);
+    let resp = client
+        .get(QUERY_ID_DOC_URL)
+        .header("User-Agent", crate::state::BROWSER_UA)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("query-ID document request failed")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("query-ID document HTTP {}", resp.status());
+    }
+    let json: Value = resp.json().await.context("query-ID document JSON parse failed")?;
+
+    let mut ids = HashMap::new();
+    for op in [OP_USER_BY_SCREEN_NAME, OP_USER_TWEETS] {
+        if let Some(qid) = json["graphql"][op]["queryId"].as_str() {
+            // Supply-chain defense: the queryId is spliced into the URL path,
+            // so validate its character set to prevent injection.
+            let valid = !qid.is_empty()
+                && qid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if valid {
+                ids.insert(op.to_string(), qid.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        anyhow::bail!("query-ID document contained no usable queryIds");
+    }
+    Ok(ids)
+}
+
+/// Marker error: the endpoint rejected the request in a way that suggests the
+/// queryId is stale (X shipped a new frontend). Triggers one forced refresh.
+#[derive(Debug)]
+struct StaleQueryIdError;
+
+impl std::fmt::Display for StaleQueryIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "X GraphQL queryId appears stale")
+    }
+}
+impl std::error::Error for StaleQueryIdError {}
+
+/// Marker: a GraphQL request got HTTP 403, most likely the cached ct0 (CSRF
+/// token) expired. The caller clears the ct0 cache, re-fetches and retries
+/// once; a second 403 means the auth_token cookie itself is dead.
+#[derive(Debug)]
+struct StaleCt0Error;
+
+impl std::fmt::Display for StaleCt0Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "X GraphQL request forbidden (ct0 likely stale)")
+    }
+}
+impl std::error::Error for StaleCt0Error {}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/// Perform a GraphQL API call, resolving the queryId automatically. If the
+/// first attempt signals a stale queryId (HTTP 404), force-refresh the IDs
+/// and retry exactly once.
+async fn gql_request(
+    state: &AppState,
+    auth_token: &str,
+    ct0: &str,
+    op: &str,
+    params: &[(&str, String)],
+) -> anyhow::Result<Value> {
+    match gql_request_once(state, auth_token, ct0, op, params, false).await {
+        Ok(v) => Ok(v),
+        Err(e) if e.downcast_ref::<StaleQueryIdError>().is_some() => {
+            tracing::info!(op = op, "X queryId looks stale; force-refreshing and retrying once");
+            gql_request_once(state, auth_token, ct0, op, params, true).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn gql_request_once(
+    state: &AppState,
+    auth_token: &str,
+    ct0: &str,
+    op: &str,
+    params: &[(&str, String)],
+    force_refresh: bool,
+) -> anyhow::Result<Value> {
+    let qid = get_query_id(state, op, force_refresh).await;
+    if qid.is_empty() {
+        anyhow::bail!("no queryId available for X operation {}", op);
+    }
+    let path = format!("/graphql/{}/{}", qid, op);
+
+    // Build URL with query params manually (reqwest `query` feature not enabled).
+    let mut url = format!("{}{}", BASE_API, path);
+    if !params.is_empty() {
+        url.push('?');
+        let pairs: Vec<String> = params
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    k,
+                    url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>()
+                )
+            })
+            .collect();
+        url.push_str(&pairs.join("&"));
+    }
+
+    let client = state.client_for_url(&url);
+    let resp = client
+        .get(&url)
+        .header("Cookie", format!("auth_token={}; ct0={}", auth_token, ct0))
+        .header("Authorization", BEARER)
+        .header("x-csrf-token", ct0)
+        .header("x-twitter-auth-type", "OAuth2Session")
+        .header("x-twitter-active-user", "yes")
+        .header("x-twitter-client-language", "en")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", crate::state::BROWSER_UA)
+        .header("Referer", "https://x.com/")
+        .send()
+        .await
+        .with_context(|| format!("X GraphQL request failed: {}", path))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // 401 = the auth_token itself is invalid; no point retrying.
+        anyhow::bail!("X cookie expired (HTTP 401); please update via /cookies");
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // 403 may be an expired cached ct0 (rather than a dead cookie): throw
+        // the marker so the caller clears the cache, re-fetches ct0 and retries
+        // once; only a second 403 means the cookie is dead.
+        return Err(anyhow::Error::new(StaleCt0Error));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!("X API rate limited (429); retry later");
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // A 404 on a GraphQL path almost always means the queryId no longer
+        // exists (X rotated it). Surface a marker so the caller retries once
+        // after a forced refresh.
+        return Err(anyhow::Error::new(StaleQueryIdError));
+    }
+    if !status.is_success() {
+        anyhow::bail!("X API HTTP {}", status);
+    }
+
+    let json: Value = resp.json().await.context("X API JSON parse failed")?;
+
+    // GraphQL errors can come with HTTP 200.
+    if let Some(errors) = json.get("errors").filter(|e| e.is_array()) {
+        if let Some(msg) = errors.as_array().and_then(|a| a.first()) {
+            let message = msg["message"].as_str().unwrap_or("unknown");
+            anyhow::bail!("X GraphQL error: {}", message);
+        }
+    }
+    Ok(json)
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL operations
+// ---------------------------------------------------------------------------
+
+/// Resolve screen_name → (rest_id, display_name).
+async fn resolve_user(
+    state: &AppState,
+    auth_token: &str,
+    ct0: &str,
+    screen_name: &str,
+) -> anyhow::Result<(String, String)> {
+    let variables = serde_json::json!({
+        "screen_name": screen_name,
+        "withSafetyModeUserFields": true
+    });
+    let field_toggles = serde_json::json!({"withAuxiliaryUserLabels": false});
+
+    let json = gql_request(state, auth_token, ct0, OP_USER_BY_SCREEN_NAME, &[
+        ("variables", variables.to_string()),
+        ("features", FEATURES_USER.to_string()),
+        ("fieldToggles", field_toggles.to_string()),
+    ]).await?;
+
+    let result = &json["data"]["user"]["result"];
+    if result.is_null() {
+        anyhow::bail!("X user does not exist: @{}", screen_name);
+    }
+    if result["__typename"].as_str() == Some("UserUnavailable") {
+        anyhow::bail!("X user unavailable: @{}", screen_name);
+    }
+    let rest_id = result["rest_id"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("X API did not return rest_id"))?
+        .to_string();
+    let display_name = result["legacy"]["name"].as_str()
+        .or_else(|| result["core"]["name"].as_str())
+        .unwrap_or(screen_name)
+        .to_string();
+
+    Ok((rest_id, display_name))
+}
+
+/// Fetch the user's tweet timeline.
+/// `screen_name` is only used to pinpoint the zero-tweet warning (passed
+/// through to extract_tweets_from_instructions).
+async fn fetch_user_tweets(
+    state: &AppState,
+    auth_token: &str,
+    ct0: &str,
+    rest_id: &str,
+    screen_name: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let variables = serde_json::json!({
+        "userId": rest_id,
+        "count": 20,
+        "includePromotedContent": false,
+        "withQuickPromoteEligibilityTweetFields": true,
+        "withVoice": true,
+        "withV2Timeline": true
+    });
+
+    let json = gql_request(state, auth_token, ct0, OP_USER_TWEETS, &[
+        ("variables", variables.to_string()),
+        ("features", FEATURES_FEED.to_string()),
+    ]).await?;
+
+    // Navigate: data.user.result.timeline.timeline.instructions
+    let instructions = &json["data"]["user"]["result"]["timeline"]["timeline"]["instructions"];
+    if !instructions.is_array() {
+        // Try alternate path (timeline_v2)
+        let alt = &json["data"]["user"]["result"]["timeline_v2"]["timeline"]["instructions"];
+        if !alt.is_array() {
+            // Neither path yielded instructions: the API shape changed or the
+            // account is abnormal. Must NOT return Ok as an empty timeline —
+            // otherwise the scheduler treats it as success, resets the error
+            // count, and the X feed silently stops updating with no warning at
+            // all. Error out so the feed-level error count / retirement notice
+            // kicks in.
+            anyhow::bail!(
+                "X UserTweets response missing timeline instructions (API shape may have changed)"
+            );
+        }
+        return extract_tweets_from_instructions(alt, screen_name);
+    }
+    extract_tweets_from_instructions(instructions, screen_name)
+}
+
+/// Extract tweet objects from GraphQL timeline instructions.
+/// `screen_name` is only used to pinpoint the zero-tweet warning (to tell
+/// which account it is when multiple X feeds are subscribed).
+fn extract_tweets_from_instructions(instructions: &Value, screen_name: &str) -> anyhow::Result<Vec<Value>> {
+    let mut tweets = Vec::new();
+    // Count of non-cursor entries: used to distinguish a "truly empty
+    // timeline" from "no tweets extracted due to a structural redesign".
+    let mut non_cursor_entries = 0usize;
+    let empty_instructions = Vec::new();
+    for instr in instructions.as_array().unwrap_or(&empty_instructions) {
+        let instr_type = instr["type"].as_str().unwrap_or("");
+        let entries: Option<Vec<&Value>> = if instr_type == "TimelineAddEntries" {
+            instr["entries"].as_array().map(|a| a.iter().collect())
+        } else if instr_type == "TimelineAddEntry" {
+            instr.get("entry").map(|e| vec![e])
+        } else {
+            None
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry_id = entry["entryId"].as_str().unwrap_or("");
+                if !entry_id.starts_with("cursor-") {
+                    non_cursor_entries += 1;
+                }
+                collect_tweet_results(entry, &mut tweets);
+            }
+        }
+    }
+    // instructions is non-empty and non-cursor entries exist, yet not a single
+    // tweet can be extracted: most likely an entry-structure redesign (e.g.
+    // TweetTombstone wrapping). Must not silently return empty — the scheduler
+    // would treat it as success, reset the error count, and the X feed would
+    // silently stop updating with zero logs (the failure mode v1.4.3 set out
+    // to eliminate, recurring one layer deeper). Leave a warn to aid debugging;
+    // a truly empty timeline (cursors only) does not warn.
+    if tweets.is_empty() && non_cursor_entries > 0 {
+        let types: Vec<&str> = instructions
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["type"].as_str()).collect())
+            .unwrap_or_default();
+        tracing::warn!(
+            screen_name = screen_name,
+            non_cursor_entries = non_cursor_entries,
+            instruction_types = ?types,
+            "X timeline has entries but zero tweets extracted (API shape may have changed)"
+        );
+    }
+    Ok(tweets)
+}
+
+/// Recursively collect tweet result objects from timeline entries.
+fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
+    let entry_id = entry["entryId"].as_str().unwrap_or("");
+    // Skip cursor entries (pagination markers).
+    if entry_id.starts_with("cursor-") {
+        return;
+    }
+    // Direct tweet entry: content.itemContent.tweet_results.result
+    let tweet_result = &entry["content"]["itemContent"]["tweet_results"]["result"];
+    if !tweet_result.is_null() && tweet_result.get("rest_id").is_some() {
+        out.push(tweet_result.clone());
+        return;
+    }
+    // Nested items (e.g. conversation threads in profile-conversation modules)
+    if let Some(items) = entry["content"]["items"].as_array() {
+        for item in items {
+            let tr = &item["item"]["itemContent"]["tweet_results"]["result"];
+            if !tr.is_null() && tr.get("rest_id").is_some() {
+                out.push(tr.clone());
+            }
+        }
+    }
+}
+
+/// Append `<img>`/`<video>` tags for a tweet's media to the HTML body.
+/// Photos get ?name=orig (highest resolution); videos pick the highest-bitrate
+/// mp4 variant. Reads extended_entities.media, falling back to entities.media.
+fn append_media_tags(body: &mut String, legacy: &Value) {
+    let Some(media_arr) = legacy["extended_entities"]["media"]
+        .as_array()
+        .or_else(|| legacy["entities"]["media"].as_array())
+    else {
+        return;
+    };
+    for m in media_arr {
+        match m["type"].as_str().unwrap_or("") {
+            "photo" => {
+                if let Some(url) = m["media_url_https"].as_str() {
+                    // Append ?name=orig to get the highest resolution version.
+                    let orig = if url.contains('?') {
+                        format!("{}&name=orig", url)
+                    } else {
+                        format!("{}?name=orig", url)
+                    };
+                    body.push_str(&format!("<img src=\"{}\">", crate::push::escape_attr(&orig)));
+                }
+            }
+            "video" | "animated_gif" => {
+                // Pick highest bitrate variant.
+                let variants = m["video_info"]["variants"].as_array();
+                let best = variants.and_then(|vs| {
+                    vs.iter()
+                        .filter(|v| v["content_type"].as_str() == Some("video/mp4"))
+                        .max_by_key(|v| v["bitrate"].as_i64().unwrap_or(0))
+                });
+                if let Some(v) = best {
+                    if let Some(url) = v["url"].as_str() {
+                        body.push_str(&format!("<video src=\"{}\"></video>", crate::push::escape_attr(url)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tweet → Entry conversion
+// ---------------------------------------------------------------------------
+
+/// Extract @mention screen names from a tweet's entities.
+/// Checks both legacy.entities.user_mentions and note_tweet entity_set.mentions.
+fn extract_mention_names(result: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    // legacy.entities.user_mentions
+    if let Some(arr) = result["legacy"]["entities"]["user_mentions"].as_array() {
+        for m in arr {
+            if let Some(s) = m["screen_name"].as_str() {
+                if !s.is_empty() {
+                    names.push(s.to_string());
+                }
+            }
+        }
+    }
+    // note_tweet entity_set.mentions (may have additional mentions)
+    if let Some(arr) = result["note_tweet"]["note_tweet_results"]["result"]["entity_set"]["mentions"].as_array() {
+        for m in arr {
+            if let Some(s) = m["screen_name"].as_str() {
+                if !s.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(s)) {
+                    names.push(s.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Wrap `@username` occurrences in HTML with links to their X profile.
+/// Only links usernames present in the `names` list (from API entities).
+/// Skips content already inside `<a>` tags (e.g. from URL auto-linking).
+fn linkify_mentions(html: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len() + names.len() * 60);
+    let mut rest = html;
+    loop {
+        match rest.find("<a ") {
+            Some(ap) => {
+                // Linkify the plain-text segment before this anchor.
+                out.push_str(&linkify_text_segment(&rest[..ap], names));
+                // Copy the entire anchor (up to and including </a>) verbatim.
+                match rest[ap..].find("</a>") {
+                    Some(cp) => {
+                        let anchor_end = ap + cp + 4;
+                        out.push_str(&rest[ap..anchor_end]);
+                        rest = &rest[anchor_end..];
+                    }
+                    None => {
+                        // Malformed anchor; treat the rest as plain text.
+                        out.push_str(&linkify_text_segment(&rest[ap..], names));
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push_str(&linkify_text_segment(rest, names));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Linkify @mentions within a plain (anchor-free) HTML text segment.
+/// Collects all valid mention matches in one pass to avoid re-scanning
+/// already-inserted anchors.
+fn linkify_text_segment(text: &str, names: &[String]) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut matches: Vec<(usize, usize, &str)> = Vec::new();
+    for name in names {
+        let needle = format!("@{}", name).to_ascii_lowercase();
+        let mut search_from = 0usize;
+        while let Some(idx) = lower[search_from..].find(&needle) {
+            let abs = search_from + idx;
+            let end = abs + needle.len();
+            // Boundary: char before @ must not be alnum/underscore.
+            let ok_before = abs == 0 || {
+                let prev = text.as_bytes()[abs - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_')
+            };
+            // Boundary: char after the name must not be alnum/underscore.
+            let ok_after = end >= text.len() || {
+                let next = text.as_bytes()[end];
+                !(next.is_ascii_alphanumeric() || next == b'_')
+            };
+            if ok_before && ok_after {
+                matches.push((abs, end, name.as_str()));
+            }
+            search_from = abs + 1;
+        }
+    }
+    if matches.is_empty() {
+        return text.to_string();
+    }
+    // Sort by position; skip overlaps (keep earliest).
+    matches.sort_by_key(|&(s, _, _)| s);
+    let mut out = String::with_capacity(text.len() + matches.len() * 60);
+    let mut last_end = 0usize;
+    for (start, end, name) in &matches {
+        if *start < last_end {
+            continue;
+        }
+        out.push_str(&text[last_end..*start]);
+        out.push_str(&format!(
+            "<a href=\"https://x.com/{}\">{}</a>",
+            crate::push::escape_attr(name),
+            crate::push::escape_html(&text[*start..*end])
+        ));
+        last_end = *end;
+    }
+    out.push_str(&text[last_end..]);
+    out
+}
+
+/// Linkify #hashtags and $cashtags in Telegram HTML, skipping existing anchors.
+/// #tag → https://x.com/hashtag/tag ; $TICKER → https://x.com/search?q=%24TICKER
+fn linkify_hashtags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 128);
+    let mut rest = html;
+    loop {
+        match rest.find("<a ") {
+            Some(ap) => {
+                out.push_str(&linkify_hashtags_in_text(&rest[..ap]));
+                match rest[ap..].find("</a>") {
+                    Some(cp) => {
+                        let anchor_end = ap + cp + 4;
+                        out.push_str(&rest[ap..anchor_end]);
+                        rest = &rest[anchor_end..];
+                    }
+                    None => {
+                        out.push_str(&linkify_hashtags_in_text(&rest[ap..]));
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push_str(&linkify_hashtags_in_text(rest));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Find #hashtag and $cashtag patterns in a plain-text segment and wrap them
+/// as X platform hyperlinks. Uses the same positional-scan approach as
+/// linkify_text_segment to avoid re-scanning inserted anchors.
+fn linkify_hashtags_in_text(text: &str) -> String {
+    // Collect matches: (start, end, is_cashtag)
+    let mut matches: Vec<(usize, usize, bool)> = Vec::new();
+    let bytes = text.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'#' && b != b'$' {
+            continue;
+        }
+        // Boundary: char before must not be alnum/underscore.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        let is_cashtag = b == b'$';
+        // Scan the tag body: alphanumeric + underscore (ASCII sufficient for
+        // X hashtags/cashtags in practice; unicode chars terminate the tag).
+        let mut end = i + 1;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        // Must have at least 1 char after the sigil.
+        if end <= i + 1 {
+            continue;
+        }
+        // Cashtags: only pure alpha tickers (avoid $5, $100 etc).
+        if is_cashtag {
+            let tag_body = &text[i + 1..end];
+            if !tag_body.chars().all(|c| c.is_ascii_alphabetic()) {
+                continue;
+            }
+        }
+        matches.push((i, end, is_cashtag));
+    }
+
+    if matches.is_empty() {
+        return text.to_string();
+    }
+
+    // Sort and deduplicate overlaps (keep earliest).
+    matches.sort_by_key(|&(s, _, _)| s);
+    let mut out = String::with_capacity(text.len() + matches.len() * 80);
+    let mut last_end = 0usize;
+    for &(start, end, is_cashtag) in &matches {
+        if start < last_end {
+            continue;
+        }
+        out.push_str(&text[last_end..start]);
+        let tag_text = &text[start..end];
+        let tag_body = &text[start + 1..end]; // without sigil
+        let href = if is_cashtag {
+            format!("https://x.com/search?q=%24{}", crate::push::escape_attr(tag_body))
+        } else {
+            format!("https://x.com/hashtag/{}", crate::push::escape_attr(tag_body))
+        };
+        out.push_str(&format!(
+            "<a href=\"{}\">{}</a>",
+            href,
+            crate::push::escape_html(tag_text)
+        ));
+        last_end = end;
+    }
+    out.push_str(&text[last_end..]);
+    out
+}
+
+/// Extract a tweet's full text (note_tweet takes priority, falling back to
+/// legacy.full_text — the convention fixed in #7) and clean t.co links,
+/// returning readable text. M7 fix: the main tweet/RT/QT three call sites
+/// previously repeated the same extraction chain verbatim; collapsed into a
+/// single function.
+fn tweet_full_text(result: &Value) -> String {
+    let legacy = &result["legacy"];
+    let raw = result["note_tweet"]["note_tweet_results"]["result"]["text"]
+        .as_str()
+        .or_else(|| legacy["full_text"].as_str())
+        .unwrap_or_default();
+    let note_urls = result["note_tweet"]["note_tweet_results"]["result"]["entity_set"]["urls"]
+        .as_array();
+    clean_tweet_text(raw, legacy, note_urls)
+}
+
+/// Append a RT/QT blockquote to the body. `prefix` = "RT" or "QT".
+/// `include_media`: RT needs media tags appended, QT does not.
+/// M7 fix: the former RT and QT blocks (~25 lines) were verbatim duplicates;
+/// collapsed into a single function.
+fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_media: bool) {
+    // Handle TweetWithVisibilityResults wrapper (same as tweet_to_entry).
+    let result = if result["__typename"].as_str() == Some("TweetWithVisibilityResults") {
+        &result["tweet"]
+    } else {
+        result
+    };
+    let legacy = &result["legacy"];
+    let text = tweet_full_text(result);
+    let screen = extract_screen_name(result);
+    let mut mentions = extract_mention_names(result);
+    // Same as tweet_to_entry: add the author's screen_name so self-mentions
+    // also get hyperlinked (v1.10.14).
+    if !mentions.iter().any(|n| n.eq_ignore_ascii_case(screen)) {
+        mentions.push(screen.to_string());
+    }
+    let mut inner = linkify_hashtags(&linkify_mentions(&tweet_text_to_html(&text), &mentions));
+    if include_media {
+        append_media_tags(&mut inner, legacy);
+    }
+    // Link to the specific tweet if id is available, else user profile.
+    let link = match legacy["id_str"].as_str() {
+        Some(tid) => format!("https://x.com/{}/status/{}", screen, tid),
+        None => format!("https://x.com/{}", screen),
+    };
+    // Consistent with weibo.rs: when body is non-empty, separate the original
+    // text from the quote block with \n — otherwise </a> sits flush against
+    // <blockquote>, Telegram fails to recognize the blockquote boundary, and
+    // after the content degrades to plain text the @mention merges with the
+    // QT/RT prefix into a wrong username (e.g. @BotQT).
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "<blockquote>{} <a href=\"{}\">@{}</a>: {}</blockquote>",
+        prefix,
+        crate::push::escape_attr(&link),
+        crate::push::escape_html(screen),
+        inner
+    ));
+}
+
+/// Convert a GraphQL tweet result object into a feed-rs Entry.
+fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Option<Entry> {
+    // Handle TweetWithVisibilityResults wrapper.
+    let tweet = if tweet["__typename"].as_str() == Some("TweetWithVisibilityResults") {
+        &tweet["tweet"]
+    } else {
+        tweet
+    };
+
+    let legacy = &tweet["legacy"];
+    if legacy.is_null() {
+        return None;
+    }
+    let id = legacy["id_str"].as_str()
+        .or_else(|| tweet["rest_id"].as_str())?
+        .to_string();
+
+    // Skip replies (only root tweets in the timeline).
+    if legacy["in_reply_to_status_id_str"].is_string() {
+        return None;
+    }
+
+    // Full text: note_tweet takes priority, falling back to legacy.full_text
+    // (unified convention via tweet_full_text).
+    let text = tweet_full_text(tweet);
+
+    // Pure-retweet detection: the outer full_text is X's auto-generated
+    // "RT @xxx: original text"; rendering it would duplicate the retweet
+    // content in the blockquote below → skip the outer body and keep only
+    // the blockquote.
+    let rt = &legacy["retweeted_status_result"]["result"];
+    let is_pure_rt = !rt.is_null() && text.starts_with("RT @");
+
+    // Build HTML body (escape + auto-link URLs + newlines to <br>).
+    // For pure retweets the body stays empty; only the RT blockquote is emitted.
+    let mut body = String::new();
+    if !is_pure_rt {
+        let mut mentions = extract_mention_names(tweet);
+        // The X API's user_mentions does not include the author's self-mention
+        // (e.g. Elon Musk's body text @elonmusk); add the author's screen_name
+        // so self-mentions also get hyperlinked (v1.10.14).
+        if !mentions.iter().any(|n| n.eq_ignore_ascii_case(screen_name)) {
+            mentions.push(screen_name.to_string());
+        }
+        body = linkify_hashtags(&linkify_mentions(&tweet_text_to_html(&text), &mentions));
+        // Media: images and videos from legacy.entities.media / extended_entities.
+        append_media_tags(&mut body, legacy);
+    }
+
+    // Retweet → blockquote (including the RT's media tags).
+    if !rt.is_null() {
+        append_quote_block(&mut body, rt, "RT", true);
+    }
+
+    // Quote tweet → also blockquote (including the quoted tweet's media tags).
+    // v1.10.16: previously include_media=false meant that when the main tweet
+    // had no media and all images were in the quoted tweet, the whole push
+    // degraded to plain text (e.g. an elonmusk QT of a tweet with images).
+    // Changed to true to align with RT.
+    let quote = &tweet["quoted_status_result"]["result"];
+    if !quote.is_null() {
+        append_quote_block(&mut body, quote, "QT", true);
+    }
+
+    // Parse created_at: "Wed Oct 10 20:19:24 +0000 2018"
+    let published = parse_twitter_time(legacy["created_at"].as_str().unwrap_or(""));
+
+    // Title: first 50 chars of the CLEANED text (no t.co noise).
+    let title = crate::platforms::make_title(&text, "(推文)");
+
+    let link = format!("https://x.com/{}/status/{}", screen_name, id);
+
+    Some(crate::platforms::make_entry(id, title, display_name.to_string(), body, "text/html", link, published))
+}
+
+/// Extract screen_name from a tweet result object, trying multiple API paths.
+/// Handles TweetWithVisibilityResults wrapper transparently.
+fn extract_screen_name(tweet_result: &Value) -> &str {
+    // Unwrap TweetWithVisibilityResults if present.
+    let tr = if tweet_result["__typename"].as_str() == Some("TweetWithVisibilityResults") {
+        &tweet_result["tweet"]
+    } else {
+        tweet_result
+    };
+    // Path 1: core.screen_name (older API shape)
+    if let Some(s) = tr["core"]["screen_name"].as_str() {
+        return s;
+    }
+    // Path 2: core.user_results.result.legacy.screen_name
+    if let Some(s) = tr["core"]["user_results"]["result"]["legacy"]["screen_name"].as_str() {
+        return s;
+    }
+    // Path 3: core.user_results.result.core.screen_name
+    if let Some(s) = tr["core"]["user_results"]["result"]["core"]["screen_name"].as_str() {
+        return s;
+    }
+    // Path 4: user_results.result.legacy.screen_name (some responses nest user at top level)
+    if let Some(s) = tr["user_results"]["result"]["legacy"]["screen_name"].as_str() {
+        return s;
+    }
+    // Path 5: legacy.screen_name (rare fallback)
+    if let Some(s) = tr["legacy"]["screen_name"].as_str() {
+        return s;
+    }
+    // Log the actual structure so we can fix the path next time.
+    let keys: Vec<&str> = tr.as_object().map(|m| m.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+    let core_keys: Vec<&str> = tr["core"].as_object().map(|m| m.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+    tracing::warn!(
+        rest_id = ?tr["rest_id"].as_str(),
+        top_keys = ?keys,
+        core_keys = ?core_keys,
+        "extract_screen_name: no path matched, falling back to unknown"
+    );
+    "unknown"
+}
+
+/// Clean tweet text by processing t.co URL entities:
+/// 1) Remove media placeholder t.co URLs (images/videos are sent as attachments).
+/// 2) Replace regular t.co URLs with their expanded_url (real target).
+///
+/// `legacy` is the tweet's legacy object; `note_urls` is the optional
+/// note_tweet entity_set urls array (takes precedence over legacy entities).
+fn clean_tweet_text(full_text: &str, legacy: &Value, note_urls: Option<&Vec<Value>>) -> String {
+    let mut text = full_text.to_string();
+
+    // Remove media placeholder t.co URLs.
+    let media_entities = legacy["extended_entities"]["media"]
+        .as_array()
+        .or_else(|| legacy["entities"]["media"].as_array());
+    if let Some(arr) = media_entities {
+        for m in arr {
+            if let Some(tco) = m["url"].as_str() {
+                text = text.replace(tco, "");
+            }
+        }
+    }
+
+    // Replace regular t.co URLs with expanded_url.
+    let url_entities = note_urls.or_else(|| legacy["entities"]["urls"].as_array());
+    if let Some(urls) = url_entities {
+        for u in urls {
+            let tco = u["url"].as_str().unwrap_or_default();
+            let expanded = u["expanded_url"].as_str().unwrap_or_default();
+            if !tco.is_empty() && !expanded.is_empty() {
+                text = text.replace(tco, expanded);
+            }
+        }
+    }
+
+    // Trim trailing whitespace left after removing media placeholders.
+    text.trim_end().to_string()
+}
+
+/// Convert cleaned tweet text to Telegram-HTML: escape special chars,
+/// auto-link bare URLs (so expanded_url targets are clickable), and
+/// convert newlines to <br>. Media tags are appended separately.
+fn tweet_text_to_html(text: &str) -> String {
+    static RE_URL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"https?://[^\s<>"]+"#).unwrap());
+    let mut out = String::new();
+    let mut last = 0usize;
+    for caps in RE_URL.captures_iter(text) {
+        let m = caps.get(0).unwrap();
+        // Escape and append the text before this URL.
+        out.push_str(&crate::push::escape_html(&text[last..m.start()]));
+        // Strip trailing sentence punctuation that isn't part of the URL.
+        let mut url = m.as_str();
+        while url.ends_with(['.', ',', ';', '!', '?']) {
+            url = &url[..url.len() - 1];
+        }
+        out.push_str(&format!(
+            "<a href=\"{}\">{}</a>",
+            crate::push::escape_attr(url),
+            crate::push::escape_html(url)
+        ));
+        // Emit the stripped trailing punctuation after the link (otherwise the
+        // body would lose periods etc.).
+        let stripped = &m.as_str()[url.len()..];
+        out.push_str(&crate::push::escape_html(stripped));
+        last = m.end();
+    }
+    out.push_str(&crate::push::escape_html(&text[last..]));
+    // Convert newlines to <br>
+    out.replace('\n', "<br>")
+}
+
+/// Parse Twitter's created_at format: "Wed Oct 10 20:19:24 +0000 2018".
+fn parse_twitter_time(s: &str) -> Option<DateTime<Utc>> {
+    // Format: "%a %b %d %H:%M:%S %z %Y"
+    chrono::DateTime::parse_from_str(s, "%a %b %d %H:%M:%S %z %Y")
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_screen_name_valid() {
+        assert_eq!(parse_screen_name("https://x.com/elonmusk"), Some("elonmusk".into()));
+        assert_eq!(parse_screen_name("https://twitter.com/NASA"), Some("NASA".into()));
+        assert_eq!(parse_screen_name("https://www.x.com/some_user"), Some("some_user".into()));
+        assert_eq!(parse_screen_name("https://x.com/a"), Some("a".into()));
+    }
+
+    #[test]
+    fn parse_screen_name_invalid() {
+        assert_eq!(parse_screen_name("https://x.com/"), None);
+        assert_eq!(parse_screen_name("https://x.com/home"), None);
+        assert_eq!(parse_screen_name("https://x.com/search?q=test"), None);
+        assert_eq!(parse_screen_name("https://x.com/i/flow/login"), None);
+        assert_eq!(parse_screen_name("https://x.com/settings"), None);
+        assert_eq!(parse_screen_name("https://example.com/elonmusk"), None);
+        // Too long (>15 chars)
+        assert_eq!(parse_screen_name("https://x.com/abcdefghijklmnop"), None);
+    }
+
+    #[test]
+    fn parse_twitter_time_works() {
+        let t = parse_twitter_time("Wed Oct 10 20:19:24 +0000 2018");
+        assert!(t.is_some());
+        let dt = t.unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2018-10-10");
+    }
+
+    #[test]
+    fn extract_cookie_value_works() {
+        let header = "ct0=abc123xyz; Max-Age=14400; Domain=.x.com; Path=/; Secure";
+        assert_eq!(extract_cookie_value(header, "ct0"), Some("abc123xyz".into()));
+        assert_eq!(extract_cookie_value(header, "other"), None);
+    }
+
+    #[test]
+    fn linkify_mentions_basic() {
+        let names = vec!["elonmusk".to_string()];
+        let html = "Hello @elonmusk how are you";
+        let out = linkify_mentions(html, &names);
+        assert_eq!(
+            out,
+            "Hello <a href=\"https://x.com/elonmusk\">@elonmusk</a> how are you"
+        );
+    }
+
+    #[test]
+    fn linkify_mentions_case_insensitive_match_preserves_original_case() {
+        let names = vec!["elonmusk".to_string()];
+        let html = "cc @ElonMusk";
+        let out = linkify_mentions(html, &names);
+        assert_eq!(
+            out,
+            "cc <a href=\"https://x.com/elonmusk\">@ElonMusk</a>"
+        );
+    }
+
+    #[test]
+    fn linkify_mentions_skips_inside_existing_anchor() {
+        let names = vec!["elonmusk".to_string()];
+        let html = "<a href=\"https://x.com/elonmusk\">@elonmusk</a> and @elonmusk";
+        let out = linkify_mentions(html, &names);
+        // First occurrence is inside an anchor and must stay verbatim;
+        // the second one gets linked.
+        assert_eq!(
+            out,
+            "<a href=\"https://x.com/elonmusk\">@elonmusk</a> and <a href=\"https://x.com/elonmusk\">@elonmusk</a>"
+        );
+    }
+
+    #[test]
+    fn linkify_mentions_boundary_checks() {
+        let names = vec!["elonmusk".to_string()];
+        // Preceded by alnum → not a mention.
+        assert_eq!(linkify_mentions("foo@elonmusk", &names), "foo@elonmusk");
+        // Followed by alnum → not a mention (e.g. @elonmusk2x).
+        assert_eq!(linkify_mentions("@elonmusk2x", &names), "@elonmusk2x");
+        // Followed by underscore → not a mention.
+        assert_eq!(linkify_mentions("@elonmusk_", &names), "@elonmusk_");
+        // At start of string → mention.
+        assert!(linkify_mentions("@elonmusk", &names).contains("<a href"));
+        // After punctuation → mention.
+        assert!(linkify_mentions("(@elonmusk)", &names).contains("<a href"));
+    }
+
+    #[test]
+    fn linkify_mentions_no_names_noop() {
+        let html = "Hello @elonmusk";
+        assert_eq!(linkify_mentions(html, &[]), html);
+    }
+
+    #[test]
+    fn linkify_mentions_multiple_mentions() {
+        let names = vec!["alice".to_string(), "bob".to_string()];
+        let html = "@alice meets @bob";
+        let out = linkify_mentions(html, &names);
+        assert_eq!(
+            out,
+            "<a href=\"https://x.com/alice\">@alice</a> meets <a href=\"https://x.com/bob\">@bob</a>"
+        );
+    }
+
+    #[test]
+    fn linkify_mentions_self_mention_by_author() {
+        // v1.10.14: author's own screen_name is appended to the names list
+        // by tweet_to_entry/append_quote_block, so self-mentions get linked.
+        let names = vec!["SpaceXSI".to_string(), "elonmusk".to_string()];
+        let html = "Great work @SpaceXSI — @elonmusk";
+        let out = linkify_mentions(html, &names);
+        assert!(out.contains(r#"<a href="https://x.com/SpaceXSI">@SpaceXSI</a>"#), "out: {}", out);
+        assert!(out.contains(r#"<a href="https://x.com/elonmusk">@elonmusk</a>"#), "out: {}", out);
+    }
+
+    #[test]
+    fn extract_mention_names_from_legacy_entities() {
+        let json: Value = serde_json::json!({
+            "legacy": {
+                "entities": {
+                    "user_mentions": [
+                        {"screen_name": "alice"},
+                        {"screen_name": "bob"}
+                    ]
+                }
+            }
+        });
+        let names = extract_mention_names(&json);
+        assert_eq!(names, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn extract_mention_names_dedupes_note_tweet_mentions() {
+        let json: Value = serde_json::json!({
+            "legacy": {
+                "entities": {
+                    "user_mentions": [{"screen_name": "alice"}]
+                }
+            },
+            "note_tweet": {
+                "note_tweet_results": {
+                    "result": {
+                        "entity_set": {
+                            "mentions": [
+                                {"screen_name": "Alice"},
+                                {"screen_name": "carol"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let names = extract_mention_names(&json);
+        // "Alice" is a case-insensitive duplicate of "alice" and must not be added.
+        assert_eq!(names, vec!["alice".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn append_quote_block_newline_separator() {
+        // Regression test: when body is non-empty there must be a \n
+        // separator before the quote block — otherwise </a> sits flush
+        // against <blockquote> and Telegram fails to recognize the
+        // blockquote boundary (observed in practice: @Bot + QT merged into
+        // @BotQT and auto-linked as t.me/BotQT).
+        let tweet: Value = serde_json::json!({
+            "legacy": {
+                "full_text": "quoted text",
+                "id_str": "123",
+                "entities": {
+                    "user_mentions": [],
+                    "media": []
+                }
+            },
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": { "screen_name": "someuser" }
+                    }
+                }
+            }
+        });
+        // body non-empty: must have a \n separator
+        let mut body = String::from("Grok <a href=\"https://x.com/Bot\">@Bot</a>");
+        append_quote_block(&mut body, &tweet, "QT", false);
+        assert!(body.contains("@Bot</a>\n<blockquote>"), "missing \\n separator: {}", body);
+        assert!(!body.contains("@Bot</a><blockquote>"), "blockquote glued to anchor: {}", body);
+
+        // body empty (pure RT): no leading \n
+        let mut empty_body = String::new();
+        append_quote_block(&mut empty_body, &tweet, "RT", false);
+        assert!(empty_body.starts_with("<blockquote>"), "empty body should not have leading \\n: {}", empty_body);
+    }
+
+    #[test]
+    fn linkify_hashtags_basic() {
+        let out = linkify_hashtags("Hello #Tesla world");
+        assert!(out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"), "got: {}", out);
+        assert!(out.starts_with("Hello "), "prefix lost: {}", out);
+        assert!(out.ends_with(" world"), "suffix lost: {}", out);
+    }
+
+    #[test]
+    fn linkify_hashtags_cashtag() {
+        let out = linkify_hashtags("Buy $TSLA now");
+        assert!(out.contains("<a href=\"https://x.com/search?q=%24TSLA\">$TSLA</a>"), "got: {}", out);
+    }
+
+    #[test]
+    fn linkify_hashtags_skips_numeric_cashtag() {
+        // $5, $100 are not cashtags (pure digits)
+        let out = linkify_hashtags("Price is $5 and $100");
+        assert!(!out.contains("<a href"), "numeric should not linkify: {}", out);
+    }
+
+    #[test]
+    fn linkify_hashtags_skips_inside_anchor() {
+        let out = linkify_hashtags("<a href=\"https://x.com/foo\">#Tesla</a> plain #SpaceX");
+        // #Tesla inside anchor should NOT be double-wrapped
+        assert_eq!(out.matches("<a href").count(), 2, "got: {}", out);
+        assert!(out.contains("#SpaceX</a>"), "plain hashtag should be linkified: {}", out);
+    }
+
+    #[test]
+    fn linkify_hashtags_boundary_checks() {
+        // No match when preceded by an alphanumeric char
+        assert_eq!(linkify_hashtags("foo#Tesla"), "foo#Tesla");
+        // No match with an underscore prefix
+        assert_eq!(linkify_hashtags("foo_#Tesla"), "foo_#Tesla");
+        // Matches at line start
+        assert!(linkify_hashtags("#Tesla is great").contains("<a href"));
+        // Matches after an opening parenthesis
+        assert!(linkify_hashtags("(#Tesla)").contains("<a href"));
+    }
+
+    #[test]
+    fn linkify_hashtags_multiple() {
+        let out = linkify_hashtags("#DavidLetterman #ElonMusk #Tesla");
+        assert_eq!(out.matches("<a href").count(), 3, "got: {}", out);
+        assert!(out.contains("hashtag/DavidLetterman"), "got: {}", out);
+        assert!(out.contains("hashtag/ElonMusk"), "got: {}", out);
+        assert!(out.contains("hashtag/Tesla"), "got: {}", out);
+    }
+
+    #[test]
+    fn linkify_hashtags_no_tags_noop() {
+        let html = "Hello world, no tags here.";
+        assert_eq!(linkify_hashtags(html), html);
+    }
+
+    #[test]
+    fn linkify_hashtags_with_br() {
+        // In tweet_text_to_html output newlines have already become <br>;
+        // a tag right after <br> must still match
+        let out = linkify_hashtags("text<br>#Tesla<br>more");
+        assert!(out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"), "got: {}", out);
+    }
+}
