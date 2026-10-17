@@ -20,6 +20,16 @@ fn main() {
         format!("{version}+{hash}")
     };
     println!("cargo:rustc-env=APP_VERSION={full}");
-    // Re-run when HEAD moves so the hash stays fresh.
+    // Re-run when HEAD moves so the hash stays fresh. Two watch points are
+    // needed:
+    //   - .git/HEAD changes on a branch switch / checkout, but NOT on a plain
+    //     commit (its content stays "ref: refs/heads/main"), which is exactly
+    //     why the hash went stale after commits.
+    //   - .git/logs/HEAD (the reflog) is appended on every commit/checkout, so
+    //     its mtime changes on each commit — this is the reliable trigger.
+    // In a Docker build there is no .git, so these paths don't exist; Cargo
+    // then re-runs this script every build (harmless: git fails, hash is empty,
+    // and the plain semver from Cargo.toml is used).
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
 }
