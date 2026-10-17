@@ -222,18 +222,66 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 ## 可选增强：本地 Bot API 服务器
 
-默认直连 Telegram 官方 Bot API，上传限制 50MB。如需推送大文件（视频等），可部署本地 Bot API 服务器：
+默认直连 Telegram 官方 Bot API：媒体读入内存后上传，单文件上限 50MB（本 bot 保守取 **49MB**）。如需推送大视频/大文件，可自建本地 Bot API 服务器并启用 **file:// 零拷贝**——bot 把媒体写入与 bot-api 共享的目录，发送时以 `file://` 本地路径引用，bot-api 直接读盘，不经 HTTP 上传，单文件物理上限放宽到 **2GB**。
 
-1. 部署 [aiogram/telegram-bot-api](https://github.com/aiogram/telegram-bot-api)（需 `TELEGRAM_API_ID` + `TELEGRAM_API_HASH`，在 [my.telegram.org](https://my.telegram.org) 申请）
-2. 设置 `TELEGRAM_LOCAL=1` 启用本地模式（允许 file:// 发送）
-3. tgsrssr 侧配置：
-   - `BOT_API_URL`: 指向本地 bot-api（如 `http://127.0.0.1:8081`）
-   - 媒体卷挂载：tgsrssr 与 bot-api 须挂载**同一宿主媒体目录**
-   - `BOT_API_MEDIA_DIR`: bot-api 容器内看到该目录的路径
+### 两种媒体传输模式
 
-file:// 零拷贝原理：bot 下载媒体写入共享目录，发送时以 `file://` 本地路径引用，bot-api 直接读文件，不经 HTTP 上传。
+| 模式 | 触发条件 | 传输方式 | 单文件上限 |
+|---|---|---|---|
+| `memory`（官方 API） | `BOT_API_URL` 留空 | 读入内存上传 | 49MB |
+| `file://`（本地零拷贝） | `BOT_API_URL` 已设 且 `BOT_API_MEDIA_DIR` 非空 | 本地路径直读 | 2GB |
 
-> **注意**：两个容器必须挂载同一宿主目录到 `BOT_API_MEDIA_DIR` 指定的路径，否则 file:// 发送会失败。
+实际是否推送某条视频，还叠加受业务闸门 `MAX_VIDEO_PUSH_MB`（默认 100）约束，与上表物理上限取更严者。由于 `BOT_API_MEDIA_DIR` 默认为非空值，**是否走零拷贝实际上只由 `BOT_API_URL` 是否为空决定**。
+
+### 部署目录结构
+
+file:// 的前提是两容器挂载同一宿主媒体目录。典型布局：
+
+```text
+deploy/
+|-- tgsrssr/                  # bot 本体
+|   |-- compose.yaml
+|   |-- data/                 # SQLite（DB_PATH）
+|   |-- logs/                 # 日志（LOG_DIR）
+|   +-- media/                # 媒体落盘（MEDIA_DIR，容器内 /app/media）
++-- telegram-bot-api/         # 可选：本地 Bot API（官方 aiogram 镜像）
+    |-- compose.yaml
+    |-- data/                 # bot-api 运行时状态
+    +-- media/                # 与 tgsrssr 共享的媒体目录
+```
+
+不用本地 bot-api 时，`tgsrssr/media/` 用独立本地目录即可，无需共享。
+
+### 媒体目录配置（关键）
+
+零拷贝不依赖绝对路径：bot 写入 `MEDIA_DIR`（`/app/media`），发送时把该前缀**翻译**成 `BOT_API_MEDIA_DIR` 前缀生成 `file://` 路径，bot-api 从同一宿主目录读文件。两侧配置：
+
+```yaml
+# telegram-bot-api/compose.yaml
+services:
+  telegram-bot-api:
+    environment:
+      TELEGRAM_API_ID: "<api_id>"          # my.telegram.org 申请，非 BotFather token
+      TELEGRAM_API_HASH: "<api_hash>"
+      TELEGRAM_LOCAL: "1"                   # 本地模式：允许 file:// 发送
+    volumes:
+      - ./data:/var/lib/telegram-bot-api
+      - ./media:/var/lib/telegram-bot-api-media   # bot-api 容器内的媒体路径
+
+# tgsrssr/compose.yaml
+services:
+  tgsrssr:
+    environment:
+      BOT_API_URL: "http://127.0.0.1:8081"                 # 指向本地 bot-api
+      BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media" # = bot-api 侧媒体挂载路径
+    volumes:
+      - ./data:/app/data
+      - ../telegram-bot-api/media:/app/media                      # 换成与 bot-api 同一宿主目录
+      - ../telegram-bot-api/media:/var/lib/telegram-bot-api-media
+      - ./logs:/app/logs
+```
+
+要点：`BOT_API_MEDIA_DIR` 默认即 `/var/lib/telegram-bot-api-media`（官方镜像约定），仅当 bot-api 用了不同容器内路径才需覆盖；两个容器**必须挂同一宿主目录**，否则 `file://` 发送失败。`TELEGRAM_LOCAL=1` 与 `BOT_API_URL` 指向本地，是启用零拷贝的两把开关。
 
 ## 通知
 
@@ -507,18 +555,66 @@ Per-source filtering (/set source page → "Content filter"):
 
 ## Optional Enhancement: Local Bot API Server
 
-By default the bot connects directly to the official Telegram Bot API (50MB upload limit). To push large files (videos, etc.), deploy a local Bot API server:
+By default the bot connects directly to the official Telegram Bot API: media is read into memory and uploaded, with a 50MB per-file limit (this bot conservatively caps at **49MB**). To push large videos/files, deploy a local Bot API server and enable **file:// zero-copy** — the bot writes media into a directory shared with bot-api, references it via a `file://` local path when sending, and bot-api reads the file directly from disk with no HTTP upload, raising the physical per-file cap to **2GB**.
 
-1. Deploy [aiogram/telegram-bot-api](https://github.com/aiogram/telegram-bot-api) (requires `TELEGRAM_API_ID` + `TELEGRAM_API_HASH`, apply at [my.telegram.org](https://my.telegram.org))
-2. Set `TELEGRAM_LOCAL=1` to enable local mode (allows file:// sending)
-3. Configure tgsrssr:
-   - `BOT_API_URL`: point to the local bot-api (e.g. `http://127.0.0.1:8081`)
-   - Media volume mount: tgsrssr and bot-api must mount the **same host media directory**
-   - `BOT_API_MEDIA_DIR`: the path where the bot-api container sees that directory
+### Two Media Transport Modes
 
-file:// zero-copy principle: the bot downloads media into the shared directory; when sending, it references the local path via `file://`, and bot-api reads the file directly — no HTTP upload.
+| Mode | Trigger | Transport | Per-file cap |
+|---|---|---|---|
+| `memory` (official API) | `BOT_API_URL` empty | read into memory, upload | 49MB |
+| `file://` (local zero-copy) | `BOT_API_URL` set AND `BOT_API_MEDIA_DIR` non-empty | direct local path read | 2GB |
 
-> **Note**: both containers must mount the same host directory at the path specified by `BOT_API_MEDIA_DIR`, otherwise file:// sending will fail.
+Whether a given video is actually pushed is further gated by the business limit `MAX_VIDEO_PUSH_MB` (default 100) — the stricter of that and the physical caps above applies. Since `BOT_API_MEDIA_DIR` is non-empty by default, **zero-copy is effectively decided solely by whether `BOT_API_URL` is set**.
+
+### Deployment Directory Layout
+
+file:// requires both containers to mount the same host media directory. Typical layout:
+
+```text
+deploy/
+|-- tgsrssr/                  # the bot itself
+|   |-- compose.yaml
+|   |-- data/                 # SQLite (DB_PATH)
+|   |-- logs/                 # logs (LOG_DIR)
+|   +-- media/                # media on disk (MEDIA_DIR, /app/media inside the container)
++-- telegram-bot-api/         # optional: local Bot API (official aiogram image)
+    |-- compose.yaml
+    |-- data/                 # bot-api runtime state
+    +-- media/                # media directory shared with tgsrssr
+```
+
+Without a local bot-api, `tgsrssr/media/` can be a standalone local directory — no sharing needed.
+
+### Media Directory Configuration (key)
+
+Zero-copy relies on no absolute paths: the bot writes into `MEDIA_DIR` (`/app/media`); when sending, that prefix is **translated** into a `file://` path prefixed with `BOT_API_MEDIA_DIR`, and bot-api reads the same host directory. Both sides:
+
+```yaml
+# telegram-bot-api/compose.yaml
+services:
+  telegram-bot-api:
+    environment:
+      TELEGRAM_API_ID: "<api_id>"          # from my.telegram.org, NOT the BotFather token
+      TELEGRAM_API_HASH: "<api_hash>"
+      TELEGRAM_LOCAL: "1"                   # local mode: allows file:// sending
+    volumes:
+      - ./data:/var/lib/telegram-bot-api
+      - ./media:/var/lib/telegram-bot-api-media   # media path inside the bot-api container
+
+# tgsrssr/compose.yaml
+services:
+  tgsrssr:
+    environment:
+      BOT_API_URL: "http://127.0.0.1:8081"                 # point at the local bot-api
+      BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media" # = bot-api's media mount path
+    volumes:
+      - ./data:/app/data
+      - ../telegram-bot-api/media:/app/media                      # replace with the same host dir as bot-api
+      - ../telegram-bot-api/media:/var/lib/telegram-bot-api-media
+      - ./logs:/app/logs
+```
+
+Key points: `BOT_API_MEDIA_DIR` defaults to `/var/lib/telegram-bot-api-media` (the official image's convention) — override it only if your bot-api uses a different in-container path; both containers **must mount the same host directory**, otherwise file:// sending fails. `TELEGRAM_LOCAL=1` plus `BOT_API_URL` pointing at the local server are the two switches that enable zero-copy.
 
 ## Notifications
 
