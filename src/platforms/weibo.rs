@@ -1524,15 +1524,15 @@ mod tests {
         assert_eq!(parse_uid("https://weibo.com/u/"), None);
         assert_eq!(parse_uid("https://weibo.com/n/某人"), None);
         assert_eq!(parse_uid("https://rsshub.example.com/weibo/user/123"), None);
-        assert_eq!(parse_uid("https://weibo.com/7762107285/Rk6p8h0Pa"), None);
+        assert_eq!(parse_uid("https://weibo.com/1000000001/AbCdEfGhI"), None);
     }
 
     #[test]
     fn absolutize_hrefs_makes_relative_links_absolute() {
         // @user link (single quotes), hashtag search link, status link.
-        let html = "回复<a href='/n/风不如斯'>@风不如斯</a>:<a href=\"/search?containerid=100103type%3D1%26q%3D%23话题%23\">#话题#</a><a href=\"/status/123\">全文</a>";
+        let html = "回复<a href='/n/某人'>@某人</a>:<a href=\"/search?containerid=100103type%3D1%26q%3D%23话题%23\">#话题#</a><a href=\"/status/123\">全文</a>";
         let out = absolutize_hrefs(html);
-        assert!(out.contains("href='https://m.weibo.cn/n/风不如斯'"), "out: {}", out);
+        assert!(out.contains("href='https://m.weibo.cn/n/某人'"), "out: {}", out);
         assert!(out.contains("href=\"https://m.weibo.cn/search?containerid=100103type%3D1%26q%3D%23话题%23\""), "out: {}", out);
         assert!(out.contains("href=\"https://m.weibo.cn/status/123\""), "out: {}", out);
         // Absolute URLs must be left untouched.

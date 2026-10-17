@@ -579,12 +579,12 @@ mod tests {
 
     #[test]
     fn extract_reply_blockquote_works() {
-        let block = r#"<div class="tgme_widget_message_bubble"><a class="tgme_widget_message_reply user-color-default" href="https://t.me/tnews365/35618"><div class="tgme_widget_message_author accent_color"><span class="tgme_widget_message_author_name" dir="auto">News Channel</span></div><div class="tgme_widget_message_text js-message_reply_text" dir="auto">quoted original content</div></a><div class="tgme_widget_message_text js-message_text">main text</div></div>"#;
+        let block = r#"<div class="tgme_widget_message_bubble"><a class="tgme_widget_message_reply user-color-default" href="https://t.me/some_channel/1"><div class="tgme_widget_message_author accent_color"><span class="tgme_widget_message_author_name" dir="auto">News Channel</span></div><div class="tgme_widget_message_text js-message_reply_text" dir="auto">quoted original content</div></a><div class="tgme_widget_message_text js-message_text">main text</div></div>"#;
         let q = extract_reply_blockquote(block);
         assert!(q.starts_with("<blockquote>"));
         assert!(q.ends_with("</blockquote>"));
         // Author wrapped in hyperlink to original message
-        assert!(q.contains(r#"<a href="https://t.me/tnews365/35618">News Channel</a>:"#));
+        assert!(q.contains(r#"<a href="https://t.me/some_channel/1">News Channel</a>:"#));
         assert!(q.contains("quoted original content"));
     }
 
