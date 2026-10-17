@@ -36,11 +36,14 @@ services:
       ## Admins (comma-separated); can use /cookies & /loget, receive platform alerts
       ADMIN_USER_IDS: "123456789"
 
-      ## 用户白名单（逗号分隔，可选——仅管理员使用时可留空）
-      ## User whitelist (comma-separated, optional — can be empty for admin-only use)
-      ALLOWED_USER_IDS: "123456789,987654321"
-
       ## ===== 访问控制 / Access control =====
+
+      ## 用户白名单（逗号分隔，可选）；仅管理员使用时可留空——管理员隐式放行，
+      ## 无需重复列入。ADMIN_USER_IDS 非空时留空此项即可正常单人管理使用。
+      ## User whitelist (comma-separated, optional); can be empty for admin-only use —
+      ## admins are implicitly allowed and need not be listed again. With a non-empty
+      ## ADMIN_USER_IDS, leaving this empty works fine for single-admin use.
+      # ALLOWED_USER_IDS: "123456789,987654321"
 
       ## 默认 false=仅管理员+白名单可用；true=对所有用户开放
       ## Default false = admins + whitelist only; true = open to all users
@@ -48,9 +51,12 @@ services:
 
       ## ===== 平台/网络拓扑（按部署环境调整）/ Platform & network topology =====
 
-      ## bot-api 容器内的媒体目录路径（file:// 零拷贝），默认即此值
-      ## Media directory path inside the bot-api container (file:// zero-copy); this is the default
-      BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
+      ## bot-api 容器内的媒体目录路径（file:// 零拷贝）。默认即此值，仅当本地
+      ## bot-api 部署使用了不同的容器内路径时才需取消注释并修改。
+      ## Media directory path inside the bot-api container (file:// zero-copy). This
+      ## is the default; uncomment only if your local bot-api uses a different
+      ## in-container path.
+      # BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
 
       ## 默认空=官方 API；本地 bot-api 时设置
       ## Empty = official API; set when using a local bot-api
