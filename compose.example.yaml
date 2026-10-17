@@ -32,17 +32,19 @@ services:
       ## BotFather token
       TELOXIDE_TOKEN: "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
 
-      ## 管理员（逗号分隔）；可用 /cookies、/loget，接收平台告警
-      ## Admins (comma-separated); can use /cookies & /loget, receive platform alerts
+      ## 管理员：必须配置，且只能一个用户 ID；可用 /cookies、/loget，接收平台告警。
+      ## 配置 0 个或多个将在启动时直接报错退出。
+      ## Admin: required, exactly one user ID; can use /cookies & /loget, receives
+      ## platform alerts. Setting zero or multiple IDs makes startup fail with an error.
       ADMIN_USER_IDS: "123456789"
 
       ## ===== 访问控制 / Access control =====
 
-      ## 用户白名单（逗号分隔，可选）；仅管理员使用时可留空——管理员隐式放行，
-      ## 无需重复列入。ADMIN_USER_IDS 非空时留空此项即可正常单人管理使用。
-      ## User whitelist (comma-separated, optional); can be empty for admin-only use —
-      ## admins are implicitly allowed and need not be listed again. With a non-empty
-      ## ADMIN_USER_IDS, leaving this empty works fine for single-admin use.
+      ## 用户白名单（逗号分隔，可选）；默认为空。可配置多个用户 ID。
+      ## 管理员隐式放行，无需重复列入——留空此项即可正常单人（仅管理员）使用。
+      ## User whitelist (comma-separated, optional); empty by default, may list
+      ## multiple IDs. The admin is implicitly allowed and need not be listed —
+      ## leaving this empty works fine for admin-only use.
       # ALLOWED_USER_IDS: "123456789,987654321"
 
       ## 默认 false=仅管理员+白名单可用；true=对所有用户开放

@@ -1155,25 +1155,18 @@ async fn notify_owner_html(bot: &Bot, state: &AppState, chat_id: &str, html_msg:
     }
 }
 
-/// Send an HTML notification to all admins (v1.11.0: after cookies were
-/// globalized, platform-level alerts go to admins instead of channel owners).
-/// Each admin receives the copy rendered in their own language preference;
-/// when no admins are configured, log a warn and leave a trace (a clue for
-/// troubleshooting silently lost alerts).
+/// Send an HTML notification to the admin (v1.11.0: after cookies were
+/// globalized, platform-level alerts go to admins instead of channel owners;
+/// v1.11.3: exactly one admin is configured, so this is a single recipient).
+/// The copy is rendered in the admin's own language preference.
 async fn notify_admins_html(
     bot: &Bot,
     state: &AppState,
     build_msg: impl Fn(Lang) -> String,
 ) {
-    let admins = &state.config.admin_user_ids;
-    if admins.is_empty() {
-        warn!("platform alert has no ADMIN_USER_IDS to notify");
-        return;
-    }
-    for &admin in admins {
-        let lang = owner_lang(state, admin).await;
-        notify_user_html(bot, admin, &build_msg(lang)).await;
-    }
+    let admin = state.config.admin_user_id;
+    let lang = owner_lang(state, admin).await;
+    notify_user_html(bot, admin, &build_msg(lang)).await;
 }
 
 /// Resolve the owner's language preference from DB.

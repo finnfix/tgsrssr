@@ -7,9 +7,10 @@ pub struct Config {
     pub token: String,
     pub bot_api_url: Option<String>,
     pub allowed_user_ids: Vec<i64>,
-    /// Admin user IDs: can manage cookies, fetch logs, and receive platform
-    /// health notifications. Implied in allowed_user_ids.
-    pub admin_user_ids: Vec<i64>,
+    /// The single admin user ID: can manage cookies, fetch logs, and receive
+    /// platform health notifications. Implied in allowed_user_ids. Exactly one
+    /// is required — parse_admin_id rejects 0 or multiple values at startup.
+    pub admin_user_id: i64,
     /// When true, any Telegram user can use the bot (open registration).
     /// When false (default), only admins + allowed_user_ids can interact.
     pub open_to_all: bool,
@@ -80,16 +81,12 @@ impl Config {
         let bot_api_url = std::env::var("BOT_API_URL").ok().filter(|s| !s.is_empty());
 
         let allowed_user_ids = parse_id_list("ALLOWED_USER_IDS");
-        let admin_user_ids = parse_id_list("ADMIN_USER_IDS");
-        // Empty whitelist = all users silently rejected (including /start);
-        // the bot appears dead. Logging isn't initialized yet, so use eprintln
-        // (consistent with parse_id_list).
-        if allowed_user_ids.is_empty() && admin_user_ids.is_empty() {
-            eprintln!("WARNING: ALLOWED_USER_IDS and ADMIN_USER_IDS are both empty or unset — ALL users will be rejected. The bot will appear dead.");
-        }
-        if admin_user_ids.is_empty() {
-            eprintln!("WARNING: ADMIN_USER_IDS is empty or unset — no user can manage cookies or fetch logs.");
-        }
+        // Exactly one admin is required. Missing (unset/empty/all-invalid) or
+        // more than one is a fatal misconfiguration: cookie/log management,
+        // command-menu elevation and platform alerts all key off this one user.
+        let admin_user_id = validate_single_admin(parse_id_list("ADMIN_USER_IDS"))?;
+        // Empty whitelist is fine now that the admin is always present and
+        // implicitly allowed (is_allowed checks admin_user_id).
         let open_to_all = env_parse_or("OPEN_TO_ALL", false);
 
         let db_path = PathBuf::from(env_or("DB_PATH", "data/rss_bot.db"));
@@ -123,7 +120,7 @@ impl Config {
             token,
             bot_api_url,
             allowed_user_ids,
-            admin_user_ids,
+            admin_user_id,
             open_to_all,
             db_path,
             media_dir,
@@ -168,16 +165,16 @@ impl Config {
     }
 
     /// Whether a user may interact with the bot at all.
-    /// OPEN_TO_ALL=true: everyone. Otherwise: admins + ALLOWED_USER_IDS.
+    /// OPEN_TO_ALL=true: everyone. Otherwise: the admin + ALLOWED_USER_IDS.
     pub fn is_allowed(&self, user_id: i64) -> bool {
         self.open_to_all
-            || self.admin_user_ids.contains(&user_id)
+            || self.admin_user_id == user_id
             || self.allowed_user_ids.contains(&user_id)
     }
 
-    /// Whether a user is an admin (cookies / loget / platform alerts).
+    /// Whether a user is the admin (cookies / loget / platform alerts).
     pub fn is_admin(&self, user_id: i64) -> bool {
-        self.admin_user_ids.contains(&user_id)
+        self.admin_user_id == user_id
     }
 }
 
@@ -215,4 +212,42 @@ fn parse_id_list(key: &str) -> Vec<i64> {
         }
     }
     ids
+}
+
+/// The admin list must resolve to exactly one user ID. Split out from
+/// `from_env` so it is unit-testable without touching process env.
+fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
+    match ids.len() {
+        1 => Ok(ids[0]),
+        0 => Err(anyhow::anyhow!(
+            "ADMIN_USER_IDS is required and must contain exactly one user ID"
+        )),
+        n => Err(anyhow::anyhow!(
+            "ADMIN_USER_IDS must contain exactly one user ID, got {}",
+            n
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_single_admin;
+
+    #[test]
+    fn single_admin_accepted() {
+        assert_eq!(validate_single_admin(vec![42]).unwrap(), 42);
+    }
+
+    #[test]
+    fn empty_admin_rejected() {
+        let err = validate_single_admin(vec![]).unwrap_err().to_string();
+        assert!(err.contains("required"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn multiple_admins_rejected() {
+        let err = validate_single_admin(vec![1, 2]).unwrap_err().to_string();
+        assert!(err.contains("exactly one"), "unexpected message: {}", err);
+        assert!(err.contains("got 2"), "unexpected message: {}", err);
+    }
 }

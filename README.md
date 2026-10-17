@@ -21,6 +21,7 @@
 - **富媒体管线**：图片/GIF/视频/文档自动识别分类发送，file_id 上传去重，超限自动转文档，媒体组成组发送
 - **多用户 + 管理员分级**：白名单/开放注册准入 + 频道归属按邀请者判定；管理员统一配置平台 cookie，所有用户共享
 - **单二进制部署**：Rust 编译产物 + SQLite，无外部数据库依赖，Docker 一键启动
+- **轻量常驻**：稳态运行内存约 20 MB（RSS，轻载实测），小型 VPS 即可承载；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
 
 ## 快速开始
 
@@ -38,7 +39,7 @@ cp compose.example.yaml compose.yaml
 
 # 2. 编辑 compose.yaml，填入必填项：
 #    TELOXIDE_TOKEN: "你的 BotFather token"
-#    ADMIN_USER_IDS: "你的用户ID"（管理员，管理 cookie/日志）
+#    ADMIN_USER_IDS: "你的用户ID"（管理员，必须且只能一个）
 
 # 3. 拉取镜像并启动
 docker compose pull
@@ -190,8 +191,8 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `TELOXIDE_TOKEN` | BotFather token（**必填**） | - |
-| `ADMIN_USER_IDS` | 管理员 ID，逗号分隔（**必填**）；可用 /cookies、/loget，接收平台告警 | - |
-| `ALLOWED_USER_IDS` | 用户白名单 ID，逗号分隔（可选，仅管理员使用时可留空） | - |
+| `ADMIN_USER_IDS` | 管理员，**必须配置且只允许一个**用户 ID；可用 /cookies、/loget，接收平台告警；为 0 个或多个时启动报错 | - |
+| `ALLOWED_USER_IDS` | 用户白名单 ID，逗号分隔、可配多个（可选，默认为空；管理员隐式放行，仅管理员使用时留空即可） | 空 |
 | `OPEN_TO_ALL` | true = 对所有用户开放；false = 仅管理员+白名单 | false |
 | `BOT_API_URL` | 本地 Bot API 地址；留空 = 官方 API | 空 |
 | `BOT_API_MEDIA_DIR` | bot-api 容器内媒体目录（file:// 零拷贝） | /var/lib/telegram-bot-api-media |
@@ -354,6 +355,7 @@ The following channels are powered by tgsrssr — check them out to see the push
 - **Rich media pipeline**: images/GIFs/videos/documents auto-detected and sent via the appropriate API, file_id upload dedup, oversized media auto-converted to documents, media grouped into albums
 - **Multi-user + admin tiers**: whitelist/open registration access + channel ownership by inviter; admins configure platform cookies once, shared by all users
 - **Single binary deployment**: Rust binary + SQLite, no external database, one-command Docker startup
+- **Lightweight footprint**: ~20 MB RSS in steady state (measured under light load), comfortable on a small VPS; in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
 
 ## Quick Start
 
@@ -371,7 +373,7 @@ cp compose.example.yaml compose.yaml
 
 # 2. Edit compose.yaml, fill in the required fields:
 #    TELOXIDE_TOKEN: "your BotFather token"
-#    ADMIN_USER_IDS: "your user ID" (admin: manages cookies/logs)
+#    ADMIN_USER_IDS: "your user ID" (admin: required, exactly one ID)
 
 # 3. Pull the image and start
 docker compose pull
@@ -523,8 +525,8 @@ Per-source filtering (/set source page → "Content filter"):
 | Variable | Description | Default |
 |---|---|---|
 | `TELOXIDE_TOKEN` | BotFather token (**required**) | - |
-| `ADMIN_USER_IDS` | Admin IDs, comma-separated (**required**); can use /cookies, /loget, receives platform alerts | - |
-| `ALLOWED_USER_IDS` | Whitelisted user IDs, comma-separated (optional; can be empty for admin-only use) | - |
+| `ADMIN_USER_IDS` | Admin, **required, exactly one** user ID; can use /cookies, /loget, receives platform alerts; startup fails with an error if 0 or multiple IDs are given | - |
+| `ALLOWED_USER_IDS` | Whitelisted user IDs, comma-separated, multiple allowed (optional; empty by default — the admin is implicitly allowed, leave empty for admin-only use) | empty |
 | `OPEN_TO_ALL` | true = open to all users; false = admins + whitelist only | false |
 | `BOT_API_URL` | Local Bot API address; empty = official API | empty |
 | `BOT_API_MEDIA_DIR` | Media dir path inside bot-api container (file:// zero-copy) | /var/lib/telegram-bot-api-media |

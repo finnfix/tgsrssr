@@ -126,16 +126,14 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = bot.set_my_commands(user_cmds).await {
         error!(error = %e, "failed to set bot commands");
     }
-    // Register the full menu including cookies/loget for each admin.
+    // Register the full menu including cookies/loget for the admin.
     // Use Chat scope (not ChatMember, which is rejected in private chats).
     // In private chats chat_id == user_id, so this targets the admin's DM.
-    for &admin in &cfg.admin_user_ids {
-        let scope = teloxide::types::BotCommandScope::Chat {
-            chat_id: teloxide::types::Recipient::Id(teloxide::types::ChatId(admin)),
-        };
-        if let Err(e) = bot.set_my_commands(all_cmds.clone()).scope(scope).await {
-            error!(admin = admin, error = %e, "failed to set admin command menu");
-        }
+    let scope = teloxide::types::BotCommandScope::Chat {
+        chat_id: teloxide::types::Recipient::Id(teloxide::types::ChatId(cfg.admin_user_id)),
+    };
+    if let Err(e) = bot.set_my_commands(all_cmds.clone()).scope(scope).await {
+        error!(admin = cfg.admin_user_id, error = %e, "failed to set admin command menu");
     }
 
     // Scheduler: fetch job + cleanup job + auto-heal job
