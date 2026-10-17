@@ -836,6 +836,35 @@ fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
     }
 }
 
+/// X sizes media through the `name` query parameter. Video preview frames are
+/// re-encoded JPEGs with no `orig` variant (requesting it 404s), so ask for
+/// `large` — the biggest one that always exists — instead of the `small`
+/// default the timeline returns.
+fn upgrade_x_cover(url: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (url, ""),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut has_name = false;
+    for p in query.split('&').filter(|p| !p.is_empty()) {
+        match p.strip_prefix("name=") {
+            Some(_v) => {
+                // Replace whatever size the response requested with large
+                // (small = timeline default, orig = photo-only and 404s for
+                // re-encoded video covers).
+                has_name = true;
+                parts.push("name=large".to_string());
+            }
+            None => parts.push(p.to_string()),
+        }
+    }
+    if !has_name {
+        parts.push("name=large".to_string());
+    }
+    format!("{base}?{}", parts.join("&"))
+}
+
 /// Append `<img>`/`<video>` tags for a tweet's media to the HTML body.
 /// Photos get ?name=orig (highest resolution); videos pick the highest-bitrate
 /// mp4 variant. Reads extended_entities.media, falling back to entities.media.
@@ -869,7 +898,28 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
                 });
                 if let Some(v) = best {
                     if let Some(url) = v["url"].as_str() {
-                        body.push_str(&format!("<video src=\"{}\"></video>", crate::push::escape_attr(url)));
+                        // preview_image_url is the video cover: emit it as the
+                        // poster attribute so the oversized/failed-video cover
+                        // fallback in media.rs has a URL to send. The field is
+                        // an object with a url in some response shapes and a
+                        // bare string in others, so accept both (same
+                        // dual-shape handling as weibo page_pic).
+                        let poster = m["preview_image_url"]["url"]
+                            .as_str()
+                            .or_else(|| m["preview_image_url"].as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(upgrade_x_cover);
+                        match poster {
+                            Some(p) => body.push_str(&format!(
+                                "<video src=\"{}\" poster=\"{}\"></video>",
+                                crate::push::escape_attr(url),
+                                crate::push::escape_attr(&p)
+                            )),
+                            None => body.push_str(&format!(
+                                "<video src=\"{}\"></video>",
+                                crate::push::escape_attr(url)
+                            )),
+                        }
                     }
                 }
             }
@@ -1798,5 +1848,95 @@ mod tests {
     fn unwrap_tweet_result_plain_passthrough() {
         let plain = serde_json::json!({ "rest_id": "999", "legacy": {} });
         assert_eq!(unwrap_tweet_result(&plain)["rest_id"].as_str(), Some("999"));
+    }
+
+    #[test]
+    fn append_media_tags_video_poster_object_shape() {
+        // preview_image_url is an object with a url field in the standard
+        // GraphQL shape; the poster attribute must be emitted so the
+        // oversized-video cover fallback has a URL to send. The cover is
+        // upgraded to name=large (no orig exists for video previews).
+        let legacy: Value = serde_json::json!({
+            "extended_entities": { "media": [{
+                "type": "video",
+                "preview_image_url": { "url": "https://pbs.twimg.com/media/COVER.jpg" },
+                "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 832000, "url": "https://video.twimg.com/x/low.mp4" },
+                    { "content_type": "video/mp4", "bitrate": 2560000, "url": "https://video.twimg.com/x/hd.mp4" }
+                ]}
+            }]}
+        });
+        let mut body = String::new();
+        append_media_tags(&mut body, &legacy);
+        assert_eq!(
+            body,
+            "<video src=\"https://video.twimg.com/x/hd.mp4\" poster=\"https://pbs.twimg.com/media/COVER.jpg?name=large\"></video>"
+        );
+    }
+
+    #[test]
+    fn append_media_tags_video_poster_bare_string_shape() {
+        // Some response shapes carry preview_image_url as a bare string;
+        // both forms must be accepted (same dual-shape handling as weibo
+        // page_pic). The timeline default is name=small and must be
+        // replaced with large.
+        let legacy: Value = serde_json::json!({
+            "extended_entities": { "media": [{
+                "type": "video",
+                "preview_image_url": "https://pbs.twimg.com/media/COVER2.jpg?name=small",
+                "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 100, "url": "https://video.twimg.com/y/a.mp4" }
+                ]}
+            }]}
+        });
+        let mut body = String::new();
+        append_media_tags(&mut body, &legacy);
+        assert!(body.contains("poster=\"https://pbs.twimg.com/media/COVER2.jpg?name=large\""));
+        assert!(!body.contains("name=small"));
+    }
+
+    #[test]
+    fn upgrade_x_cover_modes() {
+        // No query: append name=large.
+        assert_eq!(
+            upgrade_x_cover("https://pbs.twimg.com/media/A.jpg"),
+            "https://pbs.twimg.com/media/A.jpg?name=large"
+        );
+        // name=small: replace in place, keep other params.
+        assert_eq!(
+            upgrade_x_cover("https://pbs.twimg.com/media/B.jpg?format=jpg&name=small"),
+            "https://pbs.twimg.com/media/B.jpg?format=jpg&name=large"
+        );
+        // name=orig (photos never reach here, but be safe): orig 404s for
+        // re-encoded video covers, downgrade to large.
+        assert_eq!(
+            upgrade_x_cover("https://pbs.twimg.com/media/C.jpg?name=orig"),
+            "https://pbs.twimg.com/media/C.jpg?name=large"
+        );
+        // Already large: unchanged.
+        assert_eq!(
+            upgrade_x_cover("https://pbs.twimg.com/media/D.jpg?name=large"),
+            "https://pbs.twimg.com/media/D.jpg?name=large"
+        );
+    }
+
+    #[test]
+    fn append_media_tags_video_without_preview_keeps_plain_tag() {
+        // No usable preview_image_url: the tag stays without a poster
+        // attribute (unchanged legacy behavior).
+        let legacy: Value = serde_json::json!({
+            "extended_entities": { "media": [{
+                "type": "animated_gif",
+                "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 0, "url": "https://video.twimg.com/z/g.mp4" }
+                ]}
+            }]}
+        });
+        let mut body = String::new();
+        append_media_tags(&mut body, &legacy);
+        assert_eq!(
+            body,
+            "<video src=\"https://video.twimg.com/z/g.mp4\"></video>"
+        );
     }
 }
