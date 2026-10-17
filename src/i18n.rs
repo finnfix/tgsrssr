@@ -88,25 +88,10 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Zh, "start_text") => "你好，我是 RSS 订阅 Bot，将我加入频道或群组后开始工作。\n版本：v{}",
         (Lang::En, "start_text") => "Hi! I'm an RSS subscription Bot. Add me to a channel or group to get started.\nVersion: v{}",
 
-        // ===== Command descriptions (BotCommands) =====
-        (Lang::Zh, "cmd_desc_start") => "帮助",
-        (Lang::En, "cmd_desc_start") => "Help",
-        (Lang::Zh, "cmd_desc_set") => "订阅管理",
-        (Lang::En, "cmd_desc_set") => "Manage subscriptions",
-        (Lang::Zh, "cmd_desc_list") => "订阅列表",
-        (Lang::En, "cmd_desc_list") => "Subscription list",
-        (Lang::Zh, "cmd_desc_sub") => "添加订阅",
-        (Lang::En, "cmd_desc_sub") => "Add subscription",
-        (Lang::Zh, "cmd_desc_test") => "测试推送",
-        (Lang::En, "cmd_desc_test") => "Test push",
-        (Lang::Zh, "cmd_desc_find") => "查询消息源",
-        (Lang::En, "cmd_desc_find") => "Find message source",
-        (Lang::Zh, "cmd_desc_cookies") => "平台验证",
-        (Lang::En, "cmd_desc_cookies") => "Platform cookies",
-        (Lang::Zh, "cmd_desc_loget") => "获取日志",
-        (Lang::En, "cmd_desc_loget") => "Get logs",
-        (Lang::Zh, "cmd_desc_about") => "关于",
-        (Lang::En, "cmd_desc_about") => "About",
+        // ===== Command descriptions =====
+        // Removed: previously contained `cmd_desc_*` keys, but teloxide's
+        // BotCommands derive reads the #[command(description)] literals
+        // directly and never queries i18n; those keys were never referenced.
 
         // ===== /list =====
         (Lang::Zh, "list_usage") => "用法：<code>/list &lt;频道&gt;</code>",
@@ -221,8 +206,6 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "cookie_save_failed") => "❌ Failed to save cookie: {:#}",
         (Lang::Zh, "fkw_empty") => "❌ 未收到内容，已取消设置关键词。",
         (Lang::En, "fkw_empty") => "❌ No content received, keyword setup cancelled.",
-        (Lang::Zh, "fkw_clear_cmd") => "清空",
-        (Lang::En, "fkw_clear_cmd") => "clear",
         (Lang::Zh, "fkw_too_long") => "❌ 关键词过长（超过 500 字符），已取消。",
         (Lang::En, "fkw_too_long") => "❌ Keywords too long (>500 chars), cancelled.",
         (Lang::Zh, "fkw_cleared") => "✅ 关键词已清空，过滤已关闭。",
@@ -497,8 +480,6 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "label_entry") => "Entry",
         (Lang::Zh, "label_source") => "源",
         (Lang::En, "label_source") => "Source",
-        (Lang::Zh, "unknown_error") => "未知错误",
-        (Lang::En, "unknown_error") => "Unknown error",
 
         // ===== Media warnings =====
         (Lang::Zh, "media_image") => "图片",

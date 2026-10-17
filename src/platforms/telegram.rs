@@ -48,9 +48,31 @@ pub fn parse_channel_name(url: &str) -> Option<String> {
     } else {
         segs[0]
     };
-    // Reserved paths (t.me/s, /addstickers, bot commands, etc.).
+    // Reserved t.me paths: preview prefix, invite/share/proxy/gift/theme/
+    // sticker/chatlist routes, login pages, etc. Without a slug here, a link
+    // like `t.me/joinchat/ABCDEF` parses "joinchat" as a channel username
+    // (8 chars, all valid) and 404s forever after subscribing, accumulating
+    // fetch errors.
     const RESERVED: &[&str] = &[
-        "s", "i", "addstickers", "addemoji", "share", "proxy", "socks", "contact", "login", "setlanguage",
+        "s",
+        "i",
+        "c",
+        "joinchat",
+        "share",
+        "contact",
+        "login",
+        "setlanguage",
+        "confirmphone",
+        "addstickers",
+        "addemoji",
+        "addtheme",
+        "addlist",
+        "proxy",
+        "socks",
+        "boost",
+        "gift",
+        "gifts",
+        "username",
     ];
     if RESERVED.contains(&name) {
         return None;
@@ -78,9 +100,18 @@ static RE_CHAN_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_DATA_POST: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"data-post="([^"]+)""#).unwrap()
 });
-/// Message text container (main text only, not reply text).
-static RE_MSG_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<div[^>]*tgme_widget_message_text js-message_text[^>]*>(.*?)</div>"#).unwrap()
+/// Message text container opening tag (main text only, not reply text).
+/// Captures nothing: the inner HTML is extracted by a balanced-div position
+/// scan (see `extract_main_text_html`), because the body can contain nested
+/// `</div>` (blockquote / code blocks) that a non-greedy `(.*?)</div>` regex
+/// would truncate at, silently cutting the message (LESSONS: non-greedy
+/// truncation).
+/// The reply text div is class `tgme_widget_message_text js-message_reply_text`
+/// and cannot match: the pattern requires the literal `js-message_text`,
+/// absent from `js-message_reply_text` (no `js-message_` immediately precedes
+/// the reply's `_text` suffix).
+static RE_MSG_TEXT_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<div[^>]*tgme_widget_message_text js-message_text[^>]*>"#).unwrap()
 });
 /// Reply block: `<a class="tgme_widget_message_reply" href="...">...</a>`.
 /// Captures: [1]=href. Inner content is extracted by position-based scanning
@@ -94,9 +125,11 @@ static RE_REPLY_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_REPLY_AUTHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)tgme_widget_message_author_name[^>]*>(.*?)</span>"#).unwrap()
 });
-/// Reply text content.
-static RE_REPLY_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<div[^>]*js-message_reply_text[^>]*>(.*?)</div>"#).unwrap()
+/// Reply text container opening tag. Captures nothing: inner HTML is
+/// extracted by the balanced-div scan (`extract_balanced_div_inner`) since
+/// quoted content may itself contain nested `</div>`.
+static RE_REPLY_TEXT_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<div[^>]*js-message_reply_text[^>]*>"#).unwrap()
 });
 /// Photo: background-image url on the photo wrap.
 /// Anchored inside the `tgme_widget_message_photo_wrap` tag: the page also
@@ -110,10 +143,30 @@ static RE_PHOTO_BG: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_VIDEO_SRC: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)<video\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap()
 });
-/// Timestamp of the message link.
+/// Timestamp of the message link. Used only relative to an anchor position
+/// (see `extract_published`) — never as "first datetime in the block", since
+/// the reply block precedes the main text and embeds the quoted message's own
+/// `<time datetime>`.
 static RE_DATETIME: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"datetime="([^"]+)""#).unwrap()
 });
+/// Main message date container: `<div class="tgme_widget_message_date">`
+/// wrapping the message's own `<time datetime=...>`. Any tag name with this
+/// class qualifies; matched generically so a markup tweak (div→span) still
+/// anchors correctly.
+static RE_DATE_CONTAINER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<[a-z]+[^>]*tgme_widget_message_date[^>]*>"#).unwrap()
+});
+/// Anchor / div open-close tags for the balanced position scanners below.
+/// `\b` after the tag name avoids matching `<divider>`-style names.
+static RE_ANCHOR_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)<a\b").unwrap());
+static RE_ANCHOR_CLOSE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)</a\s*>").unwrap());
+static RE_DIV_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)<div\b").unwrap());
+static RE_DIV_CLOSE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)</div\s*>").unwrap());
 
 // ---------------------------------------------------------------------------
 // Main fetch entry point
@@ -244,17 +297,11 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str) -> Option<En
         return None;
     }
 
-    let published = RE_DATETIME
-        .captures(block)
-        .and_then(|c| DateTime::parse_from_rfc3339(&c[1]).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+    let published = extract_published(block);
 
     // Main text: keep raw HTML so downstream html_to_telegram_html
     // preserves hyperlinks (<a> tags) correctly.
-    let main_html = RE_MSG_TEXT
-        .captures(block)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
+    let main_html = extract_main_text_html(block, data_post);
 
     // Reply / quoted content → <blockquote>.
     let reply_html = extract_reply_blockquote(block);
@@ -306,10 +353,12 @@ fn extract_reply_blockquote(block: &str) -> String {
         })
         .unwrap_or_default();
 
-    // Reply text (keep raw HTML for link preservation).
-    let text = RE_REPLY_TEXT
-        .captures(&inner)
-        .map(|c| c[1].to_string())
+    // Reply text (keep raw HTML for link preservation): balanced-div scan so
+    // quoted content containing blockquotes/code blocks (inner `</div>`) is
+    // not truncated at the first close tag.
+    let text = RE_REPLY_TEXT_OPEN
+        .find(&inner)
+        .map(|m| extract_balanced_div_inner(&inner, m.end()).0)
         .unwrap_or_default();
 
     if text.trim().is_empty() {
@@ -327,41 +376,146 @@ fn extract_reply_blockquote(block: &str) -> String {
     format!("<blockquote>{}</blockquote>", quoted)
 }
 
-/// Given `block` and the byte offset just after an opening `<a ...>` tag,
+/// Parse the message's publish time from its **own** date anchor.
+///
+/// The reply block (`tgme_widget_message_reply`) sits before the main text
+/// and embeds the quoted message's own `<time datetime>` — inside a nested
+/// `tgme_widget_message_date` span too — so grabbing the first
+/// `datetime="..."` or the first date container in the block makes replies
+/// publish at the quoted message's timestamp (breaks ordering and
+/// fresh-entry detection).
+/// Strategy: compute the reply block's byte range via the balanced-anchor
+/// scan, then take the first `tgme_widget_message_date` container **outside**
+/// that range and read its datetime (bounded by the next `data-post`, i.e.
+/// the next message, so a stray match cannot leak). If no date container
+/// exists outside the reply (page redesigned), fall back to the first
+/// datetime positioned outside the reply range. Datetimes inside the reply
+/// block are never a source.
+fn extract_published(block: &str) -> Option<DateTime<Utc>> {
+    // Reply block byte range [opening tag start, matching `</a>` start);
+    // every datetime inside belongs to the quoted message. Unbalanced reply
+    // anchor (truncated markup): exclude through end of block — a missing
+    // timestamp is safer than the quoted message's wrong one.
+    let reply_range = RE_REPLY_BLOCK.find(block).map(|reply| {
+        let end = balanced_close_start(block, reply.end(), &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE, 1)
+            .unwrap_or(block.len());
+        (reply.start(), end)
+    });
+    let in_reply = |pos: usize| matches!(&reply_range, Some((s, e)) if pos >= *s && pos < *e);
+
+    // Preferred: date container outside the reply block, first datetime
+    // within it.
+    for open in RE_DATE_CONTAINER.find_iter(block) {
+        if in_reply(open.start()) {
+            continue;
+        }
+        let s = &block[open.end()..];
+        let s = match RE_DATA_POST.find(s) {
+            // Do not leak past this message's wrap into the next block.
+            Some(next) => &s[..next.start()],
+            None => s,
+        };
+        let dt = RE_DATETIME
+            .captures(s)
+            .and_then(|c| DateTime::parse_from_rfc3339(&c[1]).ok())
+            .map(|d| d.with_timezone(&Utc));
+        if dt.is_some() {
+            return dt;
+        }
+    }
+    // Fallback: first datetime positioned outside the reply range.
+    for caps in RE_DATETIME.captures_iter(block) {
+        if caps.get(0).map(|m| in_reply(m.start())).unwrap_or(true) {
+            continue;
+        }
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&caps[1]) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    None
+}
+
+/// Extract the main message text (raw HTML) via a balanced-div scan, with a
+/// warning when the container cannot be closed (page redesign guard, so a
+/// truncated body is observable instead of silent).
+fn extract_main_text_html(block: &str, data_post: &str) -> String {
+    let Some(open) = RE_MSG_TEXT_OPEN.find(block) else {
+        // No main-text container at all: media-only message; the skip-empty
+        // service-message check downstream handles this silently by design.
+        return String::new();
+    };
+    let (inner, balanced) = extract_balanced_div_inner(block, open.end());
+    if !balanced {
+        tracing::warn!(
+            post = %data_post,
+            "telegram message text div has no balanced </div>; body may be truncated (page structure may have changed)"
+        );
+    }
+    inner
+}
+
+/// Given `html` and the byte offset just after an opening `<a ...>` tag,
 /// scan forward counting anchor nesting depth and return the inner HTML up to
 /// (but excluding) the matching `</a>`. Handles nested `<a>` hyperlinks.
 /// Falls back to the rest of the string if no balanced close is found.
-fn extract_balanced_anchor_inner(block: &str, start: usize) -> String {
-    static RE_OPEN: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)<a\b").unwrap());
-    static RE_CLOSE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)</a\s*>").unwrap());
-    // Collect open/close positions at or after `start`, then walk in order.
+fn extract_balanced_anchor_inner(html: &str, start: usize) -> String {
+    // We are already inside the reply <a>, hence depth 1.
+    match balanced_close_start(html, start, &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE, 1) {
+        Some(pos) => html[start..pos].to_string(),
+        None => html[start..].to_string(),
+    }
+}
+
+/// Given `html` and the byte offset just after an opening `<div ...>` tag,
+/// scan forward counting **div** nesting depth (blockquotes / code blocks
+/// inside the message body produce nested `</div>` tags that a non-greedy
+/// `(.*?)</div>` regex would truncate at — LESSONS: non-greedy truncation).
+/// Returns the inner HTML up to (but excluding) the matching `</div>` and
+/// `true`; on an unbalanced region returns the remainder and `false` so
+/// callers can log a redesign warning.
+fn extract_balanced_div_inner(html: &str, start: usize) -> (String, bool) {
+    // We are already inside the text <div>, hence depth 1.
+    match balanced_close_start(html, start, &RE_DIV_OPEN, &RE_DIV_CLOSE, 1) {
+        Some(pos) => (html[start..pos].to_string(), true),
+        None => (html[start..].to_string(), false),
+    }
+}
+
+/// Shared skeleton for the balanced-tag scanners above: collect open/close
+/// tag positions at or after `start`, walk them in order from `initial_depth`,
+/// and return the offset where depth returns to 0 (the matching close tag).
+/// `None` when the region never closes.
+fn balanced_close_start(
+    html: &str,
+    start: usize,
+    re_open: &regex::Regex,
+    re_close: &regex::Regex,
+    initial_depth: i32,
+) -> Option<usize> {
     let mut events: Vec<(usize, bool)> = Vec::new(); // (pos, is_open)
-    for m in RE_OPEN.find_iter(block) {
+    for m in re_open.find_iter(html) {
         if m.start() >= start {
             events.push((m.start(), true));
         }
     }
-    for m in RE_CLOSE.find_iter(block) {
+    for m in re_close.find_iter(html) {
         if m.start() >= start {
             events.push((m.start(), false));
         }
     }
     events.sort_by_key(|e| e.0);
-    let mut depth = 1i32; // we are already inside the reply <a>
+    let mut depth = initial_depth;
     for (pos, is_open) in events {
         if is_open {
             depth += 1;
         } else {
             depth -= 1;
             if depth == 0 {
-                return block[start..pos].to_string();
+                return Some(pos);
             }
         }
     }
-    // No balanced close found: return the remainder.
-    block[start..].to_string()
+    None
 }
 
 /// Strip all HTML tags and decode entities, producing plain text for titles.
@@ -399,6 +553,10 @@ mod tests {
         assert_eq!(parse_channel_name("https://t.me/+abcde"), None);
         // Reserved path.
         assert_eq!(parse_channel_name("https://t.me/share/url?url=x"), None);
+        // Reserved invite path must not parse as a channel: "joinchat" is an
+        // otherwise-legal 8-char username and would 404 forever.
+        assert_eq!(parse_channel_name("https://t.me/joinchat/ABCDEF"), None);
+        assert_eq!(parse_channel_name("https://t.me/c/1234567890/42"), None);
         // Bare domain.
         assert_eq!(parse_channel_name("https://t.me/"), None);
         // Other host.
@@ -445,6 +603,65 @@ mod tests {
         assert!(q.contains("before"), "out: {}", q);
         assert!(q.contains("after"), "out: {}", q);
         assert!(q.contains(r#"<a href="https://example.com">link text</a>"#), "out: {}", q);
+    }
+
+    #[test]
+    fn extract_reply_blockquote_nested_div() {
+        // Quoted content containing an inner </div> (e.g. a blockquote or
+        // code block) must not truncate the reply text at the first close.
+        let block = r#"<a class="tgme_widget_message_reply" href="https://t.me/src/1"><span class="tgme_widget_message_author_name">Author</span><div class="tgme_widget_message_text js-message_reply_text">head<div class="quoted-inner">middle</div>tail</div></a>"#;
+        let q = extract_reply_blockquote(block);
+        assert!(q.contains("head"), "out: {}", q);
+        assert!(q.contains("middle"), "out: {}", q);
+        assert!(q.contains("tail"), "out: {}", q);
+    }
+
+    #[test]
+    fn main_text_nested_div_not_truncated() {
+        // The main text div may contain nested block divs; the balanced scan
+        // must return the full inner HTML up to the matching close.
+        let block = r#"<div class="tgme_widget_message" data-post="chan/9"><div class="tgme_widget_message_text js-message_text" dir="auto">A<div class="quote">B</div>C</div><div class="after">ignored</div></div>"#;
+        let html = extract_main_text_html(block, "chan/9");
+        assert_eq!(html, "A<div class=\"quote\">B</div>C");
+    }
+
+    #[test]
+    fn published_prefers_date_container_outside_reply() {
+        // The reply block appears before the main text and embeds the quoted
+        // message's own <time> (inside a nested tgme_widget_message_date
+        // wrapper). published must come from the message's own date
+        // container, never from the quoted timestamp.
+        let block = r#"<div class="tgme_widget_message" data-post="chan/200"><a class="tgme_widget_message_reply" href="https://t.me/chan/100"><div class="tgme_widget_message_date"><time datetime="2020-01-01T00:00:00+00:00">old</time></div><span class="tgme_widget_message_author_name">Author</span><div class="tgme_widget_message_text js-message_reply_text">quoted</div></a><div class="tgme_widget_message_text js-message_text">new main</div><div class="tgme_widget_message_date"><time datetime="2026-10-17T08:30:00+00:00">now</time></div></div>"#;
+        let dt = extract_published(block).expect("a publish time");
+        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(dt, expected);
+    }
+
+    #[test]
+    fn published_falls_back_after_reply_anchor() {
+        // Redesigned layout without a recognizable date container outside
+        // the reply: fall back to the first datetime after the reply block's
+        // matching </a>, still skipping the quoted message's timestamp.
+        let block = r#"<div class="tgme_widget_message" data-post="chan/200"><a class="tgme_widget_message_reply" href="https://t.me/chan/100"><time datetime="2020-01-01T00:00:00+00:00">old</time><span class="tgme_widget_message_author_name">Author</span><div class="tgme_widget_message_text js-message_reply_text">quoted</div></a><div class="tgme_widget_message_text js-message_text">new main</div><time datetime="2026-10-17T08:30:00+00:00">now</time></div>"#;
+        let dt = extract_published(block).expect("a publish time");
+        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(dt, expected);
+    }
+
+    #[test]
+    fn published_without_reply_unchanged() {
+        // A reply-less message block keeps the pre-existing behavior: its own
+        // (only) datetime is used, container present or not.
+        let block = r#"<div class="tgme_widget_message" data-post="chan/200"><div class="tgme_widget_message_date"><time datetime="2026-10-17T08:30:00+00:00">now</time></div><div class="tgme_widget_message_text js-message_text">plain</div></div>"#;
+        let dt = extract_published(block).expect("a publish time");
+        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(dt, expected);
     }
 
     #[test]

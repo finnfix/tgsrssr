@@ -175,6 +175,24 @@ pub fn strip_html_to_plain(html: &str) -> String {
     decode_entities(&RE_TAG.replace_all(html, " "))
 }
 
+/// Extract one cookie value from a Set-Cookie header string by name.
+/// Pure text manipulation, so it lives here alongside the other HTML/HTTP
+/// text helpers. Scans every `;`-separated attribute segment: the target
+/// cookie is not guaranteed to be first (e.g. `guest_id` may precede `ct0`,
+/// and some servers prepend attributes before it). Shared by the X ct0
+/// bootstrap (platforms/x.rs) and the Weibo visitor-cookie fetch (media.rs) —
+/// previously two near-identical private copies existed and had drifted
+/// (one only inspected the first segment, missing later cookies).
+pub fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}=", name);
+    set_cookie.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix(prefix.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Blockquote folding
 // ---------------------------------------------------------------------------
@@ -248,16 +266,20 @@ pub fn normalize_blockquote_fold(html: &str) -> String {
         };
         let mut inner = html[inner_start..close_start].trim().to_string();
         // Targeted handling: if the first paragraph (before the first \n\n)
-        // has visible length ≤ 50 chars, treat it as an RSSHub TG channel
+        // has visible length ≤ 50 units, treat it as an RSSHub TG channel
         // author header line and compress the \n\n there to \n.
+        // Measured in UTF-16 code units (visible_len), consistent with the
+        // rest of the pipeline — Telegram measures entity offsets the same
+        // way, so an emoji-heavy header is no longer under-counted by
+        // chars().count().
         if let Some(p) = inner.find("\n\n") {
             let first_para = &inner[..p];
-            let first_visible = RE_TAG.replace_all(first_para, "").chars().count();
+            let first_visible = visible_len(first_para);
             if first_visible <= HEADER_MAX_VISIBLE {
                 inner = format!("{}\n{}", first_para, &inner[p + 2..]);
             }
         }
-        let visible = RE_TAG.replace_all(&inner, "").chars().count();
+        let visible = visible_len(&inner);
         if visible > FOLD_THRESHOLD {
             out.push_str(&format!("<blockquote expandable>{}</blockquote>", inner));
         } else {

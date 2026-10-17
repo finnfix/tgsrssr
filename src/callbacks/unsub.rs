@@ -15,6 +15,10 @@ use crate::state::AppState;
 
 /// Handle single unsub callback: delete subscription, notify, then refresh the
 /// panel in place (same page, clamped) so the removed button disappears.
+// Page-threading params (page/ch_page/chlist_page) pushed the arity past the
+// clippy default; bundling them into a struct was considered and rejected as
+// more disruptive than the established allow pattern (start_pending_op).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_unsub_callback(
     bot: &Bot,
     q: &CallbackQuery,
@@ -22,6 +26,7 @@ pub(super) async fn handle_unsub_callback(
     sub_id: i64,
     page: usize,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let qid = q.id.clone();
@@ -78,13 +83,16 @@ pub(super) async fn handle_unsub_callback(
     }
 
     // Refresh the panel in place so the deleted source's button disappears.
-    render_unsub_panel(bot, PageTarget::Edit(q), &chat_id, state, page, ch_page, lang).await?;
+    render_unsub_panel(bot, PageTarget::Edit(q), &chat_id, state, page, ch_page, chlist_page, lang).await?;
 
     Ok(())
 }
 
 /// Render the /unsub panel (paginated, PAGE_SIZE items per page). Each source
 /// is directly an "unsubscribe" button; paused sources get a ⏸ marker.
+/// `chlist_page` is the channel-list page threaded through the round trip so
+/// the "back to channel page" button restores the user's original list page.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn render_unsub_panel(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -92,6 +100,7 @@ pub(super) async fn render_unsub_panel(
     state: &AppState,
     page: usize,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let subs = match db::get_subscriptions(&state.db, chat_id).await {
@@ -106,7 +115,7 @@ pub(super) async fn render_unsub_panel(
         // #15: the empty state provides a back-to-channel-page button; no dead page is left behind.
         let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             i18n::t(lang, "unsub_back"),
-            format!("c|ch|{}|{}", chat_id, ch_page),
+            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
         )]]);
         deliver(bot, &target, i18n::t(lang, "unsub_panel_empty"), Some(kb)).await?;
         return Ok(());
@@ -133,10 +142,10 @@ pub(super) async fn render_unsub_panel(
         let flag = if sub.active == 0 { " ⏸" } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{}. {}{}", start + offset + 1, crate::fetcher::truncate_text(name, 30), flag),
-            format!("c|unsub|{}|{}|{}", sub.id, page, ch_page),
+            format!("c|unsub|{}|{}|{}|{}", sub.id, page, ch_page, chlist_page),
         )]);
     }
-    if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|unsubpg|{}|{}|{}", chat_id, p, ch_page)) {
+    if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|unsubpg|{}|{}|{}|{}", chat_id, p, ch_page, chlist_page)) {
         buttons.push(nav);
     }
     // The "unsubscribe all" entry point appears only in this panel (there is no /unsub_all command);
@@ -144,11 +153,11 @@ pub(super) async fn render_unsub_panel(
     // #36: pass through the current page number so the confirmation page's "Back" button can restore the original page.
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_all_btn"),
-        format!("c|unsuballask|{}|{}|{}", chat_id, page, ch_page),
+        format!("c|unsuballask|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page),
     )]);
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_back"),
-        format!("c|ch|{}|{}", chat_id, ch_page),
+        format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
     )]);
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -159,6 +168,7 @@ pub(super) async fn render_unsub_panel(
 /// Render the "unsubscribe all" confirmation panel. Entry point is the button
 /// on the /unsub panel (c|unsuballask); there is no /unsub_all command.
 /// #36: the page parameter lets the "Back" button restore the unsub panel's original page number.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn render_unsub_all_confirm(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -166,6 +176,7 @@ pub(super) async fn render_unsub_all_confirm(
     state: &AppState,
     page: usize,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let subs = match db::get_subscriptions(&state.db, chat_id).await {
@@ -178,14 +189,14 @@ pub(super) async fn render_unsub_all_confirm(
     if subs.is_empty() {
         let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             i18n::t(lang, "unsub_back"),
-            format!("c|ch|{}|{}", chat_id, ch_page),
+            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
         )]]);
         deliver(bot, &target, i18n::t(lang, "unsub_panel_empty"), Some(kb)).await?;
         return Ok(());
     }
 
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = chat.as_ref().and_then(|c| c.title.clone()).unwrap_or_else(|| chat_id.to_string());
+    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
     let text = i18n::t(lang, "unsuball_confirm")
         .replacen("{}", &crate::push::format_chat_title_html(&title, chat_id), 1)
@@ -193,8 +204,8 @@ pub(super) async fn render_unsub_all_confirm(
         .replacen("{}", &subs.len().to_string(), 1);
 
     let kb = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "unsuball_confirm_btn"), format!("c|unsuball|{}|{}|{}", chat_id, ch_page, page)),
-        InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|unsubpg|{}|{}|{}", chat_id, page, ch_page)),
+        InlineKeyboardButton::callback(i18n::t(lang, "unsuball_confirm_btn"), format!("c|unsuball|{}|{}|{}|{}", chat_id, ch_page, page, chlist_page)),
+        InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|unsubpg|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page)),
     ]]);
 
     deliver(bot, &target, &text, Some(kb)).await?;
@@ -202,6 +213,7 @@ pub(super) async fn render_unsub_all_confirm(
 }
 
 /// Handle unsub_all callback: generate OPML backup, send it, then delete all.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_unsub_all_callback(
     bot: &Bot,
     q: &CallbackQuery,
@@ -209,6 +221,7 @@ pub(super) async fn handle_unsub_all_callback(
     chat_id: &str,
     ch_page: usize,
     page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let qid = q.id.clone();
@@ -264,7 +277,7 @@ pub(super) async fn handle_unsub_all_callback(
     let opml_bytes = opml.as_bytes().to_vec();
 
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = chat.as_ref().and_then(|c| c.title.clone()).unwrap_or_else(|| chat_id.to_string());
+    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
     let safe_name: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
     let filename = format!("rss_backup_{}.opml", safe_name);
 
@@ -292,7 +305,7 @@ pub(super) async fn handle_unsub_all_callback(
                 .await?;
             // Restore the confirmation page (the idempotency lock has already changed the message
             // to "Processing…"; without restoring it, retries would be locked out forever).
-            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, lang).await?;
+            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await?;
             return Ok(());
         }
     }
@@ -303,7 +316,7 @@ pub(super) async fn handle_unsub_all_callback(
         Err(e) => {
             bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
             // Restore the confirmation page (same as above).
-            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, lang).await?;
+            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await?;
             return Ok(());
         }
     };
@@ -329,7 +342,7 @@ pub(super) async fn handle_unsub_all_callback(
                 .replacen("{}", &crate::push::format_chat_id_html(chat_id), 1)
                 .replacen("{}", &count.to_string(), 1);
             let kb = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(i18n::t(lang, "unsuball_view"), format!("c|ch|{}|{}", chat_id, ch_page)),
+                InlineKeyboardButton::callback(i18n::t(lang, "unsuball_view"), format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page)),
             ]]);
             if bot
                 .edit_message_text(chat, mid, &text)

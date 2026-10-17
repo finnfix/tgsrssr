@@ -24,6 +24,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::state::AppState;
+// Set-Cookie value extraction is a pure text helper; it lives in htmltext
+// and is shared with media.rs (two drifting private copies previously).
+use crate::htmltext::extract_cookie_value;
 
 /// Public Bearer token used by x.com's web client (same for all users).
 const BEARER: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -43,6 +46,18 @@ const FEATURES_USER: &str = r#"{"hidden_profile_subscriptions_enabled":true,"rwe
 
 /// Features payload for UserTweets (timeline).
 const FEATURES_FEED: &str = r#"{"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_enhance_cards_enabled":false}"#;
+
+/// Hard cap on timeline pagination pages per fetch round. Protects against
+/// high-volume accounts (and against any cursor anomaly) blowing up one
+/// round: 3 pages x count=20 ≈ up to 60 tweets per cycle. Already-sent
+/// entries from older pages are still filtered downstream by the
+/// scheduler's sent-entry dedup, so widening the window never re-pushes.
+const MAX_TIMELINE_PAGES: usize = 3;
+
+/// Pause between timeline pages: extra requests inside one round raise
+/// rate-limit / risk-control exposure; the cadence matches the send-side
+/// pacer (1100 ms).
+const TIMELINE_PAGE_PAUSE: Duration = Duration::from_millis(1100);
 
 // ---------------------------------------------------------------------------
 // URL detection
@@ -161,18 +176,32 @@ async fn fetch_x_user_with_ct0(
     // the Weibo behavior; fix for #8).
     let mut entries: Vec<Entry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Conversion-failure counter (summarized in a warn at batch end; ensures an
-    // API redesign that fails the whole batch doesn't leave zero traces,
-    // aligned with the None-warn convention of Weibo's mblog_to_entry).
+    // Unexpected-conversion-failure counter (summarized in a warn at batch
+    // end; ensures an API redesign that fails the whole batch doesn't leave
+    // zero traces, aligned with the None-warn convention of Weibo's
+    // mblog_to_entry). Replies are an EXPECTED skip and are counted
+    // separately, so a normal day full of replies stops polluting the dropped
+    // signal that is meant to catch genuine structural breakage.
     let mut dropped = 0usize;
+    let mut skipped_replies = 0usize;
     for tweet in &tweets {
-        if let Some(e) = tweet_to_entry(tweet, screen_name, &display_name) {
-            if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
-                entries.push(e);
+        match tweet_to_entry(tweet, screen_name, &display_name) {
+            ConvertOutcome::Ok(e) => {
+                if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
+                    entries.push(*e);
+                }
             }
-        } else {
-            dropped += 1;
+            ConvertOutcome::SkippedReply => skipped_replies += 1,
+            ConvertOutcome::Failed => dropped += 1,
         }
+    }
+    if skipped_replies > 0 {
+        tracing::debug!(
+            screen_name = screen_name,
+            skipped = skipped_replies,
+            total = tweets.len(),
+            "X replies skipped during conversion (expected)"
+        );
     }
     if dropped > 0 {
         tracing::warn!(
@@ -277,20 +306,6 @@ async fn obtain_ct0_cached(state: &AppState, auth_token: &str) -> anyhow::Result
 async fn clear_ct0_cache(auth_token: &str) {
     let mut cache = ct0_cache().lock().await;
     cache.remove(auth_token);
-}
-
-/// Extract a named cookie value from a Set-Cookie header string.
-fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
-    let prefix = format!("{}=", name);
-    let first_part = set_cookie.split(';').next()?;
-    let first_part = first_part.trim();
-    if first_part.starts_with(&prefix) {
-        let val = &first_part[prefix.len()..];
-        if !val.is_empty() {
-            return Some(val.to_string());
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -581,8 +596,8 @@ async fn resolve_user(
 }
 
 /// Fetch the user's tweet timeline.
-/// `screen_name` is only used to pinpoint the zero-tweet warning (passed
-/// through to extract_tweets_from_instructions).
+/// `screen_name` is only used to pinpoint the zero-tweet warning (to tell
+/// which account it is when multiple X feeds are subscribed).
 async fn fetch_user_tweets(
     state: &AppState,
     auth_token: &str,
@@ -590,52 +605,140 @@ async fn fetch_user_tweets(
     rest_id: &str,
     screen_name: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let variables = serde_json::json!({
-        "userId": rest_id,
-        "count": 20,
-        "includePromotedContent": false,
-        "withQuickPromoteEligibilityTweetFields": true,
-        "withVoice": true,
-        "withV2Timeline": true
-    });
+    let mut tweets: Vec<Value> = Vec::new();
+    // Accumulated across pages: distinguishes a "truly empty timeline" from
+    // "no tweets extracted due to a structural redesign" (see the warn below).
+    let mut total_non_cursor_entries = 0usize;
+    // Instruction types from the first page, kept for the shape-change warn.
+    let mut first_page_instr_types: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    // Pages actually fetched this round (drives the inter-page pause so the
+    // first page — and a fully cached short timeline — stays request-cheap).
+    let mut pages_fetched = 0usize;
 
-    let json = gql_request(state, auth_token, ct0, OP_USER_TWEETS, &[
-        ("variables", variables.to_string()),
-        ("features", FEATURES_FEED.to_string()),
-    ]).await?;
-
-    // Navigate: data.user.result.timeline.timeline.instructions
-    let instructions = &json["data"]["user"]["result"]["timeline"]["timeline"]["instructions"];
-    if !instructions.is_array() {
-        // Try alternate path (timeline_v2)
-        let alt = &json["data"]["user"]["result"]["timeline_v2"]["timeline"]["instructions"];
-        if !alt.is_array() {
-            // Neither path yielded instructions: the API shape changed or the
-            // account is abnormal. Must NOT return Ok as an empty timeline —
-            // otherwise the scheduler treats it as success, resets the error
-            // count, and the X feed silently stops updating with no warning at
-            // all. Error out so the feed-level error count / retirement notice
-            // kicks in.
-            anyhow::bail!(
-                "X UserTweets response missing timeline instructions (API shape may have changed)"
-            );
+    for _page in 0..MAX_TIMELINE_PAGES {
+        if pages_fetched > 0 {
+            tokio::time::sleep(TIMELINE_PAGE_PAUSE).await;
         }
-        return extract_tweets_from_instructions(alt, screen_name);
+        let mut variables = serde_json::json!({
+            "userId": rest_id,
+            "count": 20,
+            "includePromotedContent": false,
+            "withQuickPromoteEligibilityTweetFields": true,
+            "withVoice": true,
+            "withV2Timeline": true
+        });
+        if let Some(c) = &cursor {
+            variables["cursor"] = Value::String(c.clone());
+        }
+
+        let json = gql_request(state, auth_token, ct0, OP_USER_TWEETS, &[
+            ("variables", variables.to_string()),
+            ("features", FEATURES_FEED.to_string()),
+        ]).await?;
+        pages_fetched += 1;
+
+        // Navigate: data.user.result.timeline.timeline.instructions
+        let mut instructions = &json["data"]["user"]["result"]["timeline"]["timeline"]["instructions"];
+        if !instructions.is_array() {
+            // Try alternate path (timeline_v2)
+            let alt = &json["data"]["user"]["result"]["timeline_v2"]["timeline"]["instructions"];
+            if !alt.is_array() {
+                // Neither path yielded instructions: the API shape changed or the
+                // account is abnormal. Must NOT return Ok as an empty timeline —
+                // otherwise the scheduler treats it as success, resets the error
+                // count, and the X feed silently stops updating with no warning at
+                // all. Error out so the feed-level error count / retirement notice
+                // kicks in. Bail mid-pagination too: error propagation is
+                // unchanged (cookie / stale-ct0 marker / rate-limit texts kept).
+                anyhow::bail!(
+                    "X UserTweets response missing timeline instructions (API shape may have changed)"
+                );
+            }
+            instructions = alt;
+        }
+        if pages_fetched == 1 {
+            first_page_instr_types = instructions
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i["type"].as_str().map(|t| t.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+
+        let page = extract_timeline_page(instructions);
+        total_non_cursor_entries += page.non_cursor_entries;
+        let page_tweet_count = page.tweets.len();
+        tweets.extend(page.tweets);
+
+        // Stop conditions (none can loop forever): no bottom cursor, a cursor
+        // identical to the one just used (X sometimes repeats it on an
+        // exhausted timeline), or a page that yielded no tweets at all
+        // (further pages cannot recover from an empty/redesigned page).
+        // Pages with older already-sent tweets are still safe: the scheduler
+        // filters them via the sent-entry table (widening the window never
+        // re-pushes).
+        let Some(next) = page.bottom_cursor else { break };
+        if page_tweet_count == 0 || Some(&next) == cursor.as_ref() {
+            break;
+        }
+        cursor = Some(next);
     }
-    extract_tweets_from_instructions(instructions, screen_name)
+
+    // instructions existed and non-cursor entries exist, yet not a single
+    // tweet was extracted across all pages: most likely an entry-structure
+    // redesign (e.g. TweetTombstone wrapping). Must not silently return
+    // empty — the scheduler would treat it as success, reset the error
+    // count, and the X feed would silently stop updating with zero logs
+    // (the failure mode v1.4.3 set out to eliminate, recurring one layer
+    // deeper). Leave a warn to aid debugging; a truly empty timeline
+    // (cursors only) does not warn.
+    if tweets.is_empty() && total_non_cursor_entries > 0 {
+        tracing::warn!(
+            screen_name = screen_name,
+            non_cursor_entries = total_non_cursor_entries,
+            instruction_types = ?first_page_instr_types,
+            "X timeline has entries but zero tweets extracted (API shape may have changed)"
+        );
+    }
+    Ok(tweets)
 }
 
-/// Extract tweet objects from GraphQL timeline instructions.
-/// `screen_name` is only used to pinpoint the zero-tweet warning (to tell
-/// which account it is when multiple X feeds are subscribed).
-fn extract_tweets_from_instructions(instructions: &Value, screen_name: &str) -> anyhow::Result<Vec<Value>> {
+/// One parsed timeline page: tweet result objects, the count of non-cursor
+/// entries, and the bottom pagination cursor (if any).
+/// `tweets` / `non_cursor_entries` / `bottom_cursor` semantics are identical
+/// to the pre-pagination single-page extractor.
+struct TimelinePage {
+    tweets: Vec<Value>,
+    non_cursor_entries: usize,
+    bottom_cursor: Option<String>,
+}
+
+/// Extract tweet objects and the pagination cursor from GraphQL timeline
+/// instructions (one page).
+fn extract_timeline_page(instructions: &Value) -> TimelinePage {
     let mut tweets = Vec::new();
-    // Count of non-cursor entries: used to distinguish a "truly empty
-    // timeline" from "no tweets extracted due to a structural redesign".
     let mut non_cursor_entries = 0usize;
+    let mut bottom_cursor: Option<String> = None;
     let empty_instructions = Vec::new();
     for instr in instructions.as_array().unwrap_or(&empty_instructions) {
         let instr_type = instr["type"].as_str().unwrap_or("");
+        // Dedicated pagination instruction: carries only a cursor entry
+        // (entryId `cursor-bottom-…`), never tweets. Read the bottom token
+        // from it, contributing neither tweets nor the non-cursor count.
+        if instr_type == "TimelineSuggestCursor" {
+            if let Some(entry) = instr.get("entry") {
+                let entry_id = entry["entryId"].as_str().unwrap_or("");
+                if bottom_cursor.is_none() {
+                    if let Some(v) = cursor_entry_value(entry_id, entry) {
+                        bottom_cursor = Some(v);
+                    }
+                }
+            }
+            continue;
+        }
         let entries: Option<Vec<&Value>> = if instr_type == "TimelineAddEntries" {
             instr["entries"].as_array().map(|a| a.iter().collect())
         } else if instr_type == "TimelineAddEntry" {
@@ -646,33 +749,51 @@ fn extract_tweets_from_instructions(instructions: &Value, screen_name: &str) -> 
         if let Some(entries) = entries {
             for entry in entries {
                 let entry_id = entry["entryId"].as_str().unwrap_or("");
-                if !entry_id.starts_with("cursor-") {
+                if entry_id.starts_with("cursor-") {
+                    // Cursor entry: not a tweet, but the bottom one carries
+                    // the token needed to request the next page.
+                    if bottom_cursor.is_none() {
+                        if let Some(v) = cursor_entry_value(entry_id, entry) {
+                            bottom_cursor = Some(v);
+                        }
+                    }
+                } else {
                     non_cursor_entries += 1;
+                    collect_tweet_results(entry, &mut tweets);
                 }
-                collect_tweet_results(entry, &mut tweets);
             }
         }
     }
-    // instructions is non-empty and non-cursor entries exist, yet not a single
-    // tweet can be extracted: most likely an entry-structure redesign (e.g.
-    // TweetTombstone wrapping). Must not silently return empty — the scheduler
-    // would treat it as success, reset the error count, and the X feed would
-    // silently stop updating with zero logs (the failure mode v1.4.3 set out
-    // to eliminate, recurring one layer deeper). Leave a warn to aid debugging;
-    // a truly empty timeline (cursors only) does not warn.
-    if tweets.is_empty() && non_cursor_entries > 0 {
-        let types: Vec<&str> = instructions
-            .as_array()
-            .map(|a| a.iter().filter_map(|i| i["type"].as_str()).collect())
-            .unwrap_or_default();
-        tracing::warn!(
-            screen_name = screen_name,
-            non_cursor_entries = non_cursor_entries,
-            instruction_types = ?types,
-            "X timeline has entries but zero tweets extracted (API shape may have changed)"
-        );
+    TimelinePage {
+        tweets,
+        non_cursor_entries,
+        bottom_cursor,
     }
-    Ok(tweets)
+}
+
+/// Bottom pagination cursor token from a timeline cursor entry.
+/// Two shapes seen in the wild: the real opaque token in `content.value`
+/// (with `content.cursorType == "Bottom"`), or the token embedded in the
+/// entryId itself (`cursor-bottom-<value>`, e.g. TimelineSuggestCursor).
+/// Neither present → None (fall back to single-page mode rather than
+/// sending a bogus cursor).
+fn cursor_entry_value(entry_id: &str, entry: &Value) -> Option<String> {
+    let is_bottom = entry["content"]["cursorType"].as_str() == Some("Bottom")
+        || entry_id.starts_with("cursor-bottom-");
+    if !is_bottom {
+        return None;
+    }
+    if let Some(v) = entry["content"]["value"].as_str() {
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    // entryId shape: cursor-bottom-<value>
+    let suffix = entry_id.strip_prefix("cursor-bottom-")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(suffix.to_string())
 }
 
 /// Unwrap a `{__typename:"TweetWithVisibilityResults", tweet:{...}}` wrapper to
@@ -999,16 +1120,16 @@ fn tweet_full_text(result: &Value) -> String {
 }
 
 /// Append a RT/QT blockquote to the body. `prefix` = "RT" or "QT".
-/// `include_media`: RT needs media tags appended, QT does not.
+/// `include_media`: whether to append the quoted tweet's media tags. Both
+/// call sites in tweet_to_entry now pass true (v1.10.16: QT media was
+/// included to match RT, so image-only quote tweets no longer degrade to
+/// plain text when the main tweet itself has no media); the flag is kept
+/// for flexibility and tests.
 /// M7 fix: the former RT and QT blocks (~25 lines) were verbatim duplicates;
 /// collapsed into a single function.
 fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_media: bool) {
-    // Handle TweetWithVisibilityResults wrapper (same as tweet_to_entry).
-    let result = if result["__typename"].as_str() == Some("TweetWithVisibilityResults") {
-        &result["tweet"]
-    } else {
-        result
-    };
+    // Handle TweetWithVisibilityResults wrapper (shared with tweet_to_entry).
+    let result = unwrap_tweet_result(result);
     let legacy = &result["legacy"];
     let text = tweet_full_text(result);
     let screen = extract_screen_name(result);
@@ -1044,22 +1165,39 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_m
     ));
 }
 
+/// Result of converting one collected tweet to an Entry, distinguishing an
+/// expected skip from a genuine parse failure so the batch-end dropped-warn
+/// only reflects structural breakage (replies were previously counted as
+/// dropped and fired the "legacy missing?" warn on any reply-heavy day).
+enum ConvertOutcome {
+    /// Converted successfully. Entry is boxed: feed-rs Entry is large and the
+    /// skip/fail variants carry no data, so an inline Entry would make every
+    /// outcome the size of Entry (clippy::large_enum_variant).
+    Ok(Box<Entry>),
+    /// Expected skip: a reply (the timeline only pushes root tweets).
+    SkippedReply,
+    /// Unexpected failure: legacy missing or no usable id (API shape change).
+    Failed,
+}
+
 /// Convert a GraphQL tweet result object into a feed-rs Entry.
-fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Option<Entry> {
+fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> ConvertOutcome {
     // Handle TweetWithVisibilityResults wrapper (shared with collect_tweet_results).
     let tweet = unwrap_tweet_result(tweet);
 
     let legacy = &tweet["legacy"];
     if legacy.is_null() {
-        return None;
+        return ConvertOutcome::Failed;
     }
-    let id = legacy["id_str"].as_str()
-        .or_else(|| tweet["rest_id"].as_str())?
-        .to_string();
+    let Some(id_str) = legacy["id_str"].as_str().or_else(|| tweet["rest_id"].as_str()) else {
+        return ConvertOutcome::Failed;
+    };
+    let id = id_str.to_string();
 
-    // Skip replies (only root tweets in the timeline).
+    // Skip replies (only root tweets in the timeline). Expected, not a
+    // conversion failure: counted separately, never in the dropped warn.
     if legacy["in_reply_to_status_id_str"].is_string() {
-        return None;
+        return ConvertOutcome::SkippedReply;
     }
 
     // Full text: note_tweet takes priority, falling back to legacy.full_text
@@ -1112,18 +1250,16 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Optio
 
     let link = format!("https://x.com/{}/status/{}", screen_name, id);
 
-    Some(crate::platforms::make_entry(id, title, display_name.to_string(), body, "text/html", link, published))
+    ConvertOutcome::Ok(Box::new(crate::platforms::make_entry(
+        id, title, display_name.to_string(), body, "text/html", link, published,
+    )))
 }
 
 /// Extract screen_name from a tweet result object, trying multiple API paths.
 /// Handles TweetWithVisibilityResults wrapper transparently.
 fn extract_screen_name(tweet_result: &Value) -> &str {
-    // Unwrap TweetWithVisibilityResults if present.
-    let tr = if tweet_result["__typename"].as_str() == Some("TweetWithVisibilityResults") {
-        &tweet_result["tweet"]
-    } else {
-        tweet_result
-    };
+    // Unwrap TweetWithVisibilityResults if present (shared helper).
+    let tr = unwrap_tweet_result(tweet_result);
     // Path 1: core.screen_name (older API shape)
     if let Some(s) = tr["core"]["screen_name"].as_str() {
         return s;
@@ -1289,6 +1425,96 @@ mod tests {
         let header = "ct0=abc123xyz; Max-Age=14400; Domain=.x.com; Path=/; Secure";
         assert_eq!(extract_cookie_value(header, "ct0"), Some("abc123xyz".into()));
         assert_eq!(extract_cookie_value(header, "other"), None);
+    }
+
+    #[test]
+    fn extract_cookie_value_scans_all_segments() {
+        // Regression: the target key may not be the first `;` segment
+        // (some Set-Cookie headers carry attributes or extra cookies first);
+        // aligned with media.rs semantics.
+        let header = "guest_id=v1%3A123; ct0=abc123xyz; Path=/; Secure";
+        assert_eq!(extract_cookie_value(header, "ct0"), Some("abc123xyz".into()));
+        assert_eq!(extract_cookie_value(header, "guest_id"), Some("v1%3A123".into()));
+    }
+
+    #[test]
+    fn extract_timeline_page_reads_bottom_cursor_from_content_value() {
+        let instructions = serde_json::json!([
+            {
+                "type": "TimelineAddEntries",
+                "entries": [
+                    {"entryId": "cursor-top-1", "content": {"cursorType": "Top", "value": "TOPCURSOR"}},
+                    {"entryId": "tweet-123", "content": {"itemContent": {"tweet_results": {"result":
+                        {"rest_id": "123", "legacy": {"id_str": "123"}}}}}},
+                    {"entryId": "cursor-bottom-1", "content": {"cursorType": "Bottom", "value": "BOTTOMCURSOR"}}
+                ]
+            }
+        ]);
+        let page = extract_timeline_page(&instructions);
+        assert_eq!(page.tweets.len(), 1);
+        assert_eq!(page.non_cursor_entries, 1);
+        assert_eq!(page.bottom_cursor.as_deref(), Some("BOTTOMCURSOR"));
+    }
+
+    #[test]
+    fn extract_timeline_page_reads_cursor_from_suggest_cursor_and_entry_id() {
+        // TimelineSuggestCursor instruction, token embedded in the entryId.
+        let instructions = serde_json::json!([
+            {"type": "TimelineAddEntries", "entries": [
+                {"entryId": "tweet-1", "content": {"itemContent": {"tweet_results": {"result":
+                    {"rest_id": "1", "legacy": {"id_str": "1"}}}}}}
+            ]},
+            {"type": "TimelineSuggestCursor", "entry":
+                {"entryId": "cursor-bottom-ABC123", "content": {"cursorType": "Bottom"}}}
+        ]);
+        let page = extract_timeline_page(&instructions);
+        assert_eq!(page.tweets.len(), 1);
+        assert_eq!(page.bottom_cursor.as_deref(), Some("ABC123"));
+    }
+
+    #[test]
+    fn extract_timeline_page_no_cursor_when_bottom_missing() {
+        let instructions = serde_json::json!([
+            {"type": "TimelineAddEntries", "entries": [
+                {"entryId": "cursor-top-1", "content": {"cursorType": "Top", "value": "TOP"}},
+                {"entryId": "tweet-1", "content": {"itemContent": {"tweet_results": {"result":
+                    {"rest_id": "1", "legacy": {"id_str": "1"}}}}}}
+            ]}
+        ]);
+        let page = extract_timeline_page(&instructions);
+        assert_eq!(page.bottom_cursor, None);
+    }
+
+    #[test]
+    fn tweet_to_entry_classifies_reply_as_expected_skip() {
+        // Replies must NOT be reported as conversion failures (dropped):
+        // they are an expected skip counted separately.
+        let reply = serde_json::json!({
+            "rest_id": "5",
+            "legacy": {
+                "id_str": "5",
+                "full_text": "hi",
+                "in_reply_to_status_id_str": "4"
+            }
+        });
+        assert!(matches!(
+            tweet_to_entry(&reply, "user", "User"),
+            ConvertOutcome::SkippedReply
+        ));
+        // Missing legacy is a genuine structural failure.
+        let broken = serde_json::json!({"rest_id": "6"});
+        assert!(matches!(
+            tweet_to_entry(&broken, "user", "User"),
+            ConvertOutcome::Failed
+        ));
+        let ok = serde_json::json!({
+            "rest_id": "7",
+            "legacy": {"id_str": "7", "full_text": "hello"}
+        });
+        assert!(matches!(
+            tweet_to_entry(&ok, "user", "User"),
+            ConvertOutcome::Ok(_)
+        ));
     }
 
     #[test]

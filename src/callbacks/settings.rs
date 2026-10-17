@@ -21,7 +21,7 @@ pub(super) async fn render_settings_page(
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = chat.as_ref().and_then(|c| c.title.clone()).unwrap_or_else(|| chat_id.to_string());
+    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
     let iv_label = fmt_interval(lang, cfg.interval_minutes);
     let cm_label = fmt_content_mode(lang, &cfg.content_mode);
@@ -204,21 +204,42 @@ pub(super) async fn render_settings_source(
 }
 
 /// Load chat config, creating the row on first access.
+/// Tolerant variant for DISPLAY paths (render_*): a transient DB read error
+/// falls back to the default row so the panel still renders. Write/toggle
+/// paths must use `load_chat_config_checked` instead — toggling from a wrong
+/// baseline persists an override contradicting the user's real setting.
 pub(super) async fn load_chat_config(db: &crate::db::Db, chat_id: &str) -> db::ChatConfigRow {
-    let cfg = db::get_chat_config(db, chat_id).await.ok().flatten();
-    match cfg {
-        Some(c) => c,
+    match load_chat_config_checked(db, chat_id).await {
+        Ok(c) => c,
+        Err(_) => default_chat_config(chat_id.to_string()),
+    }
+}
+
+/// Strict variant for WRITE/toggle paths: propagates a DB read error so the
+/// caller aborts (the callback wrapper answers and clears the spinner) rather
+/// than writing an override computed from a wrong default baseline. A genuinely
+/// missing row (Ok(None)) is still a valid "use defaults" case, not an error.
+pub(super) async fn load_chat_config_checked(
+    db: &crate::db::Db,
+    chat_id: &str,
+) -> anyhow::Result<db::ChatConfigRow> {
+    match db::get_chat_config(db, chat_id).await? {
+        Some(c) => Ok(c),
         None => {
             db::ensure_chat_config(db, chat_id).await.ok();
-            db::ChatConfigRow {
-                chat_id: chat_id.to_string(),
-                interval_minutes: db::DEFAULT_INTERVAL_MINUTES,
-                content_mode: db::DEFAULT_CONTENT_MODE.to_string(),
-                source_display: db::DEFAULT_SOURCE_DISPLAY.to_string(),
-                caption_above_media: db::DEFAULT_CAPTION_ABOVE_MEDIA,
-                link_preview: db::DEFAULT_LINK_PREVIEW,
-            }
+            Ok(default_chat_config(chat_id.to_string()))
         }
+    }
+}
+
+fn default_chat_config(chat_id: String) -> db::ChatConfigRow {
+    db::ChatConfigRow {
+        chat_id,
+        interval_minutes: db::DEFAULT_INTERVAL_MINUTES,
+        content_mode: db::DEFAULT_CONTENT_MODE.to_string(),
+        source_display: db::DEFAULT_SOURCE_DISPLAY.to_string(),
+        caption_above_media: db::DEFAULT_CAPTION_ABOVE_MEDIA,
+        link_preview: db::DEFAULT_LINK_PREVIEW,
     }
 }
 
@@ -251,12 +272,16 @@ pub(super) fn fmt_source_display(lang: Lang, s: &str) -> &'static str {
 }
 
 /// Second-level page: feed-level push interval override.
+/// `chlist_page` is the channel-list page carried through the round trip so
+/// "back to feed page" → "back to channel page" → "back to channel list"
+/// keeps the user's original positions.
 pub(super) async fn render_feed_interval(
     bot: &Bot,
     target: PageTarget<'_>,
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let Some((_sub, cfg)) = load_feed_ctx(bot, &target, sub_id, state, lang).await? else {
@@ -275,8 +300,8 @@ pub(super) async fn render_feed_interval(
         require_override_for_mark: true,
         cb_prefix: "c|srcfi",
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}", ch_page),
-        back_cb: format!("c|src|{}|{}", sub_id, ch_page),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -289,6 +314,7 @@ pub(super) async fn render_feed_mode(
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let Some((_sub, cfg)) = load_feed_ctx(bot, &target, sub_id, state, lang).await? else {
@@ -311,8 +337,8 @@ pub(super) async fn render_feed_mode(
         require_override_for_mark: true,
         cb_prefix: "c|srcfm",
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}", ch_page),
-        back_cb: format!("c|src|{}|{}", sub_id, ch_page),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -325,6 +351,7 @@ pub(super) async fn render_feed_source(
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let Some((_sub, cfg)) = load_feed_ctx(bot, &target, sub_id, state, lang).await? else {
@@ -344,20 +371,36 @@ pub(super) async fn render_feed_source(
         require_override_for_mark: true,
         cb_prefix: "c|srcfs",
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}", ch_page),
-        back_cb: format!("c|src|{}|{}", sub_id, ch_page),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
 }
 
 /// Second-level page: content filter settings for a feed.
+///
+/// Public entry point kept for the command path (filter-keyword reply refresh)
+/// which has no channel-list context (a PendingOp stores ch_page only).
 pub async fn render_feed_filter(
     bot: &Bot,
     target: PageTarget<'_>,
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    lang: Lang,
+) -> ResponseResult<()> {
+    render_feed_filter_impl(bot, target, sub_id, state, ch_page, 0, lang).await
+}
+
+/// Internal filter renderer carrying `chlist_page` through every button.
+pub(super) async fn render_feed_filter_impl(
+    bot: &Bot,
+    target: PageTarget<'_>,
+    sub_id: i64,
+    state: &AppState,
+    ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let Some(sub) = load_sub_or_deliver(bot, &target, &state.db, sub_id, lang).await? else {
@@ -382,11 +425,11 @@ pub async fn render_feed_filter(
     let mode_btn_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_to_bl") } else { i18n::t(lang, "filter_to_wl") };
 
     let buttons = vec![
-        vec![InlineKeyboardButton::callback(toggle_label, format!("c|srcftoggle|{}|{}", sub_id, ch_page))],
-        vec![InlineKeyboardButton::callback(mode_btn_label, format!("c|srcfmode|{}|{}", sub_id, ch_page))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "filter_set_kw"), format!("c|srcfkw|{}|{}", sub_id, ch_page))],
+        vec![InlineKeyboardButton::callback(toggle_label, format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page))],
+        vec![InlineKeyboardButton::callback(mode_btn_label, format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page))],
+        vec![InlineKeyboardButton::callback(i18n::t(lang, "filter_set_kw"), format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page))],
         vec![
-            InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|src|{}|{}", sub_id, ch_page)),
+            InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page)),
             InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
         ],
     ];

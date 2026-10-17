@@ -13,11 +13,23 @@ use crate::db::{self, Db};
 /// L6 fix: run_all_cleanup and run_startup_cleanup duplicated the same
 /// 5-task sequence; collapsed into one function parameterized by context.
 async fn run_cleanup_tasks(config: &Config, db_pool: &Db, ctx: &str) {
-    if let Err(e) = cleanup_outbound(config, db_pool).await {
-        warn!(error = %e, ctx = ctx, "outbound cleanup failed");
-    }
-    if let Err(e) = enforce_media_quota(config, db_pool).await {
-        warn!(error = %e, ctx = ctx, "media quota enforcement failed");
+    // The two media-cleanup passes below both need the outbox protection set.
+    // Computing it once here (instead of once per pass) halves the full-table
+    // outbox scan cost. On query failure both media passes are skipped (an
+    // empty protection set would delete retry-window media), but the
+    // unrelated log/database/backup passes still run.
+    match outbox_protected_paths(db_pool).await {
+        Ok(protected) => {
+            if let Err(e) = cleanup_outbound(config, &protected).await {
+                warn!(error = %e, ctx = ctx, "outbound cleanup failed");
+            }
+            if let Err(e) = enforce_media_quota(config, &protected).await {
+                warn!(error = %e, ctx = ctx, "media quota enforcement failed");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, ctx = ctx, "outbox query failed, skipping media cleanup passes to protect retry media");
+        }
     }
     if let Err(e) = cleanup_logs(config).await {
         warn!(error = %e, ctx = ctx, "log cleanup failed");
@@ -44,9 +56,9 @@ pub async fn run_all_cleanup(config: &Config, db_pool: &Db) {
 /// would miss entries that need protection.
 async fn outbox_protected_paths(db_pool: &Db) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
     let mut set = std::collections::HashSet::new();
-    let rows = db::outbox_fetch_due(db_pool, i64::MAX, i64::MAX).await?;
-    for row in &rows {
-        if let Ok(items) = serde_json::from_str::<Vec<crate::media::MediaItem>>(&row.media_json) {
+    let media_jsons = db::outbox_all_media_json(db_pool).await?;
+    for mj in &media_jsons {
+        if let Ok(items) = serde_json::from_str::<Vec<crate::media::MediaItem>>(mj) {
             for item in &items {
                 set.insert(item.path.clone());
                 if let Some(tp) = &item.thumb_path {
@@ -59,11 +71,14 @@ async fn outbox_protected_paths(db_pool: &Db) -> anyhow::Result<std::collections
 }
 
 /// Remove outbound date directories older than TTL.
-/// Protects media referenced by the outbox: even if a directory is past its
-/// TTL, deletion is skipped as long as outbox entries still reference files
-/// under that directory (prevents media within the 72h retry window from
-/// being cleaned up prematurely).
-pub async fn cleanup_outbound(config: &Config, db_pool: &Db) -> anyhow::Result<u64> {
+/// Protects media referenced by the outbox (protection set precomputed by the
+/// caller): even if a directory is past its TTL, deletion is skipped as long
+/// as outbox entries still reference files under that directory (prevents
+/// media within the 72h retry window from being cleaned up prematurely).
+pub async fn cleanup_outbound(
+    config: &Config,
+    outbox_protected: &std::collections::HashSet<PathBuf>,
+) -> anyhow::Result<u64> {
     let outbound = config.media_dir.join("outbound");
     if !outbound.exists() {
         return Ok(0);
@@ -71,14 +86,6 @@ pub async fn cleanup_outbound(config: &Config, db_pool: &Db) -> anyhow::Result<u
     let ttl_days = (config.outbound_ttl_hours as f64 / 24.0).ceil() as i64;
     let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(ttl_days + 1);
     let mut removed = 0u64;
-
-    let outbox_protected = match outbox_protected_paths(db_pool).await {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(error = %e, "outbox query failed, skipping outbound cleanup to protect retry media");
-            return Ok(0);
-        }
-    };
 
     let mut entries = fs::read_dir(&outbound).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -111,7 +118,10 @@ pub async fn cleanup_outbound(config: &Config, db_pool: &Db) -> anyhow::Result<u
 }
 
 /// Enforce total media directory size limit.
-pub async fn enforce_media_quota(config: &Config, db_pool: &Db) -> anyhow::Result<u64> {
+pub async fn enforce_media_quota(
+    config: &Config,
+    outbox_protected: &std::collections::HashSet<PathBuf>,
+) -> anyhow::Result<u64> {
     let max_bytes = config.media_max_bytes();
     let total = dir_size(&config.media_dir).await?;
     if total <= max_bytes {
@@ -130,16 +140,9 @@ pub async fn enforce_media_quota(config: &Config, db_pool: &Db) -> anyhow::Resul
     }
     files.sort_by_key(|(_, t, _)| *t);
 
-    // Collect file paths referenced by outbox entries (pending retries).
-    // These must not be deleted, otherwise MediaOnly retries lose their media.
-    let outbox_protected = match outbox_protected_paths(db_pool).await {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(error = %e, "outbox query failed, skipping quota enforcement to protect retry media");
-            return Ok(0);
-        }
-    };
-
+    // outbox_protected (paths referenced by pending retries) is passed in by
+    // the caller: those must not be deleted, otherwise MediaOnly retries lose
+    // their media.
     let mut freed = 0u64;
     let mut remaining = total;
     // Protect recently written files: media files from a fetch cycle that is

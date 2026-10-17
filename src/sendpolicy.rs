@@ -10,8 +10,14 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 /// Retry seconds extracted from a Telegram flood control error.
+/// Case-insensitive: teloxide/Telegram Display text has been observed with
+/// both "Retry after N" and lowercase "retry after N" spellings across
+/// versions; anchoring to one case silently disables flood backoff when the
+/// wording drifts (v1.11.2 #25 typed the "message is not modified" check;
+/// this hardens the flood path the same way is not possible without a typed
+/// variant, so at least match case-insensitively).
 static RE_RETRY_AFTER: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"Retry after (\d+)").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"(?i)Retry after (\d+)").unwrap());
 
 /// Extract the flood-control backoff seconds demanded by Telegram from an
 /// error string (capped at 60s). Returns None for non-flood errors. Shared
@@ -49,7 +55,16 @@ pub async fn flood_backoff(err_str: &str, tries: &mut u32, chat_id: i64) -> bool
 /// pub: the scheduler's transient RSS-fetch retries (is_fetch_transient_error)
 /// reuse the same criteria.
 pub fn is_net_error(err_str: &str) -> bool {
-    (err_str.contains("error sending request") || err_str.contains("connection"))
+    // Two reqwest-flavoured prefixes plus the pre-send DNS check from
+    // fetcher.rs (entry + redirect hops): "dns resolve failed: ..." is
+    // emitted when tokio's lookup_host cannot confirm the target. Matching it
+    // here lets the scheduler's one-shot retry absorb a transient DNS blip
+    // instead of counting it on the first round; a *sustained* DNS outage
+    // still escalates (the retry fails too and the error is counted), which is
+    // correct — repeated unreachability should eventually disable the source.
+    (err_str.contains("error sending request")
+        || err_str.contains("connection")
+        || err_str.contains("dns resolve failed"))
         && !err_str.contains("timeout")
         && !err_str.contains("timed out")
 }

@@ -505,6 +505,18 @@ fn format_caption(
         }
     }
 
+    // Title+content: append the full body, mirroring the plain-text path in
+    // format_entry_parts. Without this, a TitleContent source that happens to
+    // carry media rendered only the title + source line (the body silently
+    // vanished on the media path, while the media-less text path sent the full
+    // body) — a content-loss bug found in the post-v1.11.2 audit.
+    if opts.mode == ContentMode::TitleContent {
+        let body = fetcher::entry_body_html(entry, 100_000, meta);
+        if !body.is_empty() {
+            parts.push(body);
+        }
+    }
+
     if !footer.is_empty() {
         parts.push(footer);
     }

@@ -7,13 +7,19 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::fetcher;
+// Shared HTML matchers with fetcher.rs (single compiled copy each; media
+// already depends on fetcher, never the reverse). RE_IMG_TAG keeps its local
+// name so call sites stay unchanged.
+use crate::fetcher::{RE_IMG as RE_IMG_TAG, RE_VIDEO_BLOCK};
 use crate::state::AppState;
 use crate::ssrf::is_private_url;
 
 /// Static regexes for media URL extraction (extract_media_urls runs once per
 /// entry).
-static RE_VIDEO_BLOCK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)<video\b[^>]*>.*?</video>").unwrap());
+/// RE_VIDEO_BLOCK / full-<img>-tag matching are shared with fetcher.rs
+/// (crate::fetcher::RE_VIDEO_BLOCK / RE_IMG) to avoid compiling the same
+/// pattern twice.
+/// Attribute-level extractors stay here (media-only concerns).
 static RE_SOURCE_SRC: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"<source\b[^>]*?src\s*=\s*["']([^"']+)["']"#).unwrap());
 static RE_VIDEO_SRC: LazyLock<regex::Regex> =
@@ -27,9 +33,6 @@ static RE_URL_ICON_SPAN: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<span\s[^>]*class\s*=\s*["']?url-icon["']?[^>]*>.*?</span>"#).unwrap());
 static RE_IMG_SRC: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"<img\b[^>]*?(?:src|data-src)\s*=\s*["']([^"']+)["']"#).unwrap());
-/// Full <img> tag matcher (used for extracting images inside the body).
-static RE_IMG_TAG: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)<img\b[^>]*>").unwrap());
 
 /// A downloaded media file ready to be sent.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -427,9 +430,9 @@ async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     let mut subp = String::new();
     for value in resp2.headers().get_all("set-cookie") {
         let Ok(s) = value.to_str() else { continue };
-        if let Some(v) = extract_cookie_value(s, "SUB") {
+        if let Some(v) = crate::htmltext::extract_cookie_value(s, "SUB") {
             sub = v;
-        } else if let Some(v) = extract_cookie_value(s, "SUBP") {
+        } else if let Some(v) = crate::htmltext::extract_cookie_value(s, "SUBP") {
             subp = v;
         }
     }
@@ -452,18 +455,21 @@ async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     Some(cookie)
 }
 
-/// Extract the value of a named cookie from a Set-Cookie header value.
-/// Example: "SUB=xxx; Path=/; Domain=.weibo.com" → Some("xxx")
-fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
-    for part in set_cookie.split(';') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix(&format!("{}=", name)) {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
+/// True when the file at `path` starts with the GIF magic header
+/// ("GIF87a" / "GIF89a"). Used when the MIME hint is unavailable
+/// ("image/unknown" for body-extracted images) or the URL has no .gif
+/// suffix. A read error yields false (fall back to extension/mime detection).
+fn sniff_gif(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 6];
+    match f.read_exact(&mut magic) {
+        Ok(()) => &magic[..] == b"GIF87a" || &magic[..] == b"GIF89a",
+        Err(_) => false,
     }
-    None
 }
 
 /// Simple URL encoding (encodes everything except ASCII alphanumerics and
@@ -1122,9 +1128,14 @@ async fn download_one(
         (0, 0)
     };
 
-    // GIF detection: only sendAnimation gives correct animated display
+    // GIF detection: only sendAnimation gives correct animated display.
+    // The MIME hint from body-<img> extraction is always "image/unknown",
+    // and some CDNs serve GIFs at suffix-free URLs (/img/<hash>), so
+    // extension checks alone miss them. Read the 6-byte magic header from the
+    // downloaded file as a definitive fallback ("GIF87a"/"GIF89a").
     let is_gif = *kind == MediaKind::Image
         && (mime == "image/gif"
+            || sniff_gif(&path)
             || url
                 .to_lowercase()
                 .split('?')

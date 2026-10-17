@@ -85,14 +85,13 @@ pub async fn handle_command(
 }
 
 /// Resolve user language: DB preference first, then Telegram language_code, default En.
+/// Delegates to the shared `callbacks::resolve_lang` primitive so callback and
+/// command paths stay in sync (previously they diverged: command replies
+/// honoured the client language_code while callback panels fell straight to
+/// English for users who had not yet run /start).
 pub async fn user_lang(state: &AppState, user_id: i64, msg: Option<&Message>) -> Lang {
-    // 1. Check DB for explicit preference
-    if let Ok(Some(v)) = db::get_setting(&state.db, &Lang::setting_key(user_id)).await {
-        return Lang::from_db_value(&v);
-    }
-    // 2. Detect from Telegram client language_code
     let code = msg.and_then(|m| m.from.as_ref()).and_then(|u| u.language_code.as_deref());
-    Lang::from_language_code(code)
+    crate::callbacks::resolve_lang(state, user_id, code).await
 }
 
 // ===== /start & /about =====
@@ -145,6 +144,7 @@ async fn handle_set(
             state,
             user_id,
             0,
+            lang,
         ).await?;
     } else {
         // Direct channel page
@@ -181,7 +181,7 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let subs = try_or_reply!(bot, msg.chat.id, lang, db::get_subscriptions(&state.db, &chat_id).await);
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = chat.and_then(|c| c.title).unwrap_or_else(|| chat_id.clone());
+    let title = crate::callbacks::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     if subs.is_empty() {
         let text = i18n::t(lang, "list_empty")
@@ -406,7 +406,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     }
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = chat.and_then(|c| c.title).unwrap_or_else(|| chat_id.clone());
+    let title = crate::callbacks::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     let header = if added > 0 {
         i18n::t(lang, "sub_added")
@@ -428,6 +428,20 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
 }
 
 // ===== /test =====
+
+/// Report a /test outcome by editing the progress message in place. If the
+/// edit fails (message too old / flood-limited), fall back to sending a brand
+/// new message so the result is never permanently hidden behind the
+/// "正在抓取…" progress text that would otherwise stay frozen.
+async fn test_report(bot: &Bot, chat: teloxide::types::ChatId, progress_id: teloxide::types::MessageId, text: String) {
+    if bot.edit_message_text(chat, progress_id, text.clone()).await.is_err() {
+        // Degrade to a fresh message when the edit fails (message too old /
+        // flood), so the result is never stuck invisible behind the
+        // "fetching…" progress line. link_preview disabled to match the
+        // progress message (pure-text result; avoids link-preview spam).
+        bot.send_message(chat, text).link_preview_options(no_preview()).await.ok();
+    }
+}
 
 async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -514,7 +528,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         Ok(fr) => fr,
         Err(e) => {
             tracing::warn!(feed_url = %feed_url, error = %e, "/test: fetch failed");
-            bot.edit_message_text(msg.chat.id, progress_id, i18n::t(lang, "test_fetch_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_fetch_failed").replace("{:#}", &format!("{:#}", e))).await;
             return Ok(());
         }
     };
@@ -528,7 +542,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let entry = match fr.entries.get(entry_index) {
         Some(e) => e,
         None => {
-            bot.edit_message_text(msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await.ok();
+            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await;
             return Ok(());
         }
     };
@@ -587,7 +601,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let target_chat: i64 = match chat_id.parse() {
         Ok(id) => id,
         Err(_) => {
-            bot.edit_message_text(msg.chat.id, progress_id, i18n::t(lang, "test_bad_chat").replacen("{}", &chat_id, 1)).await.ok();
+            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_bad_chat").replacen("{}", &chat_id, 1)).await;
             return Ok(());
         }
     };
@@ -610,7 +624,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     // Media-only mode but no media: inform the user explicitly
     if opts.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
-        bot.edit_message_text(msg.chat.id, progress_id, i18n::t(lang, "test_media_only_empty")).await.ok();
+        test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_media_only_empty").to_string()).await;
         return Ok(());
     }
 
@@ -692,11 +706,11 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             if !prepared.warnings.is_empty() {
                 text.push_str(&i18n::t(lang, "test_warnings").replacen("{}", &prepared.warnings.join("\n"), 1));
             }
-            bot.edit_message_text(msg.chat.id, progress_id, text).await.ok();
+            test_report(bot, msg.chat.id, progress_id, text).await;
         }
         Err(e) => {
             tracing::warn!(chat_id = target_chat, feed_url = %feed_url, error = %e, "/test: push FAILED");
-            bot.edit_message_text(msg.chat.id, progress_id, i18n::t(lang, "test_push_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_push_failed").replace("{:#}", &format!("{:#}", e))).await;
         }
     }
     Ok(())

@@ -115,7 +115,7 @@ impl Config {
         let img_relay_domains = std::env::var("IMG_RELAY_DOMAINS")
             .unwrap_or_default()
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().trim_start_matches('.').to_lowercase().to_string())
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -150,7 +150,7 @@ impl Config {
             log_retention_days: env_parse_or("LOG_RETENTION_DAYS", 30).max(1),
             backup_retention_days: env_parse_or("BACKUP_RETENTION_DAYS", 7).max(1),
             file_id_cache_retention_days: env_parse_or("FILE_ID_CACHE_RETENTION_DAYS", 30).max(1),
-            sent_messages_max_rows: env_parse_or("SENT_MESSAGES_MAX_ROWS", 5000),
+            sent_messages_max_rows: env_parse_or("SENT_MESSAGES_MAX_ROWS", 5000).max(1),
             scheduler_interval_minutes: env_parse_or("SCHEDULER_INTERVAL_MINUTES", 5),
             // Concurrency floor of 1: a misconfigured 0 would make
             // Semaphore(0)'s acquire never succeed, silently hanging fetches.

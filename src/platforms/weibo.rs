@@ -34,6 +34,24 @@ static RE_HREF_DQ: LazyLock<regex::Regex> =
 static RE_HREF_SQ: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)href\s*=\s*'(/[^']*)'").unwrap());
 
+/// China Standard Time (UTC+8): the weibo API emits relative timestamps in
+/// CST without an explicit zone, so every relative-time parse needs this
+/// fixed offset. Built once here instead of repeating the inline
+/// `east_opt(8 * 3600).unwrap()` construction at each call site.
+static CST: LazyLock<chrono::FixedOffset> =
+    LazyLock::new(|| chrono::FixedOffset::east_opt(8 * 3600).expect("valid UTC+8 offset"));
+
+/// Read a status's `id` field as a String, accepting both the normal JSON
+/// string form and a numeric form (a numeric id must not silently drop the
+/// whole post). Returns None when the field is absent or empty.
+fn status_id_str(mblog: &Value) -> Option<String> {
+    mblog["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| mblog["id"].as_u64().map(|v| v.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
 // ── Markdown rendering regexes (for posts with md_render_mark == 1) ──
 // RE_BR / RE_BLANK_LINES / RE_IMG_ALT / RE_IMG are identical to the ones in
 // fetcher.rs; reuse the fetcher exports directly (L5 fix: previously defined
@@ -221,9 +239,17 @@ pub async fn fetch_weibo_user(
             continue;
         }
         // Dedup mblog IDs within the same batch (guards against the same post
-        // appearing at multiple card positions)
-        let mblog_id = mblog["id"].as_str().unwrap_or("");
-        if mblog_id.is_empty() || !seen_ids.insert(mblog_id.to_string()) {
+        // appearing at multiple card positions). The id is read tolerantly:
+        // normally a JSON string, but a numeric id must not silently drop the
+        // whole post (as_str → as_u64 fallback).
+        let mblog_id = match status_id_str(mblog) {
+            Some(id) => id,
+            None => {
+                warn!(uid = %uid, "skipped weibo item: missing id");
+                continue;
+            }
+        };
+        if !seen_ids.insert(mblog_id.clone()) {
             continue;
         }
         // Vote signal diagnostics (added in v1.9.5, downgraded to debug in
@@ -256,7 +282,7 @@ pub async fn fetch_weibo_user(
         // The long-text full content and the extra images share this single
         // request; on failure fall back to the list data without losing the entry.
         if status_needs_detail(&mblog) {
-            if let Some(detail) = fetch_status_show(state, &cookies, mblog_id).await {
+            if let Some(detail) = fetch_status_show(state, &cookies, &mblog_id).await {
                 if mblog["isLongText"].as_bool() == Some(true) {
                     full_text = detail["text"]
                         .as_str()
@@ -268,8 +294,8 @@ pub async fn fetch_weibo_user(
         }
         // The retweeted status can also be long text / pic-truncated; same fix.
         if status_needs_detail(&mblog["retweeted_status"]) {
-            let rt_mid = mblog["retweeted_status"]["id"].as_str().unwrap_or("");
-            if let Some(detail) = fetch_status_show(state, &cookies, rt_mid).await {
+            let rt_mid = status_id_str(&mblog["retweeted_status"]).unwrap_or_default();
+            if let Some(detail) = fetch_status_show(state, &cookies, &rt_mid).await {
                 if mblog["retweeted_status"]["isLongText"].as_bool() == Some(true) {
                     rt_full_text = detail["text"]
                         .as_str()
@@ -284,7 +310,7 @@ pub async fn fetch_weibo_user(
         // desktop ajax/statuses/show endpoint. A failure does not block the
         // entry push (it degrades to plain text).
         let vote_obj = if mblog["is_vote"].as_i64() == Some(1) {
-            fetch_vote_object(state, &cookies, mblog_id).await
+            fetch_vote_object(state, &cookies, &mblog_id).await
         } else {
             None
         };
@@ -330,6 +356,16 @@ pub async fn fetch_weibo_user(
     Ok(result)
 }
 
+/// True when a page_info type describes a post whose "image" is only a cover
+/// (video posts: cover in page_info.page_pic; live posts: same) rather than a
+/// real pics[] entry. Such types must not trigger a statuses/show detail
+/// fetch (statuses/show likewise returns no pics for them, so each round
+/// would waste one API call) and must not raise the "has pic_num but no
+/// images" warn (the pic_num counts the cover, not a lost image).
+fn is_non_photo_page(page_type: Option<&str>) -> bool {
+    matches!(page_type, Some("video") | Some("live"))
+}
+
 /// True when a status needs a statuses/show detail fetch: long text
 /// (isLongText) or a truncated pics list. The getIndex timeline API caps
 /// the pics array for multi-image posts (observed: an 11-image post
@@ -342,11 +378,10 @@ fn status_needs_detail(mblog: &Value) -> bool {
     if mblog["isLongText"].as_bool() == Some(true) {
         return true;
     }
-    // For video posts, pic_num counts the video cover (the cover lives in
-    // page_info.page_pic, not the pics[] array); it must not trigger a
-    // detail fetch — statuses/show likewise returns no pics for video posts,
-    // so each round would waste one API call.
-    if mblog["page_info"]["type"].as_str() == Some("video") {
+    // For video and live posts, pic_num counts the cover image (the cover
+    // lives in page_info.page_pic, not the pics[] array); it must not
+    // trigger a detail fetch.
+    if is_non_photo_page(mblog["page_info"]["type"].as_str()) {
         return false;
     }
     let pic_num = mblog["pic_num"].as_u64().unwrap_or(0);
@@ -449,6 +484,7 @@ async fn fetch_vote_object(state: &AppState, cookies: &str, mid: &str) -> Option
 /// (consistent with fetch_vote_object).
 async fn fetch_status_show(state: &AppState, cookies: &str, mid: &str) -> Option<Value> {
     if mid.is_empty() {
+        warn!("fetch_status_show: mid is empty, skipping (falling back to list data)");
         return None;
     }
     let api = format!("https://m.weibo.cn/statuses/show?id={}", mid);
@@ -580,6 +616,14 @@ fn extract_inline_images(text: &str) -> (String, Vec<String>) {
     (s, urls)
 }
 
+/// The standard content-image tag: `referrerpolicy="no-referrer"` is required
+/// so the image CDN hotlink guard does not reject the download. The URL is
+/// escaped here (attribute context). Extracted because this exact template
+/// was repeated verbatim at every append_weibo_media push site.
+fn img_tag(url: &str) -> String {
+    format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(url))
+}
+
 /// Append a status's media to the HTML body: pics[].large.url images
 /// (fallback pics[].url, then original_pic for single-image posts where
 /// getIndex omits the pics array), the page_info video stream, and the
@@ -597,7 +641,7 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
                 .or_else(|| pic["url"].as_str())
                 .unwrap_or_default();
             if !url.is_empty() {
-                body.push_str(&format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(url)));
+                body.push_str(&img_tag(url));
                 has_pics = true;
             }
         }
@@ -606,20 +650,20 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
     // while the pics array is empty/absent (getIndex API inconsistency).
     if !has_pics {
         if let Some(url) = mblog["original_pic"].as_str().filter(|s| !s.is_empty()) {
-            body.push_str(&format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(url)));
+            body.push_str(&img_tag(url));
             has_pics = true;
         } else {
             let pic_num = mblog["pic_num"].as_u64().unwrap_or(0);
-            // For video posts, pic_num counts the video cover (in
+            // For video and live posts, pic_num counts the cover (in
             // page_info.page_pic); this is not a case of "has images but
             // extraction failed", so no warn is emitted.
-            let is_video = mblog["page_info"]["type"].as_str() == Some("video");
-            if pic_num > 0 && !is_video {
+            let is_non_photo = is_non_photo_page(mblog["page_info"]["type"].as_str());
+            if pic_num > 0 && !is_non_photo {
                 // Include mblog_id/uid/page_info_type to make it easy to locate
                 // which post it is and what form it takes (video cover counted in
                 // pic_num / image deleted / member-only content etc.).
                 tracing::warn!(
-                    mblog_id = %mblog["id"].as_str().unwrap_or(""),
+                    mblog_id = %status_id_str(mblog).unwrap_or_default(),
                     uid = %mblog["user"]["id"].as_u64().map(|v| v.to_string()).unwrap_or_default(),
                     pic_num = pic_num,
                     page_info_type = ?mblog["page_info"]["type"].as_str(),
@@ -672,16 +716,41 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
         // Live posts: no video stream to push; extract the cover image
         // (page_pic) and send it as an image.
         if !has_pics && !page_pic_url.is_empty() {
-            body.push_str(&format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(page_pic_url)));
+            body.push_str(&img_tag(page_pic_url));
         }
     } else if !has_pics && page_info["type"].as_str() == Some("article") {
         // Article (top-article) posts have no pics array; use the cover image
         // from page_info.page_pic so the push is not purely text-only.
         if !page_pic_url.is_empty() {
-            body.push_str(&format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(page_pic_url)));
+            body.push_str(&img_tag(page_pic_url));
         }
     }
     video_attached
+}
+
+/// Remove the video / vote card links from an HTML body, but only when the
+/// corresponding media/poll has actually been attached separately — the card
+/// link is redundant once the video was sent as media or the vote was
+/// converted to a TG native Poll, but must stay when that failed, so the user
+/// does not lose the only entry point (#1 fix).
+/// Live posts keep their wblive links (users need them to watch the stream;
+/// there is no media to send).
+/// Video and vote removal are independent conditions (not an else-if chain):
+/// a post can carry a video AND be a vote (is_vote==1), and both cards must
+/// be removed on such posts — the former else-if left a redundant t.cn vote
+/// card in the body.
+/// Returns the (possibly) cleaned body; callers assign it back.
+fn strip_pushed_card_links(mut body: String, page_type: &str, video_attached: bool, poll_attached: bool) -> String {
+    if page_type == "video" && video_attached {
+        body = RE_VIDEO_CARD_LINK.replace_all(&body, "").to_string();
+    }
+    if poll_attached {
+        // poll_attached is only true when the vote details were fetched and
+        // converted (see the fetch loop / main-post call site), so no need to
+        // re-check is_vote here.
+        body = RE_VOTE_CARD_LINK.replace_all(&body, "").to_string();
+    }
+    body
 }
 
 /// Convert one mblog JSON object into a feed-rs Entry + structured metadata.
@@ -695,7 +764,9 @@ fn mblog_to_entry(
     rt_full_text: Option<&str>,
     vote_obj: Option<&Value>,
 ) -> Option<(Entry, crate::entrymeta::EntryMeta)> {
-    let id = mblog["id"].as_str()?.to_string();
+    // Read the id tolerantly (string or numeric); a missing/empty id still
+    // returns None here, which the caller logs as a warn (not silent).
+    let id = status_id_str(mblog)?;
     let bid = mblog["bid"].as_str().unwrap_or(&id);
 
     // Text body (HTML with <a>, <br/> etc.). Long weibos use the full text
@@ -738,49 +809,18 @@ fn mblog_to_entry(
     // Returns true if a video was actually attached.
     let video_attached = append_weibo_media(&mut body, mblog);
 
-    // Remove video/vote card links (the corresponding media/poll has already
-    // been sent separately, so the card link in the body is redundant).
-    // Only remove when the media/poll was actually attached, to avoid losing
-    // the only link when extraction fails (#1 fix).
-    // - Video posts: video.weibo.com/show card link removed (video already
-    //   sent as media)
-    // - Vote posts: t.cn short-link card removed (vote already converted to a
-    //   TG native Poll)
-    // - Live posts: wblive links kept (users need the link to watch the live
-    //   stream; there is no media to send)
+    // Remove video/vote card links (see strip_pushed_card_links: cards are
+    // removed only when the media/poll was actually attached).
     let page_type = mblog["page_info"]["type"].as_str().unwrap_or("");
-    // Video and vote are not mutually exclusive: a post can carry a video AND
-    // be a vote (is_vote==1). Use two independent conditions so a video+vote
-    // post removes both card links — the former else-if left a redundant t.cn
-    // vote card in the body of such posts.
-    if page_type == "video" && video_attached {
-        body = RE_VIDEO_CARD_LINK.replace_all(&body, "").to_string();
-    }
-    if vote_obj.is_some() {
-        // vote_obj is only fetched when is_vote==1 (see the fetch loop), so
-        // there is no need to re-check is_vote here.
-        body = RE_VOTE_CARD_LINK.replace_all(&body, "").to_string();
-    }
-
-    // Collect main-post inline images (from [View image] links) into sidecar.
-    // Dedup: skip URLs already present in body (pics array may carry the same).
-    // Group C: no longer inject <img data-rt="1"> into body; pass them via
-    // EntryMeta.retweet_images instead.
-    // Escaping consistency: URLs inside body are written through escape_attr
-    // (&→&amp;); a plain contains() on the raw URL would miss URLs containing
-    // &, so both the raw and escaped forms are compared.
-    let mut rt_images: Vec<String> = Vec::new();
-    for img_url in &main_inline_imgs {
-        let escaped = crate::push::escape_attr(img_url);
-        if body.contains(img_url.as_str()) || body.contains(escaped.as_str()) {
-            continue;
-        }
-        rt_images.push(img_url.clone());
-    }
+    body = strip_pushed_card_links(body, page_type, video_attached, vote_obj.is_some());
 
     // Retweeted status → blockquote (RSSHub style). The blockquote wraps the
     // entire retweet: header line + original text + original media, so the
     // whole thing renders as a single quoted block in Telegram.
+    // NOTE: the blockquote must be appended BEFORE collecting the main-post
+    // inline images below — the dedup check needs the final body (including
+    // retweet media) or an image shared between the comment-image link and
+    // the retweet pics would be pushed twice (dedup ran too early).
     let rt = &mblog["retweeted_status"];
     if !rt.is_null() {
         let rt_user = rt["user"]["screen_name"].as_str().unwrap_or("已注销");
@@ -817,7 +857,15 @@ fn mblog_to_entry(
         };
         // Retweet media (pics[] / video / article cover).
         let mut rt_body = rt_text.clone();
-        append_weibo_media(&mut rt_body, rt);
+        let rt_video_attached = append_weibo_media(&mut rt_body, rt);
+        // Same card-link cleanup as the main post: when the original is a
+        // video post, append_weibo_media already sent the video, so the
+        // video.weibo.com/show card link must be removed from rt_body too,
+        // otherwise the blockquote keeps a dead link. Vote cards are handled
+        // via the poll sidecar only for the main post, so poll_attached is
+        // false for the retweet (no retweet poll is converted).
+        let rt_page_type = rt["page_info"]["type"].as_str().unwrap_or("");
+        rt_body = strip_pushed_card_links(rt_body, rt_page_type, rt_video_attached, false);
         // Header + retweet body in ONE blockquote, single line:
         // "Retweeted @user: original post content" (the template below starts
         // with the Chinese word for "Retweeted").
@@ -829,6 +877,26 @@ fn mblog_to_entry(
             "\n<blockquote>转发 {}: {}</blockquote>",
             rt_user_html, rt_body
         ));
+    }
+
+    // Collect main-post inline images (from [View image] links) into sidecar.
+    // Group C: no longer inject <img data-rt="1"> into body; pass them via
+    // EntryMeta.retweet_images instead.
+    // Dedup: skip URLs already rendered as <img> in the FINAL body. This
+    // check runs AFTER the blockquote append above on purpose — when the
+    // comment-image URL equals an image from the retweet's pics[] (already
+    // rendered into rt_body and appended), the old pre-append check missed it
+    // and the same image was pushed twice (dedup-timing fix).
+    // Escaping consistency: URLs inside body are written through escape_attr
+    // (&→&amp;); a plain contains() on the raw URL would miss URLs containing
+    // &, so both the raw and escaped forms are compared.
+    let mut rt_images: Vec<String> = Vec::new();
+    for img_url in &main_inline_imgs {
+        let escaped = crate::push::escape_attr(img_url);
+        if body.contains(img_url.as_str()) || body.contains(escaped.as_str()) {
+            continue;
+        }
+        rt_images.push(img_url.clone());
     }
 
     // Vote data: build EntryMeta.poll (group C sidecar, replacing the former
@@ -913,7 +981,7 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
     }
     if let Some(hm) = s.strip_prefix("昨天 ") {
         if let Ok(t) = chrono::NaiveTime::parse_from_str(hm, "%H:%M") {
-            let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+            let cst = *CST;
             let yesterday = (now.with_timezone(&cst) - chrono::Duration::days(1)).date_naive();
             let dt = yesterday.and_time(t).and_local_timezone(cst).single()?;
             return Some(dt.with_timezone(&Utc));
@@ -925,7 +993,7 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
             &format!("{}-{}", now.format("%Y"), s),
             "%Y-%m-%d",
         ) {
-            let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+            let cst = *CST;
             let dt = md.and_hms_opt(0, 0, 0)?.and_local_timezone(cst).single()?;
             // Cross-year correction: weibo relative times carry no year, so a
             // post from last December fetched in January would be parsed as a
@@ -952,6 +1020,10 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
 /// italic → restore.
 /// Links and code are extracted into placeholders first, so their contents are
 /// not corrupted by the subsequent escaping/formatting passes.
+/// `[label](url)` links with an empty label or empty URL are dropped (they
+/// cannot render as a meaningful anchor); when any are dropped a warn log
+/// records the count and the lost URLs, so a vanished link leaves a trace
+/// (v1.11.2 audit).
 fn render_md_inline(text: &str) -> String {
     // 1) Extract markdown links [text](url) → placeholders
     let mut links: Vec<(String, String)> = Vec::new();
@@ -995,10 +1067,15 @@ fn render_md_inline(text: &str) -> String {
     }
 
     // 8) Restore markdown links (link text is only escaped, no recursive
-    // formatting)
+    // formatting). Empty label or empty URL yields no meaningful anchor, so
+    // the tag is dropped — but the URL would vanish without a trace, so the
+    // dropped URLs are collected and logged once (v1.11.2 audit: leave a
+    // breadcrumb recording the count of removed links).
+    let mut dropped_urls: Vec<String> = Vec::new();
     for (i, (link_text, url)) in links.iter().enumerate() {
         let token = format!("\u{FFFE}L{}\u{FFFE}", i);
         if link_text.is_empty() || url.is_empty() {
+            dropped_urls.push(url.clone());
             s = s.replace(&token, "");
         } else {
             s = s.replace(
@@ -1010,6 +1087,13 @@ fn render_md_inline(text: &str) -> String {
                 ),
             );
         }
+    }
+    if !dropped_urls.is_empty() {
+        warn!(
+            count = dropped_urls.len(),
+            urls = ?dropped_urls,
+            "weibo markdown: dropped empty-label/empty-url links (URLs not rendered)"
+        );
     }
 
     s
@@ -1417,7 +1501,9 @@ fn convert_emoji_markers(text: &str) -> String {
         .into_owned()
 }
 
-/// Strip HTML tags for title extraction.
+/// Strip HTML tags for title extraction. Thin alias (one-line forwarder) of
+/// `crate::fetcher::html_to_plain`, kept so the local call sites stay stable;
+/// behavior is exactly html_to_plain's, do not diverge it.
 fn strip_tags(html: &str) -> String {
     crate::fetcher::html_to_plain(html)
 }

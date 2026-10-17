@@ -4,18 +4,17 @@ use anyhow::Context;
 use feed_rs::model::Entry;
 use url::Url;
 
-use crate::htmltext::unescape_html;
+use crate::htmltext::{unescape_html, RE_TAG};
 use crate::state::AppState;
 
 /// Static regexes: the HTML→Telegram-HTML conversion runs on every entry,
 /// so compile once and reuse uniformly (previously every call recompiled a
 /// dozen or so regexes).
 /// RE_ENTITY_NUM/RE_ENTITY_HEX moved into crate::htmltext together with
-/// unescape_html.
+/// unescape_html. RE_TAG is likewise shared from htmltext (single compiled
+/// copy of `<[^>]+>` across the project).
 static RE_AUTHOR_PAREN: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\(([^)]+)\)").unwrap());
-static RE_TAG: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
 pub static RE_BLANK_LINES: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
 /// Line-leading indentation whitespace (HTML formatting indentation from
@@ -25,7 +24,7 @@ static RE_LINE_INDENT: LazyLock<regex::Regex> =
 /// Fold runs of horizontal whitespace into a single space.
 static RE_MULTI_SPACE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[ \t]{2,}").unwrap());
-static RE_VIDEO_BLOCK: LazyLock<regex::Regex> =
+pub static RE_VIDEO_BLOCK: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?is)<video\b[^>]*>.*?</video>").unwrap());
 pub static RE_IMG_ALT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<img\b[^>]*?\balt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap());
@@ -157,8 +156,19 @@ pub async fn fetch_feed(
     // proxy side, so the local DNS resolution result does not affect the
     // actual connection target — skip the check (v1.10.14: fixed false
     // blocking caused by local DNS resolving a domain to a private address).
-    if !state.is_routed_via_proxy(feed_url) && crate::ssrf::is_private_url(feed_url).await {
-        anyhow::bail!("blocked: private/loopback address: {}", feed_url);
+    if !state.is_routed_via_proxy(feed_url) {
+        match crate::ssrf::ssrf_check(feed_url).await {
+            crate::ssrf::SsrfOutcome::Private => {
+                anyhow::bail!("blocked: private/loopback address: {}", feed_url);
+            }
+            // DNS blip: distinct text so the transient-error classifier can
+            // match it — sendpolicy::is_net_error matches the exact substring
+            // "dns resolve failed" (contract: keep this wording in sync).
+            crate::ssrf::SsrfOutcome::LookupFailed => {
+                anyhow::bail!("dns resolve failed: {}", feed_url);
+            }
+            crate::ssrf::SsrfOutcome::Allowed => {}
+        }
     }
 
     // RSS feed fetching does NOT go through img-relay (that's only for media).
@@ -207,9 +217,22 @@ pub async fn fetch_feed(
             let next_str = next.to_string();
             // When routed via a proxy, redirects are also followed on the
             // proxy side, so a local DNS check is meaningless (same as the
-            // entry point).
-            if !state.is_routed_via_proxy(&next_str) && crate::ssrf::is_private_url(&next_str).await {
-                anyhow::bail!("blocked: redirect to private/loopback address");
+            // entry point). Three-state check (same contract as the entry): a
+            // transient DNS blip on a redirect target must not masquerade as a
+            // "private/loopback block" (which matches no retry rule); it is
+            // reported as "dns resolve failed" so is_net_error treats it as
+            // transient. Substring contract: keep both wordings in sync with
+            // sendpolicy::is_net_error.
+            if !state.is_routed_via_proxy(&next_str) {
+                match crate::ssrf::ssrf_check(&next_str).await {
+                    crate::ssrf::SsrfOutcome::Private => {
+                        anyhow::bail!("blocked: redirect to private/loopback address");
+                    }
+                    crate::ssrf::SsrfOutcome::LookupFailed => {
+                        anyhow::bail!("dns resolve failed: {}", next_str);
+                    }
+                    crate::ssrf::SsrfOutcome::Allowed => {}
+                }
             }
             cur_url = next_str;
             continue;
@@ -369,6 +392,10 @@ pub fn entry_author(entry: &Entry) -> Option<String> {
 /// stripped), not the raw HTML length. Weibo search URLs inside <a href>
 /// are very long but the visible text is short — using HTML length would
 /// incorrectly trigger the plain-text fallback and lose all hyperlinks.
+/// Note: every push-path caller passes 100_000 deliberately (splitting into
+/// multiple messages happens at send time via split_html), so the overflow
+/// plain-text fallback is a safety net for absurdly large bodies rather than a
+/// routine branch; do not lower these call-site values without checking that.
 ///
 /// When `meta.prerendered_html` is true (weibo markdown-rendered posts,
 /// group-C sidecar, replacing the former content_type `text/x-tg-html` MIME

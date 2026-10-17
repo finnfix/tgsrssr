@@ -80,14 +80,20 @@ impl Drop for ActiveGuard {
 }
 
 /// Read the platform hysteresis streak counter (positive = failure streak,
-/// negative = success streak). Read failures / missing values / invalid
-/// numbers are all treated as 0 (never interrupt the health-evaluation flow).
-async fn read_streak(state: &AppState, key: &str, platform: &'static str) -> i64 {
+/// negative = success streak). Returns Some(n) for a valid stored value (or
+/// 0 when the key is absent — that genuinely means "no streak yet"), or None
+/// on a transient DB read error. Callers must NOT write the streak back when
+/// this returns None: collapsing a read error to 0 and then writing 0 would
+/// reset an accumulated streak on a single DB hiccup (the LESSONS rule "a DB
+/// read error must not unwrap_or to a neutral value" — for counters, skip the
+/// round instead). A missing key still yields Some(0) so the normal
+/// "first failure → 1" flow proceeds.
+async fn read_streak(state: &AppState, key: &str, platform: &'static str) -> Option<i64> {
     match db::get_setting(&state.db, key).await {
-        Ok(v) => v.and_then(|s| s.parse().ok()).unwrap_or(0),
+        Ok(v) => Some(v.and_then(|s| s.parse().ok()).unwrap_or(0)),
         Err(e) => {
-            warn!(platform = platform, error = %e, "streak read failed, treating as 0");
-            0
+            warn!(platform = platform, error = %e, "streak read failed, deferring to next round");
+            None
         }
     }
 }
@@ -266,32 +272,38 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         if all_failed {
             // All failed this round: increment the failure streak counter
             // (positive = failure streak, starting from 1; if the previous
-            // direction was success (negative), reset to 1)
-            let prev = read_streak(state, &streak_key, p).await;
-            let streak = if prev > 0 { prev + 1 } else { 1 };
-            if let Err(e) = db::set_setting(&state.db, &streak_key, &streak.to_string()).await {
-                warn!(platform = p, error = %e, "streak write failed");
-            }
+            // direction was success (negative), reset to 1).
+            // On a transient read error (None), skip both the write-back and
+            // the down-notification this round — the next round re-reads and
+            // continues accumulating, preserving the streak value.
+            if let Some(prev) = read_streak(state, &streak_key, p).await {
+                let streak = if prev > 0 { prev + 1 } else { 1 };
+                if let Err(e) = db::set_setting(&state.db, &streak_key, &streak.to_string()).await {
+                    warn!(platform = p, error = %e, "streak write failed");
+                }
 
-            // Hysteresis threshold reached and not currently down: report the
-            // anomaly (notify all admins)
-            if streak >= HYSTERESIS_ROUNDS && !is_down {
-                let err = last_err.get(&p).map(String::as_str).unwrap_or("unknown error");
-                maybe_notify_platform_down(bot, state, p, err).await;
+                // Hysteresis threshold reached and not currently down: report
+                // the anomaly (notify all admins)
+                if streak >= HYSTERESIS_ROUNDS && !is_down {
+                    let err = last_err.get(&p).map(String::as_str).unwrap_or("unknown error");
+                    maybe_notify_platform_down(bot, state, p, err).await;
+                }
             }
         } else if all_ok {
-            // All succeeded this round: increment the success streak counter
-            let streak = read_streak(state, &streak_key, p).await;
-            // The success direction counts with negative numbers (-1, -2, ...)
-            let ok_streak = if streak < 0 { streak - 1 } else { -1 };
-            if let Err(e) = db::set_setting(&state.db, &streak_key, &ok_streak.to_string()).await {
-                warn!(platform = p, error = %e, "streak write failed");
-            }
+            // All succeeded this round: increment the success streak counter.
+            // Same "defer on read error" rule as the failure branch.
+            if let Some(streak) = read_streak(state, &streak_key, p).await {
+                // The success direction counts with negative numbers (-1, -2, ...)
+                let ok_streak = if streak < 0 { streak - 1 } else { -1 };
+                if let Err(e) = db::set_setting(&state.db, &streak_key, &ok_streak.to_string()).await {
+                    warn!(platform = p, error = %e, "streak write failed");
+                }
 
-            // Hysteresis threshold reached and currently down: report recovery
-            // (notify all admins)
-            if ok_streak <= -HYSTERESIS_ROUNDS && is_down {
-                maybe_notify_platform_recovered(bot, state, p).await;
+                // Hysteresis threshold reached and currently down: report recovery
+                // (notify all admins)
+                if ok_streak <= -HYSTERESIS_ROUNDS && is_down {
+                    maybe_notify_platform_recovered(bot, state, p).await;
+                }
             }
         } else {
             // Mixed round (both successes and failures): reset the streak,
@@ -376,7 +388,15 @@ async fn process_feed(
     )
     .await;
     let result = match result {
-        Err(ref e) if is_rss_source && sendpolicy::is_net_error(&e.to_string()) => {
+        // Render the anyhow error chain with `{:#}` (alternates Display):
+        // fetcher::fetch_feed wraps reqwest errors via `.with_context(...)`
+        // so plain `e.to_string()` returns only the outer "request failed:
+        // <url>" and the inner reqwest source string ("error sending request
+        // for url ...", "connection closed", etc.) is dropped — is_net_error
+        // would then never match on RSS connection-class failures. `{:#}`
+        // appends the full source chain separated by ": ", letting the
+        // substring check see the underlying reqwest error text.
+        Err(ref e) if is_rss_source && sendpolicy::is_net_error(&format!("{:#}", e)) => {
             warn!(
                 feed = %sub.feed_url,
                 error = %e,
@@ -415,17 +435,6 @@ async fn process_feed(
             if let Some(p) = platform_of_url(&sub.feed_url) {
                 stats.ok.lock().await.insert(p);
             }
-
-            // Save this response's negotiation headers for the next
-            // conditional request
-            db::update_fetch_headers(
-                &state.db,
-                sub.id,
-                fr.http_etag.as_deref(),
-                fr.http_last_modified.as_deref(),
-            )
-            .await
-            .ok();
 
             // 304 Not Modified: the source has no updates, nothing to push
             if fr.not_modified {
@@ -471,9 +480,18 @@ async fn process_feed(
 
             // Content filter config (feed level): takes effect when the switch
             // is on and the keywords are non-empty.
-            let filter_cfg = db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url)
-                .await
-                .unwrap_or_default();
+            // Distinguish "DB error" from "no filter configured": treating an
+            // error as default (empty filter) means every entry passes and the
+            // blocklist silently stops working (the LESSONS "DB read error must
+            // not unwrap_or to a neutral value" rule). Fail-open here is
+            // preferable to aborting the whole round, but must leave a trace.
+            let filter_cfg = match db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    warn!(feed = %cfg.feed_url, error = %e, "feed filter read failed, treating as no-filter for this round");
+                    Default::default()
+                }
+            };
 
             // First filter out unsent entries, then push in ascending order of
             // publish time (old → new). RSS feeds are mostly "newest first";
@@ -518,22 +536,25 @@ async fn process_feed(
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
 
+            // True when the entry loop was cut short by the deadline. The
+            // response's negotiation headers are only saved when the loop
+            // drained fully (see after the loop): saving them while some
+            // entries were deferred would let the next round's conditional
+            // request return 304 and permanently swallow the unpushed entries
+            // (the v1.11.2 "deadline → clear headers" fix only covered the
+            // deadline break, not the `?`-propagation early returns inside
+            // the loop; deferring the save covers all interruption paths at
+            // once). A `?` abort returns before this point too, so headers
+            // stay at the previous round's value and the next round re-fetches
+            // the full body (sent_entries dedup prevents double-push).
+            let mut deferred = false;
             for entry in pending {
                 if tokio::time::Instant::now() >= deadline {
                     warn!(
                         feed = %cfg.feed_url,
                         "feed processing deadline reached, remaining entries deferred to next cycle"
                     );
-                    // Deferred entries are not marked sent, but this round
-                    // already saved the source's ETag/Last-Modified. If the next
-                    // round's conditional request returns 304, process_feed
-                    // returns early and never re-processes the deferred entries
-                    // — they would be lost once they roll out of the source
-                    // window. Clear the headers so the next round issues an
-                    // unconditional request (full 200) and picks them up.
-                    if let Err(e) = db::clear_fetch_headers(&state.db, sub.id).await {
-                        warn!(feed = %cfg.feed_url, error = %e, "clear fetch headers failed after deadline");
-                    }
+                    deferred = true;
                     break;
                 }
                 let eid = fetcher::entry_id(entry);
@@ -546,7 +567,10 @@ async fn process_feed(
                 let prepared = if opts.mode.skip_media() {
                     crate::media::PreparedMedia::empty()
                 } else {
-                    let lang = owner_lang(state, owner_id.unwrap_or(0)).await;
+                    // Reuse the round-level owner language resolved once at the
+                    // top of process_feed; re-querying the settings row per
+                    // entry wasted a DB round-trip and fell back to En via a
+                    // different (owner_id.unwrap_or(0)) path.
                     crate::media::prepare_entry_media(state, entry, &transport, meta, lang).await
                 };
                 let download_warnings = prepared.warnings;
@@ -881,6 +905,23 @@ async fn process_feed(
                 // which queues uniformly per channel (≥2s/message); no extra
                 // sleep is needed here.
             }
+
+            // Save this response's negotiation headers for the next
+            // conditional request — but only when every entry in this round
+            // was fully processed. On deadline deferral (or a `?` abort that
+            // skips this code) the headers stay stale, forcing the next round
+            // to re-fetch the full body and pick up the leftovers (sent_entries
+            // dedup keeps already-pushed entries from being re-pushed).
+            if !deferred {
+                db::update_fetch_headers(
+                    &state.db,
+                    sub.id,
+                    fr.http_etag.as_deref(),
+                    fr.http_last_modified.as_deref(),
+                )
+                .await
+                .ok();
+            }
         }
         Err(e) => {
             let err_msg = format!("{:#}", e);
@@ -914,8 +955,19 @@ async fn process_feed(
 
             if count >= state.config.max_fetch_errors && sub.active == 1 {
                 // Auto-disable (marked as system-auto-disabled; the self-heal
-                // job auto-recovers it after the cooldown)
-                db::auto_disable_subscription(&state.db, sub.id).await?;
+                // job auto-recovers it after the cooldown). The UPDATE carries
+                // an `active = 1` guard closing the manual-pause race: the
+                // round-start snapshot above may be stale if the user paused
+                // the source mid-round, in which case the disable is skipped
+                // (rows_affected = 0) — a manual pause must not be converted
+                // into an auto-disable that the self-heal job would undo.
+                if !db::auto_disable_subscription(&state.db, sub.id).await? {
+                    info!(
+                        feed = %sub.feed_url,
+                        "skip auto-disable: subscription paused by user during this round"
+                    );
+                    return Ok(());
+                }
                 info!(feed = %sub.feed_url, errors = count, "subscription auto-disabled");
                 // Edge deduplication (#9 fix): no duplicate notification when
                 // the same source goes disable → self-heal → fail again.
@@ -1126,10 +1178,10 @@ async fn notify_admins_html(
 
 /// Resolve the owner's language preference from DB.
 async fn owner_lang(state: &AppState, owner_id: i64) -> Lang {
-    match db::get_setting(&state.db, &Lang::setting_key(owner_id)).await {
-        Ok(Some(v)) => Lang::from_db_value(&v),
-        _ => Lang::En,
-    }
+    // Delegate to the single source of truth for language resolution
+    // (callbacks::resolve_lang) — notifications have no Telegram client
+    // language hint, so pass None (falls back to En like before).
+    crate::callbacks::resolve_lang(state, owner_id, None).await
 }
 
 /// Append a line "\nlabel：value" (skipped when the value is empty). The

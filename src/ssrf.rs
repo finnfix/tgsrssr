@@ -5,32 +5,60 @@
 //! fetcher no longer depends on the media module — dependency direction is
 //! now one-way (fetcher → ssrf, media → ssrf).
 
-/// SSRF guard: reject URLs whose host resolves to a private/loopback address.
-/// Covers 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, ::1, fc00::/7.
-/// Shared by the fetcher's feed-fetch path and the media download path
-/// (same private-address determination for both).
-pub async fn is_private_url(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else { return true };
-    let Some(host) = u.host_str() else { return true };
+/// Outcome of the SSRF pre-check. Distinguishing "confirmed private" from
+/// "DNS lookup failed" matters at the feed-fetch entry: reporting a transient
+/// DNS blip as "blocked: private/loopback address" makes it unmatchable by
+/// the transient-error classifier, so a network-wide DNS outage would count
+/// toward auto-disable on every source. LookupFailed is still blocked here
+/// (fail-closed: reqwest may resolve differently on retry) but carries a
+/// retryable error text.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SsrfOutcome {
+    /// Host resolves only to public addresses (or is a public literal IP).
+    Allowed,
+    /// Host resolves to a private/loopback/link-local address, is a private
+    /// literal IP, has no host, or uses a non-http(s) scheme.
+    Private,
+    /// DNS resolution failed (transient): cannot confirm the target.
+    LookupFailed,
+}
+
+/// Three-state SSRF verdict. See SsrfOutcome.
+pub async fn ssrf_check(url: &str) -> SsrfOutcome {
+    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::Private };
+    let Some(host) = u.host_str() else { return SsrfOutcome::Private };
     // Only http/https allowed; other schemes (file, ftp…) blocked.
     if u.scheme() != "http" && u.scheme() != "https" {
-        return true;
+        return SsrfOutcome::Private;
     }
     // Literal IP: check directly.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(&ip);
+        return if is_private_ip(&ip) { SsrfOutcome::Private } else { SsrfOutcome::Allowed };
     }
     // Hostname: async DNS lookup, check all returned addresses.
     let addr_str = format!("{}:{}", host, u.port_or_known_default().unwrap_or(443));
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
         Ok(iter) => iter.collect(),
         // DNS resolution failure: fail-closed reject (don't allow through
-        // when we can't confirm whether the address is private).
-        // If DNS was just a transient blip, the download fails without being
-        // marked sent and will be retried next round.
-        Err(_) => return true,
+        // when we can't confirm whether the address is private), but report
+        // it distinctly so callers can treat it as transient.
+        Err(_) => return SsrfOutcome::LookupFailed,
     };
-    addrs.iter().any(|sa| is_private_ip(&sa.ip()))
+    if addrs.iter().any(|sa| is_private_ip(&sa.ip())) {
+        SsrfOutcome::Private
+    } else {
+        SsrfOutcome::Allowed
+    }
+}
+
+/// SSRF guard: reject URLs whose host resolves to a private/loopback address.
+/// Covers 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, ::1, fc00::/7.
+/// Shared by the feed-fetch path and the media download path
+/// (same private-address determination for both). DNS failures fold into
+/// `true` (fail-closed) — callers wanting the three-state verdict (to retry
+/// transient lookups) use ssrf_check directly.
+pub async fn is_private_url(url: &str) -> bool {
+    matches!(ssrf_check(url).await, SsrfOutcome::Private | SsrfOutcome::LookupFailed)
 }
 
 pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {

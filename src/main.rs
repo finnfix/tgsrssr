@@ -26,7 +26,6 @@ use tracing::{error, info};
 
 use commands::Command;
 use config::Config;
-use i18n::Lang;
 use state::AppState;
 
 #[tokio::main]
@@ -349,10 +348,10 @@ async fn register_pending_ops_sweep_job(
                 }
                 drop(ops);
                 for ((chat_id, user_id), op) in expired {
-                    let lang = match db::get_setting(&state.db, &Lang::setting_key(user_id)).await {
-                        Ok(Some(v)) => Lang::from_db_value(&v),
-                        _ => Lang::En,
-                    };
+                    // Background sweep: no client language_code available, so
+                    // resolve via the shared helper with None (DB preference
+                    // first, English otherwise).
+                    let lang = callbacks::resolve_lang(&state, user_id, None).await;
                     crate::commands::retire_prompt(
                         &bot,
                         teloxide::types::ChatId(chat_id),

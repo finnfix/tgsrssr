@@ -611,14 +611,20 @@ pub async fn set_subscription_active(db: &Db, sub_id: i64, active: bool) -> anyh
 /// System auto-disable (consecutive failures reached the threshold): sets
 /// auto_disabled=1 and records the disable moment so the self-heal job can
 /// auto-recover it after the cooldown.
-pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE subscriptions SET active = 0, auto_disabled = 1, disabled_at = datetime('now') WHERE id = ?",
+/// The `active = 1` guard closes the race against a manual pause made during
+/// the fetch round: the scheduler decides from a round-start snapshot, so
+/// without the guard a just-paused (auto_disabled=0) source would be flipped
+/// to auto-disabled and resurrected by the self-heal cooldown, overriding the
+/// user's intent. Returns whether a row was actually disabled (false = the
+/// user already paused it this round, caller should skip the notification).
+pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE subscriptions SET active = 0, auto_disabled = 1, disabled_at = datetime('now') WHERE id = ? AND active = 1",
     )
     .bind(sub_id)
     .execute(db)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() == 1)
 }
 
 /// Self-heal: re-enable sources that are "auto-disabled and past the cooldown"
@@ -799,21 +805,6 @@ pub async fn update_fetch_headers(
             .execute(db)
             .await?;
     }
-    Ok(())
-}
-
-/// Clear the stored conditional-request headers (ETag / Last-Modified) so the
-/// next fetch issues an unconditional request and gets a full 200 body.
-/// Used when a fetch cycle defers remaining entries past its deadline: those
-/// entries are not yet marked sent, but if the next round's conditional request
-/// returns 304 the cycle returns early and never re-processes them (they would
-/// be lost once they roll out of the source window). Forcing a 200 next round
-/// lets the deferred entries be picked up.
-pub async fn clear_fetch_headers(db: &Db, sub_id: i64) -> anyhow::Result<()> {
-    sqlx::query("UPDATE subscriptions SET http_etag = NULL, http_last_modified = NULL WHERE id = ?")
-        .bind(sub_id)
-        .execute(db)
-        .await?;
     Ok(())
 }
 
@@ -1255,6 +1246,18 @@ pub async fn outbox_fetch_due(db: &Db, now_ts: i64, limit: i64) -> anyhow::Resul
             last_error: r.get("last_error"),
         })
         .collect())
+}
+
+/// Return every media_json value still referenced by the outbox (all rows,
+/// no limit, one narrow column). Used by the media cleanup pass to build the
+/// "protected paths" set — loading media_json alone avoids dragging each
+/// row's entry_json / meta_json blobs into memory, which outbox_fetch_due
+/// (the full-row variant) would.
+pub async fn outbox_all_media_json(db: &Db) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query("SELECT media_json FROM outbox WHERE media_json IS NOT NULL AND media_json <> '' AND media_json <> '[]'")
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().filter_map(|r| r.get::<Option<String>, _>("media_json")).collect())
 }
 
 /// Update outbox entry after a failed retry attempt.
