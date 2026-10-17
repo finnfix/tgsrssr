@@ -10,27 +10,56 @@ use crate::state::AppState;
 use crate::try_or_reply;
 
 /// Bot command definitions (unit variants; args parsed from raw text).
+///
+/// The `description` literals below are the **default (English)** command-menu
+/// texts: they feed `Command::bot_commands()`, which main.rs registers with an
+/// empty `language_code` (the fallback every client uses when it has no
+/// dedicated list). Chinese menu texts live in `menu_desc_zh()` and are
+/// registered under the two-letter code `zh` at startup (the Bot API rejects
+/// subtag forms like `zh-hans`, so one `zh` list covers Simplified and
+/// Traditional clients alike).
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "RSS 订阅 Bot 命令")]
+#[command(rename_rule = "lowercase", description = "RSS subscription bot commands")]
 pub enum Command {
-    #[command(description = "帮助")]
+    #[command(description = "Help")]
     Start,
-    #[command(description = "订阅管理")]
+    #[command(description = "Subscriptions")]
     Set,
-    #[command(description = "订阅列表")]
+    #[command(description = "Subscription list")]
     List,
-    #[command(description = "添加订阅")]
+    #[command(description = "Add subscription")]
     Sub,
-    #[command(description = "测试推送")]
+    #[command(description = "Test push")]
     Test,
-    #[command(description = "查询消息源")]
+    #[command(description = "Find message source")]
     Find,
-    #[command(description = "平台验证")]
+    #[command(description = "Platform login")]
     Cookies,
-    #[command(description = "获取日志")]
+    #[command(description = "Get logs")]
     Loget,
-    #[command(description = "关于")]
+    #[command(description = "About")]
     About,
+}
+
+/// Chinese command-menu descriptions, keyed by command name (leading `/`
+/// ignored — teloxide 0.17 derive emits both spellings across versions).
+///
+/// Simplified and Traditional clients share this one list (see
+/// `MENU_LANGUAGES` in main.rs). Returns `None` for an unknown command so the
+/// caller can fall back to the default English text rather than dropping it.
+pub fn menu_desc_zh(cmd: &str) -> Option<&'static str> {
+    Some(match cmd.trim_start_matches('/') {
+        "start" => "帮助",
+        "set" => "订阅管理",
+        "list" => "订阅列表",
+        "sub" => "添加订阅",
+        "test" => "测试推送",
+        "find" => "查询消息源",
+        "cookies" => "平台验证",
+        "loget" => "获取日志",
+        "about" => "关于",
+        _ => return None,
+    })
 }
 
 /// Extract the argument portion after the command token, e.g. "/set foo" -> "foo".

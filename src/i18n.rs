@@ -89,9 +89,11 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "start_text") => "Hi! I'm an RSS subscription Bot. Add me to a channel or group to get started.\nVersion: v{}",
 
         // ===== Command descriptions =====
-        // Removed: previously contained `cmd_desc_*` keys, but teloxide's
-        // BotCommands derive reads the #[command(description)] literals
-        // directly and never queries i18n; those keys were never referenced.
+        // The command menu is localized outside this table: the client picks
+        // its list by its reported language_code, so translations live in
+        // `commands::menu_desc_zh()` (registered per-language at startup in
+        // main.rs). The runtime UI strings below cover the panel / reply text,
+        // selected by the stored `lang:<user_id>` setting.
 
         // ===== /list =====
         (Lang::Zh, "list_usage") => "用法：<code>/list &lt;频道&gt;</code>",

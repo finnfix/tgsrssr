@@ -94,6 +94,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 默认仅 `ALLOWED_USER_IDS` 白名单与 `ADMIN_USER_IDS` 管理员可用，其余用户静默忽略；设置 `OPEN_TO_ALL=true` 可对所有用户开放。
 `/cookies`、`/loget` 仅管理员可用（命令菜单中仅管理员可见）。管理员配置的平台 cookie 由所有用户共享；未配置时用户订阅相应平台源会收到提示。
 `/list`、`/sub`、`/test` 在群组/频道内可省略频道参数，默认作用于当前会话。
+左下角命令菜单按客户端语言显示：简体中文/繁体中文客户端显示中文描述，其余客户端显示英文。
 
 ## 支持的内容源
 
@@ -141,7 +142,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 ## 推送与渲染
 
-- **内容模式**：`title_link` / `title_summary`（+60字摘要）/ `title_content`（全文）/ `title_only` / `content_only` / `media_only`
+- **内容模式**：`title_link` / `title_summary`（+140字摘要）/ `title_content`（全文）/ `title_only` / `content_only` / `media_only`
 - **来源显示**：`source`（via 源标题）/ `author` / `none`
 - 长文按可见长度切分（正文 4096 / 媒体说明 1024 UTF-16 码元），多段引用第一条
 - 同频道发送集中排队（≥2 秒），触发限流按 Retry-After 退避
@@ -428,6 +429,7 @@ By default the official Telegram Bot API is used (50MB upload limit). To push la
 By default only `ALLOWED_USER_IDS` whitelist members and `ADMIN_USER_IDS` admins can use the bot; other users are silently ignored. Set `OPEN_TO_ALL=true` to open to all users.
 `/cookies` and `/loget` are admin-only (visible only in the admin command menu). Platform cookies configured by admins are shared by all users; subscribing to a platform source without a configured cookie shows a notice.
 `/list`, `/sub`, `/test` can omit the channel argument inside a group/channel — the current chat is used.
+The slash-command menu follows the client language: Simplified/Traditional Chinese clients see Chinese descriptions, all other clients see English.
 
 ## Supported Sources
 
@@ -475,7 +477,7 @@ Button-based UI with paginated lists (10 per page):
 
 ## Push & Rendering
 
-- **Content modes**: `title_link` / `title_summary` (+60-char summary) / `title_content` (full text) / `title_only` / `content_only` / `media_only`
+- **Content modes**: `title_link` / `title_summary` (+140-char summary) / `title_content` (full text) / `title_only` / `content_only` / `media_only`
 - **Source display**: `source` (via feed title) / `author` / `none`
 - Long text split by visible length (body 4096 / media caption 1024 UTF-16 code units); multiple parts reply to the first
 - Per-channel send queue (≥2s spacing); rate-limit triggers Retry-After backoff

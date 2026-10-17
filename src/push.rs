@@ -350,6 +350,9 @@ fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: Source
     }
 }
 
+/// Max visible characters kept in a `Title+summary` excerpt.
+const SUMMARY_MAX_CHARS: usize = 140;
+
 /// Build a short summary from the entry body: first `max_chars` visible
 /// characters (HTML tags stripped), with "......" appended when truncated.
 /// Returns empty string when the body has no visible text.
@@ -400,13 +403,13 @@ pub fn format_entry_parts(
             });
         }
         ContentMode::TitleSummary => {
-            // Title hyperlinked to the entry + summary (first 50 chars of
-            // body + "......")
+            // Title hyperlinked to the entry + summary (first
+            // SUMMARY_MAX_CHARS chars of body + "......")
             parts.push(match &link {
                 Some(url) => format!("<b><a href=\"{}\">{}</a></b>", escape_attr(url), escape_html(&title)),
                 None => format!("<b>{}</b>", escape_html(&title)),
             });
-            let summary = entry_summary(entry, 60, meta);
+            let summary = entry_summary(entry, SUMMARY_MAX_CHARS, meta);
             if !summary.is_empty() {
                 parts.push(summary);
             }
@@ -497,9 +500,9 @@ fn format_caption(
 
     let mut parts: Vec<String> = vec![head];
 
-    // Title+summary: append a summary of the first 60 chars of the body
+    // Title+summary: append a summary of the first SUMMARY_MAX_CHARS chars
     if opts.mode == ContentMode::TitleSummary {
-        let summary = entry_summary(entry, 60, meta);
+        let summary = entry_summary(entry, SUMMARY_MAX_CHARS, meta);
         if !summary.is_empty() {
             parts.push(summary);
         }
