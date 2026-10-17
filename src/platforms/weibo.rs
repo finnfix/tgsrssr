@@ -749,9 +749,14 @@ fn mblog_to_entry(
     // - Live posts: wblive links kept (users need the link to watch the live
     //   stream; there is no media to send)
     let page_type = mblog["page_info"]["type"].as_str().unwrap_or("");
+    // Video and vote are not mutually exclusive: a post can carry a video AND
+    // be a vote (is_vote==1). Use two independent conditions so a video+vote
+    // post removes both card links — the former else-if left a redundant t.cn
+    // vote card in the body of such posts.
     if page_type == "video" && video_attached {
         body = RE_VIDEO_CARD_LINK.replace_all(&body, "").to_string();
-    } else if vote_obj.is_some() {
+    }
+    if vote_obj.is_some() {
         // vote_obj is only fetched when is_vote==1 (see the fetch loop), so
         // there is no need to re-check is_vote here.
         body = RE_VOTE_CARD_LINK.replace_all(&body, "").to_string();

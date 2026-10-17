@@ -405,8 +405,20 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 if !cur.is_empty() {
                     code_chunks.push(cur);
                 }
-                if !prefix.is_empty() && visible_len(&prefix) <= limit {
-                    chunks.push(prefix);
+                // Prose before the <pre> block. When it exceeds the limit it
+                // must be split (mirroring the blockquote branch below), not
+                // dropped — the old `visible_len(&prefix) <= limit` guard
+                // silently discarded an oversized prefix, losing content with
+                // no log (e.g. a long intro before a code block, especially
+                // when a caption is cut at CAPTION_LIMIT=1024).
+                if !prefix.is_empty() {
+                    if visible_len(&prefix) <= limit {
+                        chunks.push(prefix);
+                    } else {
+                        for sub in split_html_safe(&prefix, limit) {
+                            chunks.push(sub);
+                        }
+                    }
                 }
                 for c in &code_chunks {
                     chunks.push(format!("{}{}{}", open_tag, c, close_tag));

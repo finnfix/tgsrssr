@@ -130,9 +130,16 @@ async fn edit_or_send(
     match req.await {
         Ok(_) => {}
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("not modified") {
-                // Content identical — nothing to update.
+            // Content identical — nothing to update. Prefer matching the typed
+            // ApiError::MessageNotModified; keep the substring check as a
+            // fallback in case the error surfaces without the typed variant, so
+            // an edit-to-identical-content never falls through to sending a
+            // duplicate panel message (spamming on every paginate/toggle).
+            if matches!(
+                e,
+                teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
+            ) || e.to_string().contains("not modified")
+            {
                 return Ok(());
             }
             // Original message can't be edited (too old / inaccessible): send new.
@@ -434,6 +441,18 @@ pub async fn handle_callback(
                     "cfgmv" => "content_mode",
                     _ => "source_display",
                 };
+                // Range guard for the fetch interval: a forged/edge callback
+                // with 0 or a negative value would make the due check
+                // (now-last_fetch)*1440 >= interval always true, so the channel
+                // is fetched on every 5-minute tick — easily tripping source
+                // rate limits / IP bans. Clamp to a sane minimum (1 minute).
+                if field == "interval_minutes" {
+                    let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
+                    if !ok {
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed")).await.ok();
+                        return Ok(());
+                    }
+                }
                 match db::set_chat_config_field(&state.db, cid, field, val).await {
                     Ok(_) => {
                         info!(chat_id = %cid, field = field, value = %val, "chat config updated");
@@ -752,8 +771,15 @@ async fn start_pending_op(
     if html {
         req = req.parse_mode(ParseMode::Html);
     }
-    let prompt = req.await?;
+    // Hold the pending_ops lock across the send so "send prompt + register op"
+    // is atomic. Otherwise a user who replies extremely fast (between the send
+    // completing and the map insert) would have their reply treated as an
+    // ordinary message, and the NEXT unrelated message would then be wrongly
+    // consumed as the pending op (rename/cookie). A concurrent reply now either
+    // runs before we acquire the lock (prompt not yet sent — correctly handled
+    // as a normal message) or after the insert (correctly consumed).
     let mut ops = state.pending_ops.lock().await;
+    let prompt = req.await?;
     let old = ops.insert((chat.0, user_id), make_op(prompt.id.0));
     drop(ops);
     if let Some(old) = old {
@@ -1141,6 +1167,13 @@ pub async fn handle_my_chat_member(
 ) -> ResponseResult<()> {
     let chat = update.chat.clone();
     let chat_id = chat.id.0.to_string();
+    // Telegram also emits my_chat_member for private chats (user blocks /
+    // unblocks the bot). Those must not be registered as manageable "channels"
+    // (they would pollute the /set list and allow a nonsensical self-subscribe),
+    // nor purged as if a channel. Only groups/supergroups/channels are in scope.
+    if !(chat.is_channel() || chat.is_supergroup() || chat.is_group()) {
+        return Ok(());
+    }
     let chat_type = crate::db::chat_type_str(chat.is_channel(), chat.is_group(), chat.is_supergroup());
     // Record the inviter (the user who performed the add/remove action) as the channel owner.
     let inviter_id = update.from.id.0.to_string();

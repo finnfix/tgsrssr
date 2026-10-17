@@ -675,6 +675,18 @@ fn extract_tweets_from_instructions(instructions: &Value, screen_name: &str) -> 
     Ok(tweets)
 }
 
+/// Unwrap a `{__typename:"TweetWithVisibilityResults", tweet:{...}}` wrapper to
+/// the inner tweet object; return the input unchanged when not wrapped.
+/// X returns this wrapper for some tweets (e.g. visibility-restricted results);
+/// its top level carries no `rest_id`/`legacy` — those live on the inner `tweet`.
+fn unwrap_tweet_result(result: &Value) -> &Value {
+    if result["__typename"].as_str() == Some("TweetWithVisibilityResults") {
+        &result["tweet"]
+    } else {
+        result
+    }
+}
+
 /// Recursively collect tweet result objects from timeline entries.
 fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
     let entry_id = entry["entryId"].as_str().unwrap_or("");
@@ -682,8 +694,12 @@ fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
     if entry_id.starts_with("cursor-") {
         return;
     }
-    // Direct tweet entry: content.itemContent.tweet_results.result
-    let tweet_result = &entry["content"]["itemContent"]["tweet_results"]["result"];
+    // Direct tweet entry: content.itemContent.tweet_results.result. The result
+    // may be a TweetWithVisibilityResults wrapper whose rest_id is on the inner
+    // tweet — unwrap before the rest_id check, otherwise such tweets are
+    // silently dropped at the collection stage (never reaching tweet_to_entry,
+    // so no warn and no dropped-count).
+    let tweet_result = unwrap_tweet_result(&entry["content"]["itemContent"]["tweet_results"]["result"]);
     if !tweet_result.is_null() && tweet_result.get("rest_id").is_some() {
         out.push(tweet_result.clone());
         return;
@@ -691,7 +707,7 @@ fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
     // Nested items (e.g. conversation threads in profile-conversation modules)
     if let Some(items) = entry["content"]["items"].as_array() {
         for item in items {
-            let tr = &item["item"]["itemContent"]["tweet_results"]["result"];
+            let tr = unwrap_tweet_result(&item["item"]["itemContent"]["tweet_results"]["result"]);
             if !tr.is_null() && tr.get("rest_id").is_some() {
                 out.push(tr.clone());
             }
@@ -1030,12 +1046,8 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_m
 
 /// Convert a GraphQL tweet result object into a feed-rs Entry.
 fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Option<Entry> {
-    // Handle TweetWithVisibilityResults wrapper.
-    let tweet = if tweet["__typename"].as_str() == Some("TweetWithVisibilityResults") {
-        &tweet["tweet"]
-    } else {
-        tweet
-    };
+    // Handle TweetWithVisibilityResults wrapper (shared with collect_tweet_results).
+    let tweet = unwrap_tweet_result(tweet);
 
     let legacy = &tweet["legacy"];
     if legacy.is_null() {
@@ -1193,10 +1205,28 @@ fn tweet_text_to_html(text: &str) -> String {
         let m = caps.get(0).unwrap();
         // Escape and append the text before this URL.
         out.push_str(&crate::push::escape_html(&text[last..m.start()]));
-        // Strip trailing sentence punctuation that isn't part of the URL.
+        // Strip trailing sentence punctuation and unbalanced closing brackets
+        // that aren't part of the URL. The URL regex `[^\s<>"]+` happily swallows
+        // a `)`/`]`/`}` that actually belongs to surrounding prose (e.g.
+        // "(see https://x.com/a)"), producing a broken link. Brackets are only
+        // stripped while they are unbalanced (closers exceed openers), so URLs
+        // with legitimately balanced parens (e.g. Wikipedia links) are kept.
         let mut url = m.as_str();
-        while url.ends_with(['.', ',', ';', '!', '?']) {
-            url = &url[..url.len() - 1];
+        loop {
+            let before = url;
+            while url.ends_with(['.', ',', ';', '!', '?']) {
+                url = &url[..url.len() - 1];
+            }
+            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                while url.ends_with(close)
+                    && url.matches(close).count() > url.matches(open).count()
+                {
+                    url = &url[..url.len() - close.len_utf8()];
+                }
+            }
+            if url.len() == before.len() {
+                break;
+            }
         }
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
@@ -1479,5 +1509,68 @@ mod tests {
         // a tag right after <br> must still match
         let out = linkify_hashtags("text<br>#Tesla<br>more");
         assert!(out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"), "got: {}", out);
+    }
+
+    #[test]
+    fn tweet_text_to_html_strips_trailing_unbalanced_paren() {
+        // A URL wrapped in prose parentheses must not swallow the closing ')'.
+        let out = tweet_text_to_html("see (https://x.com/a)");
+        assert!(
+            out.contains("<a href=\"https://x.com/a\">https://x.com/a</a>)"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn tweet_text_to_html_keeps_balanced_parens_in_url() {
+        // URLs with legitimately balanced parens (e.g. Wikipedia) are kept whole.
+        let out = tweet_text_to_html("https://en.wikipedia.org/wiki/Foo_(bar)");
+        assert!(
+            out.contains("<a href=\"https://en.wikipedia.org/wiki/Foo_(bar)\">"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn tweet_text_to_html_strips_trailing_punct_then_paren() {
+        // "(url)." — period stripped first, then the now-unbalanced ')'.
+        let out = tweet_text_to_html("(https://x.com/a).");
+        assert!(
+            out.contains("<a href=\"https://x.com/a\">https://x.com/a</a>)."),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn collect_tweet_results_unwraps_visibility_wrapper() {
+        // A TweetWithVisibilityResults wrapper carries rest_id only on the
+        // inner tweet; collect must unwrap it (previously such tweets were
+        // silently dropped before reaching tweet_to_entry).
+        let entry = serde_json::json!({
+            "entryId": "tweet-1",
+            "content": {
+                "itemContent": {
+                    "tweet_results": {
+                        "result": {
+                            "__typename": "TweetWithVisibilityResults",
+                            "tweet": { "rest_id": "123", "legacy": { "id_str": "123" } }
+                        }
+                    }
+                }
+            }
+        });
+        let mut out = Vec::new();
+        collect_tweet_results(&entry, &mut out);
+        assert_eq!(out.len(), 1, "wrapper tweet should be collected");
+        assert_eq!(out[0]["rest_id"].as_str(), Some("123"));
+    }
+
+    #[test]
+    fn unwrap_tweet_result_plain_passthrough() {
+        let plain = serde_json::json!({ "rest_id": "999", "legacy": {} });
+        assert_eq!(unwrap_tweet_result(&plain)["rest_id"].as_str(), Some("999"));
     }
 }

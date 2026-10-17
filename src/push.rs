@@ -1581,6 +1581,16 @@ pub async fn send_entry_msg(
     };
     let footer_reserve = visible_len(&footer) + 2;
     let chunks = split_html(html_text, SAFE_LIMIT.saturating_sub(footer_reserve).max(1));
+    // Defensive: split_html does not contractually guarantee a non-empty Vec
+    // (a pathological input whose visible_len>limit but whose every \n\n
+    // segment is empty could yield none). Guard against the `len()-1` underflow
+    // and the `expect("at least one chunk")` panic below by sending a single
+    // message instead — never silently drop the entry.
+    let chunks = if chunks.is_empty() {
+        vec![html_text.to_string()]
+    } else {
+        chunks
+    };
     let mut first_msg: Option<Message> = None;
     let last_idx = chunks.len() - 1;
     for (i, chunk) in chunks.iter().enumerate() {

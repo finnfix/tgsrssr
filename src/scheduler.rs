@@ -485,6 +485,16 @@ async fn process_feed(
                 if db::is_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await? {
                     continue;
                 }
+                // Cross-cycle double-send guard: the fetch cycle and the outbox
+                // retry cycle run under independent AtomicBool locks and can
+                // overlap. An entry that failed a previous round is queued in
+                // the outbox but not yet in sent_entries (mark happens only
+                // after a successful send), so both cycles would otherwise pass
+                // is_entry_sent and push it concurrently. Skip entries the
+                // outbox already owns — the outbox has sole retry authority.
+                if db::is_in_outbox(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await {
+                    continue;
+                }
                 // Content filter: entries whose title matches a rule are marked
                 // as sent directly (never pushed), avoiding repeated checks
                 // every round eating into the fetch window.
@@ -514,6 +524,16 @@ async fn process_feed(
                         feed = %cfg.feed_url,
                         "feed processing deadline reached, remaining entries deferred to next cycle"
                     );
+                    // Deferred entries are not marked sent, but this round
+                    // already saved the source's ETag/Last-Modified. If the next
+                    // round's conditional request returns 304, process_feed
+                    // returns early and never re-processes the deferred entries
+                    // — they would be lost once they roll out of the source
+                    // window. Clear the headers so the next round issues an
+                    // unconditional request (full 200) and picks them up.
+                    if let Err(e) = db::clear_fetch_headers(&state.db, sub.id).await {
+                        warn!(feed = %cfg.feed_url, error = %e, "clear fetch headers failed after deadline");
+                    }
                     break;
                 }
                 let eid = fetcher::entry_id(entry);
@@ -554,13 +574,21 @@ async fn process_feed(
                     if !download_warnings.is_empty() {
                         const MEDIA_DL_MAX_RETRIES: i64 = 10;
                         let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
-                        let fail_count: i64 = db::get_setting(&state.db, &retry_key)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0)
-                            + 1;
+                        // Read the current counter, distinguishing a genuine
+                        // DB error from a missing/invalid value. On a DB error we
+                        // must NOT treat it as 0: that would reset the failure
+                        // streak every time the DB hiccups, so the 10-retry cap
+                        // is never reached and the entry retries forever. Skip
+                        // the counter step this round and let the next round
+                        // re-read (the entry is not marked sent, so it is safe).
+                        let stored = match db::get_setting(&state.db, &retry_key).await {
+                            Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+                            Err(e) => {
+                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
+                                continue;
+                            }
+                        };
+                        let fail_count: i64 = stored + 1;
                         if fail_count >= MEDIA_DL_MAX_RETRIES {
                             // Cap reached: abandon this entry and notify the
                             // owner.
@@ -574,8 +602,13 @@ async fn process_feed(
                                 &entry_link,
                             );
                             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
+                            // Delete the counter key BEFORE marking sent: if the
+                            // mark fails (and `?` returns), the counter is
+                            // already cleared, so the next round re-counts from 0
+                            // instead of re-triggering the abandon branch every
+                            // round and spamming the owner with "abandoned".
                             db::delete_setting(&state.db, &retry_key).await.ok();
+                            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                         } else {
                             db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await.ok();
                             notify_download_failed(

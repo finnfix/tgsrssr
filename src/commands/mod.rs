@@ -462,6 +462,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_url")).await?;
         return Ok(());
     }
+    // Normalize before any lookup: subscriptions are stored under their
+    // normalized URL (normalize_feed_url collapses platform host/path/case
+    // variants). Matching /test's raw input against the stored value would
+    // miss an existing subscription (e.g. t.me/Foo/... vs t.me/foo), silently
+    // falling back to default config instead of that source's override — so the
+    // test result would not reflect what the real push actually does.
+    let feed_url = fetcher::normalize_feed_url(&feed_url);
     // Platform sources (Weibo/X) require an admin-configured global cookie to work; intercept when not configured.
     if let Some(p) = crate::platforms::platform_for_url(&feed_url) {
         if p.needs_cookie && state.get_cookie(p.id).await.is_none() {

@@ -1082,6 +1082,12 @@ async fn download_one(
                     || (!es.starts_with("HTTP ")
                         && (es.contains("error sending request")
                             || es.contains("error decoding response body")
+                            // reqwest renders a timeout as "operation timed out"
+                            // (no "timeout" substring), so match both spellings;
+                            // a mid-body stall that only says "timed out" would
+                            // otherwise be classified non-transient and the media
+                            // dropped without retry.
+                            || es.contains("timed out")
                             || es.contains("timeout")
                             || es.contains("connection")
                             || es.contains("incomplete")));
@@ -1222,7 +1228,16 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
-    ok && thumb.exists() && std::fs::metadata(thumb).map(|m| m.len()).unwrap_or(0) > 0
+    let good = ok && thumb.exists() && std::fs::metadata(thumb).map(|m| m.len()).unwrap_or(0) > 0;
+    if !good {
+        // ffmpeg may have been killed mid-write on timeout (kill_on_drop), or
+        // failed after creating a partial/empty file. Remove the leftover so it
+        // does not accumulate as an orphan: cleanup.rs only reclaims thumbnails
+        // registered on an outbox MediaItem.thumb_path, and a failed grab_thumb
+        // never registers one.
+        let _ = tokio::fs::remove_file(thumb).await;
+    }
+    good
 }
 
 /// Grab one frame from an image and scale it to a JPEG thumbnail (for the

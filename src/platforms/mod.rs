@@ -126,7 +126,16 @@ pub const PLATFORMS: &[PlatformDef] = &[
         label: "X",
         needs_cookie: true,
         match_url: x::is_x_url,
-        canonical_url: |url| x::parse_screen_name(url).map(|name| format!("https://x.com/{}", name)),
+        // Lowercase the screen name for canonicalization: X usernames are
+        // case-insensitive, so without this x.com/ElonMusk and x.com/elonmusk
+        // canonicalize to different strings and bypass the UNIQUE(chat_id,
+        // feed_url) dedup — the same account gets subscribed twice and pushed
+        // twice. The API lookup and links are case-insensitive; the display
+        // name comes from the API response, not this URL.
+        canonical_url: |url| {
+            x::parse_screen_name(url)
+                .map(|name| format!("https://x.com/{}", name.to_ascii_lowercase()))
+        },
         fetch: |state, url| Box::pin(x::fetch_by_url(state, url)),
     },
     PlatformDef {
@@ -134,7 +143,13 @@ pub const PLATFORMS: &[PlatformDef] = &[
         label: "Telegram",
         needs_cookie: false,
         match_url: telegram::is_telegram_url,
-        canonical_url: |url| telegram::parse_channel_name(url).map(|ch| format!("https://t.me/{}", ch)),
+        // Lowercase the channel name for canonicalization: t.me channel
+        // usernames are case-insensitive, so t.me/Foo and t.me/foo must
+        // canonicalize identically to prevent duplicate subscriptions.
+        canonical_url: |url| {
+            telegram::parse_channel_name(url)
+                .map(|ch| format!("https://t.me/{}", ch.to_ascii_lowercase()))
+        },
         fetch: |state, url| Box::pin(telegram::fetch_by_url(state, url)),
     },
 ];
@@ -232,50 +247,56 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
     }
 
     if legacy.is_empty() {
-        return;
-    }
+        // No legacy per-user cookies to migrate, but a DB could still hold
+        // legacy per-user health/streak/expired keys (three-segment form). Fall
+        // through to the unconditional cleanup below so those orphans are
+        // removed too — do NOT early-return here.
+        tracing::debug!("migrate_legacy_cookies: no legacy cookies, running orphan-key cleanup only");
+    } else {
+        tracing::info!(count = legacy.len(), "migrating legacy per-user cookies to global format");
 
-    tracing::info!(count = legacy.len(), "migrating legacy per-user cookies to global format");
-
-    // Group by platform; prefer admin's cookie
-    let mut best: std::collections::HashMap<String, (i64, String)> = std::collections::HashMap::new();
-    for (uid, platform, value) in &legacy {
-        let is_admin = state.config.is_admin(*uid);
-        let entry = best.entry(platform.clone());
-        match entry {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((*uid, value.clone()));
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                // Replace if current best is non-admin and this one is admin
-                let cur_uid = e.get().0;
-                if is_admin && !state.config.is_admin(cur_uid) {
+        // Group by platform; prefer admin's cookie
+        let mut best: std::collections::HashMap<String, (i64, String)> = std::collections::HashMap::new();
+        for (uid, platform, value) in &legacy {
+            let is_admin = state.config.is_admin(*uid);
+            let entry = best.entry(platform.clone());
+            match entry {
+                std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((*uid, value.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    // Replace if current best is non-admin and this one is admin
+                    let cur_uid = e.get().0;
+                    if is_admin && !state.config.is_admin(cur_uid) {
+                        e.insert((*uid, value.clone()));
+                    }
                 }
             }
         }
-    }
 
-    // Write global keys (only if not already set)
-    for (platform, (_uid, value)) in &best {
-        let global_key = cookie_setting_key(platform);
-        let existing = crate::db::get_setting(&state.db, &global_key).await.ok().flatten();
-        if existing.is_none() && !value.trim().is_empty() {
-            crate::db::set_setting(&state.db, &global_key, value).await.ok();
-            state.set_cookie(platform, value).await;
-            tracing::info!(platform = %platform, "migrated cookie to global format");
+        // Write global keys (only if not already set)
+        for (platform, (_uid, value)) in &best {
+            let global_key = cookie_setting_key(platform);
+            let existing = crate::db::get_setting(&state.db, &global_key).await.ok().flatten();
+            if existing.is_none() && !value.trim().is_empty() {
+                crate::db::set_setting(&state.db, &global_key, value).await.ok();
+                state.set_cookie(platform, value).await;
+                tracing::info!(platform = %platform, "migrated cookie to global format");
+            }
+        }
+
+        // Delete all legacy per-user cookie keys
+        for (key, _) in &rows {
+            let parts: Vec<&str> = key.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                crate::db::delete_setting(&state.db, key).await.ok();
+            }
         }
     }
 
-    // Delete all legacy per-user cookie keys
-    for (key, _) in &rows {
-        let parts: Vec<&str> = key.splitn(3, ':').collect();
-        if parts.len() == 3 {
-            crate::db::delete_setting(&state.db, key).await.ok();
-        }
-    }
-
-    // Clean up legacy per-user health/streak/expired keys
+    // Clean up legacy per-user health/streak/expired keys. Runs unconditionally
+    // (even when there were no legacy cookies), so a DB that only has per-user
+    // health keys still gets them removed instead of leaking forever.
     for prefix in ["platform_health:", "platform_streak:", "cookie_expired_notified:"] {
         if let Ok(hrows) = crate::db::get_settings_by_prefix(&state.db, prefix).await {
             for (key, _) in &hrows {

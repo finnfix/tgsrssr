@@ -129,10 +129,12 @@ impl Config {
             media_dir,
             log_dir,
             bot_api_media_dir,
-            outbound_ttl_hours: env_parse_or("MEDIA_OUTBOUND_TTL_HOURS", 80),
-            media_max_size_gb: env_parse_or("MEDIA_MAX_SIZE_GB", 10),
+            outbound_ttl_hours: env_parse_or("MEDIA_OUTBOUND_TTL_HOURS", 80).max(1),
+            media_max_size_gb: env_parse_or("MEDIA_MAX_SIZE_GB", 10).max(1),
             long_image_aspect_ratio: env_parse_or("LONG_IMAGE_ASPECT_RATIO", 8.0),
-            max_video_push_mb: env_parse_or("MAX_VIDEO_PUSH_MB", 100),
+            // Floor of 1: MAX_VIDEO_PUSH_MB=0 would make cap=min(transport,0)=0
+            // and skip every media item.
+            max_video_push_mb: env_parse_or("MAX_VIDEO_PUSH_MB", 100).max(1),
             rss_proxy,
             rss_no_proxy,
             rss_insecure_hosts,
@@ -154,7 +156,10 @@ impl Config {
             // Semaphore(0)'s acquire never succeed, silently hanging fetches.
             fetch_concurrency: env_parse_or("FETCH_CONCURRENCY", 8).max(1),
             download_concurrency: env_parse_or("DOWNLOAD_CONCURRENCY", 4).max(1),
-            max_fetch_errors: env_parse_or("MAX_FETCH_ERRORS", 20),
+            // Floor of 1: MAX_FETCH_ERRORS=0 makes the `count >= max` check in
+            // the scheduler true on the very first failure, auto-disabling a
+            // source after a single transient error.
+            max_fetch_errors: env_parse_or("MAX_FETCH_ERRORS", 20).max(1),
         })
     }
 

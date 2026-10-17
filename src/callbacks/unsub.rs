@@ -234,13 +234,28 @@ pub(super) async fn handle_unsub_all_callback(
     // Placed after the subscription query: ensures early-exit paths like "no subscriptions" don't
     // leave the message stuck at "Processing…".
     if let Some(m) = q.message.as_ref() {
-        if bot
+        match bot
             .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "unsuball_processing"))
             .await
-            .is_err()
         {
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "unsuball_dup")).await.ok();
-            return Ok(());
+            Ok(_) => {}
+            Err(e) => {
+                // Only a genuine "message is not modified" means another
+                // callback already preempted this one (double-tap). A transient
+                // network / Bot API error must NOT be mistaken for a duplicate —
+                // otherwise the unsuball silently aborts (neither unsubscribing
+                // nor restoring the page). On transient errors, propagate so the
+                // dispatcher can retry rather than reporting "already processing".
+                let is_not_modified = matches!(
+                    e,
+                    teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
+                ) || e.to_string().contains("not modified");
+                if is_not_modified {
+                    bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "unsuball_dup")).await.ok();
+                    return Ok(());
+                }
+                return Err(e);
+            }
         }
     }
 
