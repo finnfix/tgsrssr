@@ -813,11 +813,15 @@ pub async fn prepare_entry_media(
         .into_iter()
         .collect();
 
-    // Directories are named by Local date, consistent with the Local cutoff
-    // used in cleanup.rs (previously Utc was used; under UTC+8, directories
-    // created in the early morning were attributed to the previous day and
-    // cleaned up about 1 day early).
-    let date_dir = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // All runtime date semantics use UTC explicitly (not Local): log
+    // rotation and timestamps are fixed to UTC by tracing-appender /
+    // tracing-subscriber, so media archive dirs and cleanup cutoffs must
+    // share the same clock to keep cross-file correlation stable.
+    // `cleanup_outbound` compares these dir names against a UTC cutoff —
+    // write side and delete side must stay paired on the same clock,
+    // otherwise a deployment with TZ set (e.g. Asia/Shanghai) would drift
+    // media dirs vs the log day boundary.
+    let date_dir = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let outbound = state.config.media_dir.join("outbound").join(&date_dir);
     if let Err(e) = std::fs::create_dir_all(&outbound) {
         warn!(dir = %outbound.display(), error = %e, "cannot create outbound dir");

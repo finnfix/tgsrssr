@@ -84,7 +84,9 @@ pub async fn cleanup_outbound(
         return Ok(0);
     }
     let ttl_days = (config.outbound_ttl_hours as f64 / 24.0).ceil() as i64;
-    let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(ttl_days + 1);
+    // UTC cutoff, paired with the UTC date_dir written by media.rs: the
+    // comparison only stays correct if both sides use the same clock.
+    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(ttl_days + 1);
     let mut removed = 0u64;
 
     let mut entries = fs::read_dir(&outbound).await?;
@@ -264,7 +266,9 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
         }
     }
 
-    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    // UTC date in the backup name, consistent with the UTC retention
+    // cutoff below and with log/media date semantics across the bot.
+    let today = chrono::Utc::now().format("%Y%m%d").to_string();
     let target = backups.join(format!("rss_bot_{}.db", today));
     if !target.exists() {
         // Checkpoint first: flush the entire WAL back into the main database
@@ -297,7 +301,8 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
     // the filename). Retention days must be at least 1: a negative value
     // would push the cutoff into the future and delete all backups.
     let retention = config.backup_retention_days.max(1);
-    let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(retention);
+    // UTC cutoff, same clock as the UTC `today` used in the backup name above.
+    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(retention);
     let mut entries = fs::read_dir(&backups).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
