@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|c| !is_admin_only_command(&c.command))
         .cloned()
         .collect();
-    // Per-language menus (v1.11.4): Telegram keys the command menu on the
+    // Per-language menus (Unreleased): Telegram keys the command menu on the
     // language each client reports. The derive literals are English and are
     // registered with no language_code, which is the fallback for every client
     // whose language has no dedicated list; Chinese clients (zh-hans / zh-hant
