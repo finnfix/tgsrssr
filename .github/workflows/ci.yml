@@ -5,6 +5,11 @@ on:
     branches: ["*"]
   pull_request:
 
+# Least privilege: default the GITHUB_TOKEN to read-only repo contents.
+# No job here needs to write anything back to the repository.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest

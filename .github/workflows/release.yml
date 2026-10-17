@@ -13,6 +13,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least privilege: default the GITHUB_TOKEN to read-only repo contents so jobs
+# that only build/test cannot write back to the repo. Jobs needing more scope
+# (release creation, image push) grant it explicitly at the job level below.
+permissions:
+  contents: read
+
 jobs:
   # ===== CI gate (clippy + test) — blocks all downstream jobs =====
   check:
