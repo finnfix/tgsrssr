@@ -214,7 +214,22 @@ pub async fn fetch_telegram_channel(
     let body_buf = crate::fetcher::read_body_capped(resp, &ctx).await?;
     let html = String::from_utf8_lossy(&body_buf).into_owned();
 
-    let feed_title = extract_channel_title(&html).unwrap_or_else(|| channel.to_string());
+    // Channel title extraction: a missing title is not fatal (we fall back to
+    // the channel slug) but IS a structural signal — the info header has been
+    // a stable part of the t.me/s/<channel> layout for years, so its absence
+    // usually means the preview page was redesigned. Log it so operators can
+    // correlate "titles all became @slug" reports with a specific fetch round.
+    let feed_title = match extract_channel_title(&html) {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                channel = %channel,
+                body_len = body_buf.len(),
+                "telegram channel title not found in preview page (falling back to channel slug; page structure may have changed)"
+            );
+            channel.to_string()
+        }
+    };
 
     // Locate message blocks by finding all data-post positions and slicing
     // between consecutive ones (Rust regex has no lookahead).
@@ -231,6 +246,17 @@ pub async fn fetch_telegram_channel(
             }
         }
     }
+
+    // Per-round parse summary (aligned with weibo.rs / x.rs debug counters):
+    // lets an operator eyeball "blocks found but zero entries" vs "zero
+    // blocks at all" without needing to reproduce the fetch locally. Debug
+    // level — the warn below covers the anomalous case.
+    tracing::debug!(
+        channel = %channel,
+        blocks = blocks.len(),
+        entries = entries.len(),
+        "telegram preview parsed"
+    );
 
     // Newest first.
     crate::platforms::sort_entries_newest_first(&mut entries);

@@ -786,7 +786,12 @@ async fn download_cover_fallback(
             out.items.push(item);
         }
         _ => {
-            debug!(cover_url = %cover, "cover image download failed, entry stays text-only");
+            // Promoted from debug to warn: the cover fallback only runs after a
+            // video was dropped (oversized/failed), so a failure here means the
+            // entry loses its last visual element and degrades to text-only —
+            // a real media loss that must be observable at the default info
+            // level, not hidden behind RUST_LOG=debug.
+            warn!(cover_url = %cover, "cover image download failed, entry stays text-only");
         }
     }
 }
@@ -856,7 +861,13 @@ pub async fn prepare_entry_media(
         // high risk of fixing one and missing another).
         let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, transport).await {
             Err(e) if via_relay => {
-                debug!(relay_url = %url, direct_url = %direct_url, error = %e, "relay download failed, retrying direct");
+                // Promoted from debug to warn: this fires only when an
+                // img-relay was configured AND it failed. Even when the direct
+                // retry below succeeds, a failing relay is a real degradation
+                // signal (Worker 502 / region-blocked CDN) that must be
+                // observable at the default info level. Volume is bounded by
+                // MAX_MEDIA_PER_ENTRY, so this cannot flood the log.
+                warn!(relay_url = %url, direct_url = %direct_url, error = %e, "relay download failed, retrying direct");
                 let r = download_one(state, &direct_url, &kind, &mime, &outbound, transport).await;
                 (r, Some(e.to_string()))
             }

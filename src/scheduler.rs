@@ -206,6 +206,11 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     if due.is_empty() {
         return Ok(());
     }
+    // Cycle-level timing + totals, reported by the summary log at the end of
+    // the round (see below). Kept local to run_fetch_cycle — no signature
+    // change to process_feed.
+    let cycle_started = std::time::Instant::now();
+    let total_due = due.len();
     info!(count = due.len(), "fetch cycle: due subscriptions");
 
     // Per-round platform-level stats: seen = platforms scheduled this round,
@@ -271,6 +276,8 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     // concurrency; serial execution + random gaps effectively lowers the 403
     // probability.
     let mut first_platform = true;
+    let mut plat_ok = 0usize;
+    let mut plat_fail = 0usize;
     for (sub, cfg) in platform_subs {
         // Non-first platform source: random 3-8 second delay (pseudo-random
         // via nanosecond modulo, no rand dependency needed)
@@ -288,18 +295,46 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         let feed_url = sub.feed_url.clone();
         let chat_id = sub.chat_id.clone();
         if let Err(e) = process_feed(state, bot, sub, cfg, &stats).await {
+            plat_fail += 1;
             error!(feed = %feed_url, chat_id = %chat_id, error = %e, "platform feed processing failed");
+        } else {
+            plat_ok += 1;
         }
     }
 
     // Wait for the plain-source tasks to finish
+    let mut rss_ok = 0usize;
+    let mut rss_fail = 0usize;
     for (feed_url, handle) in handles {
         match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(feed = %feed_url, error = %e, "feed processing failed"),
-            Err(e) => error!(feed = %feed_url, error = %e, "feed task join failed"),
+            Ok(Ok(())) => rss_ok += 1,
+            Ok(Err(e)) => {
+                rss_fail += 1;
+                error!(feed = %feed_url, error = %e, "feed processing failed")
+            }
+            Err(e) => {
+                rss_fail += 1;
+                error!(feed = %feed_url, error = %e, "feed task join failed")
+            }
         }
     }
+
+    // One-line cycle summary at info level. Rationale: the individual
+    // per-feed failures above each already emit their own error!, but there
+    // was no aggregate view — an operator looking at logs after the fact
+    // could not tell at a glance "how many subs ran, how many succeeded, how
+    // long did the round take". This is the cheapest place to expose that
+    // (counters already collected above; no extra DB or platform queries).
+    // Deliberately NOT logging per-feed success info! lines to avoid volume.
+    info!(
+        due = total_due,
+        rss_ok = rss_ok,
+        rss_fail = rss_fail,
+        plat_ok = plat_ok,
+        plat_fail = plat_fail,
+        elapsed_ms = cycle_started.elapsed().as_millis() as u64,
+        "fetch cycle: summary"
+    );
 
     // Platform-level health hysteresis (whole-round view, serial so no race,
     // global per platform):
