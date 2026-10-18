@@ -1,5 +1,7 @@
 # tgsrssr
 
+**中文** · [English →](#tgsrssr-english)
+
 > **T**elegram's **R**SS **R**ust — Rust 编写的 RSS 订阅 Telegram 推送 Bot
 
 把 RSS/Atom 源的新条目定时推送到 Telegram 频道/群组，并对**微博、X (Twitter)、Telegram 频道**提供原生抓取——无需依赖 RSSHub 等第三方中转。富媒体转发、内容筛选、消息反查、断点续发、持久化重试一应俱全。
@@ -334,6 +336,8 @@ CI（GitHub Actions）在打 tag 时自动构建多平台 Docker 镜像（linux/
 ---
 
 # tgsrssr (English)
+
+[← 中文](#tgsrssr) · **English**
 
 > **T**elegram's **R**SS **R**ust — an RSS subscription Telegram push bot written in Rust
 
