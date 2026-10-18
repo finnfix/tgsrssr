@@ -95,6 +95,38 @@ pub const PENDING_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// with many parallel connections (rate limiting / anti-crawl triggers).
 pub const HOST_DOWNLOAD_CONCURRENCY: usize = 3;
 
+/// Cap on distinct per-host semaphore buckets. Hosts come from
+/// (attacker-controllable) media URLs, so the map must stay bounded.
+const MAX_HOST_BUCKETS: usize = 512;
+
+/// Make room for `host` in the per-host bucket map when it is at capacity.
+///
+/// Evicts only IDLE buckets first — a bucket is idle when all its permits are
+/// available (`available_permits() == HOST_DOWNLOAD_CONCURRENCY`, i.e. nobody
+/// currently holds one). The previous behaviour cleared the entire map on
+/// overflow; in-flight downloads kept running on their `Arc` clones while the
+/// next request to a busy host got a brand-new full-strength bucket, briefly
+/// doubling that host's effective concurrency.
+///
+/// If the map is still full after idle eviction (every bucket busy — a rare
+/// pathological case), evict a single entry. Keeping the map bounded matters
+/// more than an isolated, brief doubling of one host, and the global download
+/// semaphore still caps total concurrency. Returning an uncached transient
+/// bucket instead was rejected: it would drop per-host limiting for a hot new
+/// host, letting it open unbounded parallel connections to one CDN.
+fn cap_host_buckets(map: &mut HashMap<String, Arc<Semaphore>>, host: &str) {
+    if map.contains_key(host) || map.len() < MAX_HOST_BUCKETS {
+        return;
+    }
+    map.retain(|k, sem| k == host || sem.available_permits() < HOST_DOWNLOAD_CONCURRENCY);
+    if map.len() >= MAX_HOST_BUCKETS {
+        // All buckets busy: evict one (arbitrary) busy bucket.
+        if let Some(k) = map.keys().find(|k| *k != host).cloned() {
+            map.remove(&k);
+        }
+    }
+}
+
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -152,10 +184,17 @@ impl AppState {
         // Build a client. follow_redirects=false is used for media downloads
         // (SSRF redirect protection: download_one follows redirects manually
         // hop by hop and re-runs is_private_url on each hop).
+        // `ssrf_guard` installs the connection-layer DNS guard (ssrf.rs
+        // GuardedResolver) on direct clients only: it re-checks every address
+        // reqwest actually resolves, closing the DNS-rebinding TOCTOU window
+        // between the pre-check and the connection. Proxy-routed clients get
+        // false: the target lookup happens on the proxy side, so a local
+        // resolver would never see it.
         fn build_client(
             proxy: Option<&str>,
             insecure: bool,
             follow_redirects: bool,
+            ssrf_guard: bool,
         ) -> anyhow::Result<reqwest::Client> {
             let mut b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -167,6 +206,9 @@ impl AppState {
             if !follow_redirects {
                 b = b.redirect(reqwest::redirect::Policy::none());
             }
+            if ssrf_guard {
+                b = b.dns_resolver(crate::ssrf::GuardedResolver);
+            }
             if let Some(p) = proxy {
                 b = b.proxy(reqwest::Proxy::all(p)?);
             }
@@ -174,18 +216,19 @@ impl AppState {
         }
 
         let proxy = config.rss_proxy.as_deref();
+        let has_proxy = proxy.is_some();
 
         // RSS/platform fetch clients: follow redirects (common with feedburner etc.).
-        let http_direct = build_client(None, false, true)?;
-        let http = if proxy.is_some() { build_client(proxy, false, true)? } else { http_direct.clone() };
+        let http_direct = build_client(None, false, true, true)?;
+        let http = if has_proxy { build_client(proxy, false, true, false)? } else { http_direct.clone() };
         // Insecure variant: same proxy routing, but TLS verification disabled.
         // Only selected for whitelisted hosts (see client_for_url).
-        let http_insecure = build_client(proxy, true, true)?;
+        let http_insecure = build_client(proxy, true, true, !has_proxy)?;
 
         // Media download clients: auto-redirect disabled (SSRF protection, see download_one).
-        let media_direct = build_client(None, false, false)?;
-        let media = if proxy.is_some() { build_client(proxy, false, false)? } else { media_direct.clone() };
-        let media_insecure = build_client(proxy, true, false)?;
+        let media_direct = build_client(None, false, false, true)?;
+        let media = if has_proxy { build_client(proxy, false, false, false)? } else { media_direct.clone() };
+        let media_insecure = build_client(proxy, true, false, !has_proxy)?;
 
         Ok(Self {
             fetch_semaphore: Arc::new(Semaphore::new(config.fetch_concurrency)),
@@ -211,19 +254,16 @@ impl AppState {
 
     /// Get (or lazily create) the per-host download semaphore for a media URL.
     /// Falls back to a shared "default" bucket when the URL has no host.
-    /// The map is capped: hosts come from (attacker-controllable) media URLs,
-    /// so an unbounded map could grow without limit. On overflow we clear it;
-    /// in-flight permits keep working via their Arc clones.
+    /// The map is capped (see cap_host_buckets): hosts come from
+    /// (attacker-controllable) media URLs, so an unbounded map could grow
+    /// without limit.
     pub async fn host_download_semaphore(&self, url: &str) -> Arc<Semaphore> {
-        const MAX_HOSTS: usize = 512;
         let host = url::Url::parse(url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
             .unwrap_or_else(|| "default".to_string());
         let mut m = self.host_download_semaphores.lock().await;
-        if m.len() >= MAX_HOSTS && !m.contains_key(&host) {
-            m.clear();
-        }
+        cap_host_buckets(&mut m, &host);
         m.entry(host)
             .or_insert_with(|| Arc::new(Semaphore::new(HOST_DOWNLOAD_CONCURRENCY)))
             .clone()
@@ -320,5 +360,73 @@ impl AppState {
     /// domains to private addresses).
     pub fn is_routed_via_proxy(&self, url: &str) -> bool {
         matches!(self.route_kind(url), RouteKind::Proxy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(HOST_DOWNLOAD_CONCURRENCY))
+    }
+
+    /// Fill `map` with `n` buckets named host-0..host-n. When `busy` is true,
+    /// hold one permit per bucket (a leaked guard) so it reads as in-use.
+    fn fill(map: &mut HashMap<String, Arc<Semaphore>>, n: usize, busy: bool) {
+        for i in 0..n {
+            let sem = bucket();
+            if busy {
+                // Leak the guard: the bucket stays busy for the whole test.
+                let permit = sem.try_acquire().unwrap();
+                std::mem::forget(permit);
+            }
+            map.insert(format!("host-{}", i), sem);
+        }
+    }
+
+    #[test]
+    fn cap_below_limit_is_noop() {
+        let mut m = HashMap::new();
+        fill(&mut m, 4, false);
+        cap_host_buckets(&mut m, "new-host");
+        assert_eq!(m.len(), 4, "below-cap calls must not evict");
+    }
+
+    #[test]
+    fn cap_evicts_only_idle_buckets() {
+        let mut m = HashMap::new();
+        // Half busy, half idle, at capacity.
+        for i in 0..MAX_HOST_BUCKETS / 2 {
+            let sem = bucket();
+            let permit = sem.try_acquire().unwrap();
+            std::mem::forget(permit);
+            m.insert(format!("busy-{}", i), sem);
+        }
+        fill(&mut m, MAX_HOST_BUCKETS / 2, false);
+        // Rename idle keys distinctly (fill reuses host-N names; ensure count).
+        assert_eq!(m.len(), MAX_HOST_BUCKETS);
+        cap_host_buckets(&mut m, "new-host");
+        // All idle buckets gone, all busy buckets kept, room for the new host.
+        assert_eq!(m.len(), MAX_HOST_BUCKETS / 2);
+        assert!(m.values().all(|s| s.available_permits() < HOST_DOWNLOAD_CONCURRENCY));
+        assert!(m.len() < MAX_HOST_BUCKETS);
+    }
+
+    #[test]
+    fn cap_all_busy_evicts_exactly_one() {
+        let mut m = HashMap::new();
+        fill(&mut m, MAX_HOST_BUCKETS, true);
+        cap_host_buckets(&mut m, "new-host");
+        // Still bounded, one bucket sacrificed — never cleared wholesale.
+        assert_eq!(m.len(), MAX_HOST_BUCKETS - 1);
+    }
+
+    #[test]
+    fn cap_existing_host_never_evicts() {
+        let mut m = HashMap::new();
+        fill(&mut m, MAX_HOST_BUCKETS, false);
+        cap_host_buckets(&mut m, "host-0");
+        assert_eq!(m.len(), MAX_HOST_BUCKETS, "requests to cached hosts must not evict");
     }
 }
