@@ -1047,8 +1047,15 @@ fn render_md_inline(text: &str) -> String {
         .to_string();
 
     // 3) Escape HTML special characters (placeholders contain no &<> at this
-    // point, so this is safe)
-    let s = crate::push::escape_html(&s);
+    // point, so this is safe).
+    // Decode pre-existing HTML entities FIRST (P1-2 double-escape fix): the
+    // weibo markdown editor stores visible `&` / `<` / `>` / non-breaking
+    // spaces as `&amp;` / `&lt;` / `&gt;` / `&nbsp;`. Escaping them as-is would
+    // render them literally as `&amp;amp;` etc. decode_entities is the visible
+    // text decoder (it decodes `&amp;` last so a single pass cannot under- or
+    // over-decode), and leaves bare `&`/`<` untouched, so the round trip is
+    // idempotent for already-escaped input and correct for literal input.
+    let s = crate::push::escape_html(&crate::htmltext::decode_entities(&s));
 
     // 4) Bold **...** (before italic, to avoid ** being split into two *)
     let s = RE_MD_BOLD.replace_all(&s, "<b>$1</b>").to_string();
@@ -1059,18 +1066,25 @@ fn render_md_inline(text: &str) -> String {
     // 6) Italic *...* (** already handled; remaining single * is italic)
     let s = RE_MD_ITALIC.replace_all(&s, "<i>$1</i>").to_string();
 
-    // 7) Restore inline code
+    // 7) Restore inline code (same decode-once-escape-once rule as step 3)
     let mut s = s;
     for (i, code) in codes.iter().enumerate() {
         let token = format!("\u{FFFE}C{}\u{FFFE}", i);
-        s = s.replace(&token, &format!("<code>{}</code>", crate::push::escape_html(code)));
+        s = s.replace(
+            &token,
+            &format!(
+                "<code>{}</code>",
+                crate::push::escape_html(&crate::htmltext::decode_entities(code))
+            ),
+        );
     }
 
     // 8) Restore markdown links (link text is only escaped, no recursive
-    // formatting). Empty label or empty URL yields no meaningful anchor, so
-    // the tag is dropped — but the URL would vanish without a trace, so the
-    // dropped URLs are collected and logged once (v1.11.2 audit: leave a
-    // breadcrumb recording the count of removed links).
+    // formatting; label and URL get the same decode-once treatment). Empty
+    // label or empty URL yields no meaningful anchor, so the tag is dropped —
+    // but the URL would vanish without a trace, so the dropped URLs are
+    // collected and logged once (v1.11.2 audit: leave a breadcrumb recording
+    // the count of removed links).
     let mut dropped_urls: Vec<String> = Vec::new();
     for (i, (link_text, url)) in links.iter().enumerate() {
         let token = format!("\u{FFFE}L{}\u{FFFE}", i);
@@ -1082,8 +1096,8 @@ fn render_md_inline(text: &str) -> String {
                 &token,
                 &format!(
                     "<a href=\"{}\">{}</a>",
-                    crate::push::escape_attr(url),
-                    crate::push::escape_html(link_text)
+                    crate::push::escape_attr(&crate::htmltext::decode_entities(url)),
+                    crate::push::escape_html(&crate::htmltext::decode_entities(link_text))
                 ),
             );
         }
@@ -1187,7 +1201,10 @@ fn render_weibo_markdown(text: &str) -> String {
         let html = format!(
             "{}{}</code></pre>",
             open_tag,
-            crate::push::escape_html(&content)
+            // Same decode-once-escape-once rule as render_md_inline (P1-2):
+            // fenced content comes from the same pre-escaped editor storage,
+            // so `&amp;` inside a code block must not become `&amp;amp;`.
+            crate::push::escape_html(&crate::htmltext::decode_entities(&content))
         );
         // Store as a placeholder to prevent the trailing RE_MD_BLANK_LINES
         // from collapsing blank lines inside the code
@@ -1868,6 +1885,27 @@ mod tests {
         let input = "A & B < C > D";
         let out = render_weibo_markdown(input);
         assert!(out.contains("A &amp; B &lt; C &gt; D"), "out: {}", out);
+    }
+
+    #[test]
+    fn md_preescaped_entities_not_double_escaped() {
+        // P1-2 regression: the weibo markdown editor stores visible & and
+        // spacing as entities; escaping them without decoding first produced
+        // &amp;amp; (rendered literally in Telegram).
+        let out = render_weibo_markdown("A &amp; B");
+        assert_eq!(out, "A &amp; B", "double-escape regressed: {}", out);
+        // &nbsp; decodes to a plain space.
+        let out = render_weibo_markdown("x&nbsp;y");
+        assert_eq!(out, "x y", "nbsp not decoded: {}", out);
+        // Literal < > entities round-trip to escaped form once, not twice.
+        let out = render_weibo_markdown("&lt;tag&gt;");
+        assert_eq!(out, "&lt;tag&gt;", "entity round-trip broken: {}", out);
+        // Double-encoded input (&amp;amp;) decodes exactly one layer.
+        let out = render_weibo_markdown("&amp;amp;");
+        assert_eq!(out, "&amp;amp;", "over/under-decoded: {}", out);
+        // Bare & still escapes correctly (no regression on plain input).
+        let out = render_weibo_markdown("R&amp;D &amp; QA");
+        assert_eq!(out, "R&amp;D &amp; QA", "mixed: {}", out);
     }
 
     #[test]
