@@ -4,6 +4,24 @@
 //! (media.rs). Extracted from media.rs (batch-A architecture refactor) so the
 //! fetcher no longer depends on the media module — dependency direction is
 //! now one-way (fetcher → ssrf, media → ssrf).
+//!
+//! DNS-rebinding defence: direct-connection clients install
+//! [`GuardedResolver`] as their DNS resolver, so the addresses reqwest
+//! actually connects to are the very addresses the guard vetted — closing the
+//! time-of-check/time-of-use window between the pre-check and the connection.
+//! Proxy-routed clients must NOT use it: the connection is built on the proxy
+//! side, so a local resolver never sees the target lookup.
+
+use std::net::{IpAddr, SocketAddr};
+
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use tracing::warn;
+
+/// Error text returned by [`GuardedResolver`] when the connection-layer
+/// check rejects a lookup. Contains the substring "dns resolve failed" —
+/// sendpolicy::is_net_error classifies such fetch errors as transient
+/// (same substring contract as the pre-check branches in fetcher.rs).
+pub(crate) const GUARD_RESOLVE_FAILED: &str = "dns resolve failed by SSRF guard";
 
 /// Outcome of the SSRF pre-check. Distinguishing "confirmed private" from
 /// "DNS lookup failed" matters at the feed-fetch entry: reporting a transient
@@ -23,6 +41,36 @@ pub enum SsrfOutcome {
     LookupFailed,
 }
 
+/// Resolve `host:port` and classify every returned address. Shared by the
+/// pre-check ([`ssrf_check`]) and the connection-layer [`GuardedResolver`].
+async fn lookup_classify(host: &str, port: u16) -> (SsrfOutcome, Vec<SocketAddr>) {
+    let addr_str = format!("{}:{}", host, port);
+    // Bind the match result before returning: the lookup temporary (which
+    // borrows addr_str) must drop here, not at the end of the block, or the
+    // local falls out of scope while still borrowed (E0597).
+    let outcome = match tokio::net::lookup_host(&addr_str).await {
+        Ok(iter) => {
+            let addrs: Vec<SocketAddr> = iter.collect();
+            (classify_addrs(&addrs), addrs)
+        }
+        // DNS resolution failure: fail-closed reject (don't allow through
+        // when we can't confirm whether the address is private), but report
+        // it distinctly so callers can treat it as transient.
+        Err(_) => (SsrfOutcome::LookupFailed, Vec::new()),
+    };
+    outcome
+}
+
+/// Pure classification of a resolved address set: any private/loopback answer
+/// vetoes the whole set (fail-closed — reqwest may try the next address).
+fn classify_addrs(addrs: &[SocketAddr]) -> SsrfOutcome {
+    if addrs.iter().any(|sa| is_private_ip(&sa.ip())) {
+        SsrfOutcome::Private
+    } else {
+        SsrfOutcome::Allowed
+    }
+}
+
 /// Three-state SSRF verdict. See SsrfOutcome.
 pub async fn ssrf_check(url: &str) -> SsrfOutcome {
     let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::Private };
@@ -32,23 +80,16 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
         return SsrfOutcome::Private;
     }
     // Literal IP: check directly.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return if is_private_ip(&ip) { SsrfOutcome::Private } else { SsrfOutcome::Allowed };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_private_ip(&ip) {
+            SsrfOutcome::Private
+        } else {
+            SsrfOutcome::Allowed
+        };
     }
     // Hostname: async DNS lookup, check all returned addresses.
-    let addr_str = format!("{}:{}", host, u.port_or_known_default().unwrap_or(443));
-    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&addr_str).await {
-        Ok(iter) => iter.collect(),
-        // DNS resolution failure: fail-closed reject (don't allow through
-        // when we can't confirm whether the address is private), but report
-        // it distinctly so callers can treat it as transient.
-        Err(_) => return SsrfOutcome::LookupFailed,
-    };
-    if addrs.iter().any(|sa| is_private_ip(&sa.ip())) {
-        SsrfOutcome::Private
-    } else {
-        SsrfOutcome::Allowed
-    }
+    let port = u.port_or_known_default().unwrap_or(443);
+    lookup_classify(host, port).await.0
 }
 
 /// SSRF guard: reject URLs whose host resolves to a private/loopback address.
@@ -59,6 +100,52 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
 /// transient lookups) use ssrf_check directly.
 pub async fn is_private_url(url: &str) -> bool {
     matches!(ssrf_check(url).await, SsrfOutcome::Private | SsrfOutcome::LookupFailed)
+}
+
+/// Connection-layer DNS guard closing the rebinding window of the pre-check.
+///
+/// The pre-check resolves the hostname and vetoes private answers, but reqwest
+/// used to resolve again when connecting: a hostile DNS could answer the first
+/// lookup with a public IP and the second with 127.0.0.1 (classic
+/// time-of-check/time-of-use rebinding). Installing this resolver on a
+/// direct-connection client makes the connection path itself re-resolve and
+/// vet: an answer containing any private/loopback address fails the whole
+/// lookup (the error text carries "dns resolve failed" so is_net_error keeps
+/// treating transient blips as retryable). It re-resolves per connection
+/// rather than pinning a cached IP, so ordinary DNS failover and CDN rotation
+/// keep working.
+///
+/// Only for clients WITHOUT a proxy: through RSS_PROXY the connection target
+/// is resolved on the proxy side and this resolver is never invoked (the pre-
+/// check is skipped there for the same reason).
+#[derive(Debug, Clone, Copy)]
+pub struct GuardedResolver;
+
+impl Resolve for GuardedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port 0: reqwest substitutes the scheme's conventional port (or
+            // the URL's explicit port) on the returned addresses.
+            let (outcome, addrs) = lookup_classify(&host, 0).await;
+            match outcome {
+                SsrfOutcome::Allowed => {
+                    let boxed: Addrs = Box::new(addrs.into_iter());
+                    Ok(boxed)
+                }
+                // Private answer or failed lookup: reject. Fail-closed — the
+                // caller never reaches a connection with an unvetted address.
+                // io::Error mirrors hyper-util's GaiResolver error type; the
+                // message keeps the "dns resolve failed" substring so
+                // sendpolicy::is_net_error classifies DNS blips as transient.
+                SsrfOutcome::Private | SsrfOutcome::LookupFailed => {
+                    warn!(host = %host, "ssrf: connection-layer DNS guard rejected lookup");
+                    Err(Box::new(std::io::Error::other(GUARD_RESOLVE_FAILED))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                }
+            }
+        })
+    }
 }
 
 pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
@@ -90,5 +177,72 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || seg[0] == 0x2002              // 2002::/16 6to4 (embeds arbitrary IPv4)
                 || seg[0] == 0x2001 && seg[1] == 0 // 2001::/32 Teredo (embeds arbitrary IPv4)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn sa(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse::<IpAddr>().unwrap(), port)
+    }
+
+    #[test]
+    fn classify_all_public_allowed() {
+        assert_eq!(classify_addrs(&[sa("93.184.216.34", 0), sa("2606:2800:220:1:248:1893:25c8:1946", 0)]), SsrfOutcome::Allowed);
+    }
+
+    #[test]
+    fn classify_any_private_vetoes() {
+        // Rebinding shape: a mixed answer must fail closed, not pick the public entry.
+        assert_eq!(classify_addrs(&[sa("93.184.216.34", 0), sa("127.0.0.1", 0)]), SsrfOutcome::Private);
+        assert_eq!(classify_addrs(&[sa("169.254.169.254", 0)]), SsrfOutcome::Private);
+        assert_eq!(classify_addrs(&[sa("::1", 0)]), SsrfOutcome::Private);
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_loopback_hostname() {
+        // localhost always resolves to loopback on any host. (No expect_err:
+        // the Ok payload Addrs has no Debug impl.)
+        let res = GuardedResolver.resolve(Name::from_str("localhost").unwrap()).await;
+        let err = res.err().expect("loopback answer must be rejected");
+        assert!(
+            err.to_string().contains("dns resolve failed"),
+            "error text must keep the is_net_error substring, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_private_literal_ip() {
+        // Literal IPs skip DNS in hyper-util's connector, but a hostname that
+        // is an IP string still goes through lookup_host → private → veto.
+        let res = GuardedResolver.resolve(Name::from_str("10.0.0.1").unwrap()).await;
+        let err = res.err().expect("private literal must be rejected");
+        assert!(err.to_string().contains("dns resolve failed"));
+    }
+
+    #[tokio::test]
+    async fn resolver_never_leaks_private_for_unresolvable_name() {
+        // Fail-closed invariant. A `.invalid` lookup normally errors (rejected);
+        // on DNS-hijacking resolvers it may answer with a wildcard IP, in which
+        // case the guard must pass only public addresses, never a private one.
+        match GuardedResolver.resolve(Name::from_str("no-such-host.invalid").unwrap()).await {
+            Err(err) => assert!(err.to_string().contains("dns resolve failed")),
+            Ok(mut addrs) => assert!(addrs.all(|a| !is_private_ip(&a.ip()))),
+        }
+    }
+
+    #[test]
+    fn ssrf_check_rejects_non_http_scheme() {
+        // Blocking decision is synchronous scheme parsing; safe to test without DNS.
+        // (async fn needs a runtime; use a minimal one inline)
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            assert_eq!(ssrf_check("file:///etc/passwd").await, SsrfOutcome::Private);
+            assert_eq!(ssrf_check("gopher://example.com").await, SsrfOutcome::Private);
+            assert_eq!(ssrf_check("not a url").await, SsrfOutcome::Private);
+        });
     }
 }
