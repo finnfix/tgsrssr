@@ -98,6 +98,72 @@ async fn read_streak(state: &AppState, key: &str, platform: &'static str) -> Opt
     }
 }
 
+/// Consecutive full-body fetches that parsed zero entries before the stale-zero
+/// warn fires. Default fetch interval is 30 min, so 20 rounds ≈ 10 hours of
+/// complete silence — long enough that even a low-activity feed with a healthy
+/// parser rarely trips it, short enough to catch a page redesign within a day.
+const STALE_ZERO_WARN_ROUNDS: i64 = 20;
+
+/// Pure next-step computation of the stale-zero streak (unit-testable):
+/// returns (new_streak, should_warn). Warn fires on every exact multiple of
+/// the threshold while the streak persists — not once per edge — so a
+/// source that stays broken keeps reminding without per-round spam.
+fn stale_zero_next(prev: i64) -> (i64, bool) {
+    let next = prev.saturating_add(1);
+    (next, next % STALE_ZERO_WARN_ROUNDS == 0)
+}
+
+/// Structure-independent "silence detector" for a successful fetch round.
+///
+/// The per-platform zero-entry warns (weibo cards non-empty / X non-cursor
+/// entries present / telegram blocks present) all require the platform's
+/// response structure to still be recognized. If a redesign removes or renames
+/// the container keys, the parser reports a *legitimately* empty result: those
+/// warns never fire, the round counts as success, and the source goes silent
+/// with zero log lines. This guard needs nothing from the response shape: an
+/// HTTP-200-class fetch (not a 304) that yields zero entries repeatedly is the
+/// only evidence it uses.
+///
+/// Behavior: streak persisted in settings (`stale_zero:<chat>:<feed>`); a
+/// round with entries clears it; a DB read error skips the round rather than
+/// collapsing to 0 (same counter contract as read_streak / media_dl_fail).
+/// Log-only — no user notification: a genuinely quiet source (rarely-posting
+/// account, emptied feed) is legitimate, so paging a human on false positives
+/// would train everyone to ignore it.
+async fn note_zero_entry_round(state: &AppState, sub: &db::SubRow, round_zero: bool) {
+    let key = db::setting_key::stale_zero(&sub.chat_id, &sub.feed_url);
+    if !round_zero {
+        // Source produced entries again — streak restarts from scratch.
+        if let Err(e) = db::delete_setting(&state.db, &key).await {
+            warn!(feed = %sub.feed_url, error = %e, "stale-zero streak clear failed");
+        }
+        return;
+    }
+    let prev = match db::get_setting(&state.db, &key).await {
+        Ok(v) => v.and_then(|s| s.parse().ok()).unwrap_or(0),
+        Err(e) => {
+            warn!(feed = %sub.feed_url, error = %e, "stale-zero streak read failed, skipping this round");
+            return;
+        }
+    };
+    let (next, should_warn) = stale_zero_next(prev);
+    if let Err(e) = db::set_setting(&state.db, &key, &next.to_string()).await {
+        warn!(feed = %sub.feed_url, error = %e, "stale-zero streak write failed");
+        return;
+    }
+    if should_warn {
+        warn!(
+            feed = %sub.feed_url,
+            chat_id = %sub.chat_id,
+            rounds = next,
+            "source returned zero entries for {} consecutive successful full fetches \
+             (parser may have gone stale after a page redesign; platform-level zero-entry \
+             warns did not fire this whole time)",
+            next
+        );
+    }
+}
+
 /// Per-round platform-level stats (global — no longer isolated per owner
 /// since cookies were globalized). Bundled into a struct to avoid too many
 /// arguments on process_feed (clippy too_many_arguments).
@@ -440,6 +506,12 @@ async fn process_feed(
             if fr.not_modified {
                 return Ok(());
             }
+
+            // Stale-zero detector (structure-independent): a 200 full-body
+            // fetch that parses to zero entries extends the streak; any entry
+            // produced clears it. A 304 round above never touches it (an
+            // unchanged source is neither evidence of staleness nor health).
+            note_zero_entry_round(state, &sub, fr.entries.is_empty()).await;
 
             // Backfill/refresh feed title when not manually overridden.
             // Covers subscriptions added while fetching was broken (title fell
@@ -1585,4 +1657,22 @@ fn extract_entry_link_from_json(entry_json: &str) -> Option<String> {
         .and_then(|l| l.get("href"))
         .and_then(|h| h.as_str())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_zero_counts_up_and_warns_on_multiples() {
+        // First round: no warn (streak 1 of 20).
+        assert_eq!(stale_zero_next(0), (1, false));
+        assert_eq!(stale_zero_next(18), (19, false));
+        // Exactly the threshold warns, then every 20 consecutive silent rounds.
+        assert_eq!(stale_zero_next(STALE_ZERO_WARN_ROUNDS - 1), (20, true));
+        assert_eq!(stale_zero_next(39), (40, true));
+        // Between the multiples, counting continues silently.
+        assert_eq!(stale_zero_next(40), (41, false));
+        assert_eq!(stale_zero_next(60), (61, false));
+    }
 }

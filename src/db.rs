@@ -46,6 +46,16 @@ pub mod setting_key {
     pub fn auto_disable_notified(chat_id: &str, feed_url: &str) -> String {
         format!("auto_disable_notified:{}:{}", chat_id, feed_url)
     }
+    /// Consecutive-round counter of successful full-body fetches (HTTP 200,
+    /// not 304) that parsed zero entries: `stale_zero:<chat_id>:<feed_url>`.
+    /// Structure-independent silence detector: the per-platform zero-entry
+    /// warns need the platform response structure to still be recognized; if
+    /// a redesign makes the container keys vanish, the parser returns "valid
+    /// empty" and those warns never fire. This counter catches that case after
+    /// a sustained streak (warn log only, no user notification).
+    pub fn stale_zero(chat_id: &str, feed_url: &str) -> String {
+        format!("stale_zero:{}:{}", chat_id, feed_url)
+    }
 }
 
 /// Default config values (single source of truth on the Rust side).
@@ -302,6 +312,11 @@ pub async fn purge_chat(db: &Db, chat_id: &str) -> anyhow::Result<()> {
         .bind(format!("auto_disable_notified:{}:%", chat_id))
         .execute(&mut *tx)
         .await?;
+    // Cascade-clean the stale-zero streak counters.
+    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+        .bind(format!("stale_zero:{}:%", chat_id))
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM chats WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -433,6 +448,13 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     .bind(sub_id)
     .execute(&mut *tx)
     .await?;
+    // Cascade-clean the stale-zero streak counter (exact match, same shape).
+    sqlx::query(
+        "DELETE FROM settings WHERE key = (SELECT 'stale_zero:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+    )
+    .bind(sub_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM subscriptions WHERE id = ?").bind(sub_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -456,6 +478,11 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     // Cascade-clean the auto_disable_notified edge-dedup flag.
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
         .bind(format!("auto_disable_notified:{}:%", chat_id))
+        .execute(&mut *tx)
+        .await?;
+    // Cascade-clean the stale-zero streak counters.
+    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+        .bind(format!("stale_zero:{}:%", chat_id))
         .execute(&mut *tx)
         .await?;
     let result = sqlx::query("DELETE FROM subscriptions WHERE chat_id = ?")

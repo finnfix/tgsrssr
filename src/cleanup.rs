@@ -230,12 +230,17 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
     // cleanup on updated_at acts as the safety net (keys actively being
     // retried refresh updated_at on every failed round, so they're unaffected).
     let r3 = db::cleanup_stale_settings(db_pool, "media_dl_fail:", 7).await?;
+    // stale_zero: streak counters refresh updated_at on every zero round and
+    // vanish with the unsubscribe cascade; this retention sweep only mops up
+    // orphans left by subscriptions removed outside those paths.
+    let r4 = db::cleanup_stale_settings(db_pool, "stale_zero:", 14).await?;
     // Note: teloxide_dialogues table has no timestamp column.
     // Dialogue cleanup is handled via chat purge events instead.
     info!(
         sent_entries_deleted = r1,
         file_id_cache_deleted = r2,
         stale_settings_deleted = r3,
+        stale_zero_deleted = r4,
         "database cleanup done"
     );
     Ok(())
