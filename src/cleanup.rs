@@ -146,6 +146,7 @@ pub async fn enforce_media_quota(
     // the caller: those must not be deleted, otherwise MediaOnly retries lose
     // their media.
     let mut freed = 0u64;
+    let mut deleted_files = 0u64;
     let mut remaining = total;
     // Protect recently written files: media files from a fetch cycle that is
     // still running have not entered the outbox yet (in-flight); quota
@@ -169,12 +170,24 @@ pub async fn enforce_media_quota(
             Ok(()) => {
                 remaining -= size;
                 freed += size;
-                warn!(path = ?path, "removed file due to quota");
+                deleted_files += 1;
             }
             Err(e) => {
                 warn!(path = ?path, error = %e, "failed to remove file for quota");
             }
         }
+    }
+    // One aggregated line per round instead of a per-file warn: on instances
+    // where the quota is persistently saturated this fires hundreds of times
+    // a day and drowns out real warnings. Deletion failures above keep their
+    // per-file warn so individual problems remain locatable.
+    if deleted_files > 0 {
+        info!(
+            files = deleted_files,
+            bytes = freed,
+            mb = (freed as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+            "removed files due to media quota"
+        );
     }
     Ok(freed)
 }
