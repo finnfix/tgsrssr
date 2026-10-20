@@ -2,15 +2,15 @@
 
 **中文** · [English →](#tgsrssr-english)
 
-> **T**elegram's **R**SS **R**ust — Rust 编写的 RSS 订阅 Telegram 推送 Bot
+> **T**elegram's **R**SS **R**ust — RSS 订阅 Telegram 推送 Bot
 
-把 RSS/Atom 源的新条目定时推送到 Telegram 频道/群组，并对**微博、X (Twitter)、Telegram 频道**提供原生抓取——无需依赖 RSSHub 等第三方中转。富媒体转发、内容筛选、消息反查、断点续发、持久化重试一应俱全。
+把 RSS/Atom 源的新条目定时推送到 Telegram 频道/群组，并对**微博、X (Twitter)、Telegram 频道**提供原生抓取 —— 无需依赖第三方中转。富媒体转发、内容筛选、消息反查、断点续发、持久化重试一应俱全。
 
 ## 效果展示
 
 以下频道由 tgsrssr 实际驱动，可直接查看各类源的推送效果：
 
-| 示例频道 | 展示内容 | 内容方式 |
+| 示例频道 | 内容来源 | 内容方式 |
 |---|---|---|
 | [People's Daily](https://t.me/peoplesdailyzh) | 微博平台原生抓取 | 仅内容 |
 | [Elon Musk](https://t.me/elonmuskxtot) | X (Twitter) 平台原生抓取 | 仅内容 |
@@ -18,20 +18,20 @@
 
 ## 为什么选 tgsrssr
 
-- **原生平台抓取**：微博（长文全文、多图补全、视频 HD 升级、投票转 Poll）、X（GraphQL API 原图原视频）、Telegram 频道（公开频道网页预览）——不经过任何中间服务
+- **原生平台抓取**：微博（长文全文、多图补全、视频 HD 升级、投票转 Poll）、X（GraphQL API 原图原视频）、Telegram 频道（公开频道网页预览）
 - **不丢消息**：发送失败自动降级纯文本；仍失败入 outbox 持久化重试队列（指数退避，72h 放弃），绝不静默丢失
 - **富媒体管线**：图片/GIF/视频/文档自动识别分类发送，file_id 上传去重，超限自动转文档，媒体组成组发送
 - **多用户 + 管理员分级**：白名单/开放注册准入 + 频道归属按邀请者判定；管理员统一配置平台 cookie，所有用户共享
 - **单二进制部署**：Rust 编译产物 + SQLite，无外部数据库依赖，Docker 一键启动
-- **轻量常驻**：稳态运行内存约 20 MB（RSS，轻载实测），小型 VPS 即可承载；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
+- **轻量常驻**：稳态运行内存 10-20 MB（RSS，轻载实测），小型 VPS 即可承载；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
 
 ## 快速开始
 
 ### 前置条件
 
 - Docker + Docker Compose
-- 一个 Telegram Bot（通过 [@BotFather](https://t.me/BotFather) 创建，获取 token）
-- 你的 Telegram 用户 ID（可通过 [@userinfobot](https://t.me/userinfobot) 查询）
+- 一个 Telegram Bot（通过 [TG@BotFather](https://t.me/BotFather) 创建，获取 token）
+- 你的 Telegram 用户 ID（可通过 [TG@userinfobot](https://t.me/userinfobot) 查询）
 
 ### 方式一：Docker 镜像（推荐，无需编译）
 
@@ -40,7 +40,7 @@
 cp compose.example.yaml compose.yaml
 
 # 2. 编辑 compose.yaml，填入必填项：
-#    TELOXIDE_TOKEN: "你的 BotFather token"
+#    TELOXIDE_TOKEN: "你的 Bot token"
 #    ADMIN_USER_IDS: "你的用户ID"（管理员，必须且只能一个）
 
 # 3. 拉取镜像并启动
@@ -51,7 +51,7 @@ docker compose up -d
 docker logs -f tgsrssr
 ```
 
-### 方式二：从源码构建
+### 方式二：从源码构建（Docker）
 
 ```bash
 # 编辑 compose.yaml：注释 image 行，取消注释 build: . 行
@@ -71,9 +71,11 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 ### 首次使用
 
-1. 在 Telegram 中向你的 bot 私聊发送 `/start`
-2. **把 bot 添加进你的频道或群组**（频道建议设为管理员，确保有发消息权限）——频道归属由这一步的邀请者决定，之后只有邀请者能管理该频道
-3. 在私聊或该频道内发送 `/sub <频道> <RSS地址>` 开始订阅（新订阅只推送之后的新增内容）
+1. 在 Telegram 中向你的 Bot 私聊发送 `/start`
+2. **把 Bot 添加进你的频道或群组**（频道需确保有发消息权限）
+3. 向 Bot 内发送 `/sub <频道ID> <RSS地址>` 开始订阅
+
+> `/sub` 后面支持频道用户名（@xxx）或频道ID（-100xxxx）
 
 ### 可选：本地 Bot API 服务器（突破 50MB 上传限制）
 
@@ -84,8 +86,8 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | 命令 | 说明 |
 |---|---|
 | `/start` | 帮助 |
-| `/set [频道]` | 频道管理面板（按钮式 UI，二级设置页） |
-| `/list <频道>` | 查看频道订阅列表（超长按 4000 码元分段发送） |
+| `/set [频道]` | 频道管理面板 |
+| `/list <频道>` | 查看频道订阅列表 |
 | `/sub <频道> <url...>` | 添加订阅（可一次多个；新订阅只推新增内容） |
 | `/test <频道> <源地址> [条目序号]` | 立即推送指定源的某一条（0=最新） |
 | `/find <TG消息链接>` | 按 TG 消息反查 RSS 条目；也可直接转发频道消息给 bot |
@@ -108,7 +110,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 订阅格式：`https://weibo.com/u/<uid>`
 
-- 需登录 cookie（管理员经 `/cookies` 配置，即时生效无需重启，所有用户共享）
+- 需登录 cookie（管理员经 `/cookies` 配置）
 - 长微博全文、多图补全（>9 张）、视频 HD 升级（1080p+）
 - 转发以引用块呈现、表情转 emoji（约 150 个映射）、投票转 Telegram Poll 并自动置顶
 - 头条文章封面图、直播封面图、「查看图片」卡片图片提取
@@ -118,7 +120,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 订阅格式：`https://x.com/<screen_name>`
 
-- 需 `auth_token` cookie（管理员经 `/cookies` 配置，所有用户共享）
+- 需 `auth_token` cookie（管理员经 `/cookies` 配置）
 - GraphQL API 抓取：长推文全文、原图（`?name=orig`）、最高码率视频
 - t.co 短链展开、@mention/#hashtag/$cashtag 自动超链
 - 转推/引用以 blockquote 呈现
@@ -339,15 +341,15 @@ CI（GitHub Actions）在打 tag 时自动构建多平台 Docker 镜像（linux/
 
 [← 中文](#tgsrssr) · **English**
 
-> **T**elegram's **R**SS **R**ust — an RSS subscription Telegram push bot written in Rust
+> **T**elegram's **R**SS **R**ust — an RSS subscription Telegram push bot
 
-Periodically pushes new entries from RSS/Atom feeds to Telegram channels/groups, with **native fetching for Weibo, X (Twitter), and Telegram channels** — no dependency on third-party relays like RSSHub. Rich media forwarding, content filtering, message reverse lookup, resumable sending, and persistent retry are all built in.
+Periodically pushes new entries from RSS/Atom feeds to Telegram channels/groups, with **native fetching for Weibo, X (Twitter), and Telegram channels** — no dependency on third-party relays. Rich media forwarding, content filtering, message reverse lookup, resumable sending, and persistent retry are all built in.
 
 ## Showcase
 
 The following channels are powered by tgsrssr — check them out to see the push quality for each source type:
 
-| Demo Channel | What It Shows | Content Mode |
+| Demo Channel | Content Source | Content Mode |
 |---|---|---|
 | [People's Daily](https://t.me/peoplesdailyzh) | Weibo native fetch | Content only |
 | [Elon Musk](https://t.me/elonmuskxtot) | X (Twitter) native fetch | Content only |
@@ -355,20 +357,20 @@ The following channels are powered by tgsrssr — check them out to see the push
 
 ## Why tgsrssr
 
-- **Native platform fetching**: Weibo (full long-form text, multi-image completion, HD video upgrade, polls → TG Poll), X (GraphQL API with original images/videos), Telegram channels (public channel web preview) — no intermediate service involved
+- **Native platform fetching**: Weibo (full long-form text, multi-image completion, HD video upgrade, polls → TG Poll), X (GraphQL API with original images/videos), Telegram channels (public channel web preview)
 - **No message loss**: send failures automatically fall back to plain text; if that still fails, entries go into a persistent outbox retry queue (exponential backoff, 72h abandonment) — never silently lost
 - **Rich media pipeline**: images/GIFs/videos/documents auto-detected and sent via the appropriate API, file_id upload dedup, oversized media auto-converted to documents, media grouped into albums
 - **Multi-user + admin tiers**: whitelist/open registration access + channel ownership by inviter; admins configure platform cookies once, shared by all users
 - **Single binary deployment**: Rust binary + SQLite, no external database, one-command Docker startup
-- **Lightweight footprint**: ~20 MB RSS in steady state (measured under light load), comfortable on a small VPS; in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
+- **Lightweight footprint**: 10-20 MB RSS in steady state (measured under light load), comfortable on a small VPS; in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
 
 ## Quick Start
 
 ### Prerequisites
 
 - Docker + Docker Compose
-- A Telegram Bot (create via [@BotFather](https://t.me/BotFather) to get the token)
-- Your Telegram user ID (query via [@userinfobot](https://t.me/userinfobot))
+- A Telegram Bot (create via [TG@BotFather](https://t.me/BotFather) to get the token)
+- Your Telegram user ID (query via [TG@userinfobot](https://t.me/userinfobot))
 
 ### Option 1: Docker image (recommended, no compilation)
 
@@ -377,7 +379,7 @@ The following channels are powered by tgsrssr — check them out to see the push
 cp compose.example.yaml compose.yaml
 
 # 2. Edit compose.yaml, fill in the required fields:
-#    TELOXIDE_TOKEN: "your BotFather token"
+#    TELOXIDE_TOKEN: "your Bot token"
 #    ADMIN_USER_IDS: "your user ID" (admin: required, exactly one ID)
 
 # 3. Pull the image and start
@@ -388,7 +390,7 @@ docker compose up -d
 docker logs -f tgsrssr
 ```
 
-### Option 2: Build from source
+### Option 2: Build from source (Docker)
 
 ```bash
 # Edit compose.yaml: comment out the image line, uncomment build: .
@@ -408,9 +410,11 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 ### First Use
 
-1. Send `/start` to your bot in a private Telegram chat
-2. **Add the bot to your channel or group** (in channels, making it an admin is recommended to ensure it can post) — channel ownership is determined by whoever performs this step, and only that person can manage the channel afterwards
-3. Send `/sub <channel> <RSS URL>` in the private chat or in that channel to start subscribing (new subscriptions only push entries published afterwards)
+1. Send `/start` to your Bot in a private Telegram chat
+2. **Add the Bot to your channel or group** (in channels, ensure it has permission to send messages)
+3. Send `/sub <channel ID> <RSS URL>` to the Bot in the private chat to start subscribing
+
+> After `/sub` you can use a channel username (@xxx) or a channel ID (-100xxxx)
 
 ### Optional: Local Bot API server (bypass the 50MB upload limit)
 
@@ -421,8 +425,8 @@ By default the official Telegram Bot API is used (50MB upload limit). To push la
 | Command | Description |
 |---|---|
 | `/start` | Help |
-| `/set [channel]` | Channel management panel (button UI, secondary settings pages) |
-| `/list <channel>` | View channel subscription list (long lists split at 4000 code units) |
+| `/set [channel]` | Channel management panel |
+| `/list <channel>` | View channel subscription list |
 | `/sub <channel> <url...>` | Add subscriptions (multiple at once; new subs only push new content) |
 | `/test <channel> <feed URL> [entry index]` | Immediately push a specific entry from a feed (0 = latest) |
 | `/find <TG message link>` | Reverse-lookup an RSS entry from a TG message; or forward a channel message to the bot |
@@ -445,7 +449,7 @@ Any RSS 2.0 / Atom feed, with ETag / Last-Modified conditional requests to save 
 
 Subscription format: `https://weibo.com/u/<uid>`
 
-- Requires a login cookie (admin configures via `/cookies`, takes effect immediately without restart, shared by all users)
+- Requires a login cookie (admin configures via `/cookies`)
 - Full long-form text, multi-image completion (>9 images), HD video upgrade (1080p+)
 - Retweets rendered as blockquotes, emoji markers converted (~150 mappings), polls converted to Telegram Polls and auto-pinned
 - Article cover images, live-stream covers, "view image" card image extraction
@@ -455,7 +459,7 @@ Subscription format: `https://weibo.com/u/<uid>`
 
 Subscription format: `https://x.com/<screen_name>`
 
-- Requires an `auth_token` cookie (admin configures via `/cookies`, shared by all users)
+- Requires an `auth_token` cookie (admin configures via `/cookies`)
 - GraphQL API fetching: full long tweets, original images (`?name=orig`), highest-bitrate video
 - t.co short link expansion, auto-hyperlinking of @mentions/#hashtags/$cashtags
 - Retweets/quotes rendered as blockquotes
