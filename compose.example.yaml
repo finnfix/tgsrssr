@@ -21,7 +21,7 @@ services:
     ## 默认拉取预构建镜像（无需本地编译）。如需从源码构建，注释 image 行并取消注释 build 行。
     ## Pulls a prebuilt image by default (no local compilation). To build from source,
     ## comment out the image line and uncomment the build line.
-    image: ghcr.io/finnfix/tgsrssr:latest
+    image: ghcr.io/fynhq/tgsrssr:latest
     # build: .
     container_name: tgsrssr
     restart: unless-stopped
