@@ -378,7 +378,10 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
             resolved.unwrap_or_else(|| fallback_query_id(op).to_string())
         }
         Err(e) => {
-            tracing::warn!(error = %e, op = op, "X query-ID refresh failed; using cached/fallback ID");
+            // `{:#}` renders the full anyhow source chain (reqwest root cause
+            // under the "query-ID document request failed" context), so a
+            // proxy/TLS failure here is distinguishable from a parse failure.
+            tracing::warn!(error = format!("{:#}", e), op = op, "X query-ID refresh failed; using cached/fallback ID");
             let cache = query_id_cache().lock().await;
             cache
                 .ids

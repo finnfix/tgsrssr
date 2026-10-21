@@ -500,7 +500,7 @@ async fn process_feed(
         Err(ref e) if is_rss_source && sendpolicy::is_net_error(&format!("{:#}", e)) => {
             warn!(
                 feed = %sub.feed_url,
-                error = %e,
+                error = format!("{:#}", e),
                 "fetch transient error, retrying once after 2s"
             );
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

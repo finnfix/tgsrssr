@@ -785,13 +785,19 @@ async fn download_cover_fallback(
         Ok(DownloadOutcome::Item(item)) => {
             out.items.push(item);
         }
-        _ => {
+        Err(e) => {
             // Promoted from debug to warn: the cover fallback only runs after a
             // video was dropped (oversized/failed), so a failure here means the
             // entry loses its last visual element and degrades to text-only —
             // a real media loss that must be observable at the default info
             // level, not hidden behind RUST_LOG=debug.
-            warn!(cover_url = %cover, "cover image download failed, entry stays text-only");
+            // `{:#}` renders the full anyhow source chain (the reqwest root
+            // cause, e.g. the SOCKS/connect layer), not just the outer "error
+            // sending request for url (...)" wrapper.
+            warn!(cover_url = %cover, error = format!("{:#}", e), "cover image download failed, entry stays text-only");
+        }
+        _ => {
+            warn!(cover_url = %cover, "cover image download failed (empty/oversized), entry stays text-only");
         }
     }
 }
@@ -867,9 +873,12 @@ pub async fn prepare_entry_media(
                 // signal (Worker 502 / region-blocked CDN) that must be
                 // observable at the default info level. Volume is bounded by
                 // MAX_MEDIA_PER_ENTRY, so this cannot flood the log.
-                warn!(relay_url = %url, direct_url = %direct_url, error = %e, "relay download failed, retrying direct");
+                // `{:#}` renders the full anyhow source chain so the relay-side
+                // root cause (Worker 502 / connect / SOCKS layer) is visible,
+                // not just the outer "error sending request for url (...)" wrapper.
+                warn!(relay_url = %url, direct_url = %direct_url, error = format!("{:#}", e), "relay download failed, retrying direct");
                 let r = download_one(state, &direct_url, &kind, &mime, &outbound, transport).await;
-                (r, Some(e.to_string()))
+                (r, Some(format!("{:#}", e)))
             }
             other => (other, None),
         };
@@ -910,9 +919,9 @@ pub async fn prepare_entry_media(
             Err(e) => {
                 let msg = crate::i18n::t(lang, "media_dl_failed").replacen("{}", kind_label(lang, &kind), 1);
                 if let Some(re) = &relay_err {
-                    warn!(entry_id = %fetcher::entry_id(entry), url = %direct_url, relay_error = %re, direct_error = %e, "media download failed (relay + direct)");
+                    warn!(entry_id = %fetcher::entry_id(entry), url = %direct_url, relay_error = %re, direct_error = format!("{:#}", e), "media download failed (relay + direct)");
                 } else {
-                    warn!(entry_id = %fetcher::entry_id(entry), url = %url, error = %e, "media download failed");
+                    warn!(entry_id = %fetcher::entry_id(entry), url = %url, error = format!("{:#}", e), "media download failed");
                 }
                 out.warnings.push(msg);
                 if kind == MediaKind::Video {
@@ -1093,7 +1102,11 @@ async fn download_one(
             Err(e) => {
                 // Clean up any leftover temp file
                 let _ = tokio::fs::remove_file(&tmp_path).await;
-                let es = e.to_string();
+                // `{:#}` renders the full anyhow/reqwest source chain so the
+                // per-attempt transient diagnosis (debug log below) names the
+                // connect/SOCKS layer, not just the outer wrapper. The
+                // classification is contains/starts_with based and unaffected.
+                let es = format!("{:#}", e);
                 // 5xx (502/503/504…) are transient upstream failures (especially
                 // img-relay Worker origin-fetch jitter) — retryable; 4xx
                 // (403 hotlink protection / 404 resource missing) are
