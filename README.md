@@ -67,6 +67,12 @@ tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
 
+每个压缩包都带一个同名 `.sha256` 校验文件，解压前可在同一目录验证下载完整性：
+
+```bash
+sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
+```
+
 > 注意：二进制方式需自行安装 ffmpeg（视频缩略图/时长探测用）。
 
 ### 首次使用
@@ -325,7 +331,7 @@ SQLX_OFFLINE=true cargo build --release
 ```
 
 CI（GitHub Actions）在打 tag 时自动构建多平台 Docker 镜像（linux/amd64 + linux/arm64）
-并上传静态二进制到 Releases，见 `.github/workflows/release.yml`。
+并上传静态二进制到 Releases（每个包附带同名 `.sha256` 校验文件），见 `.github/workflows/release.yml`。
 
 ## 跨平台
 
@@ -404,6 +410,12 @@ Download the tar.gz for your platform from [Releases](../../releases), extract, 
 ```bash
 tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
+```
+
+Each archive ships with a same-named `.sha256` checksum file; verify a download in the same folder before extracting:
+
+```bash
+sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
 ```
 
 > Note: the binary approach requires ffmpeg installed separately (for video thumbnails/duration probing).
@@ -664,7 +676,8 @@ SQLX_OFFLINE=true cargo build --release
 ```
 
 CI (GitHub Actions) automatically builds multi-platform Docker images (linux/amd64 + linux/arm64)
-on tag push and uploads static binaries to Releases — see `.github/workflows/release.yml`.
+on tag push and uploads static binaries to Releases (each archive ships with a same-named `.sha256`
+checksum file) — see `.github/workflows/release.yml`.
 
 ## Cross-Platform
 
