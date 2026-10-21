@@ -1,10 +1,10 @@
 # tgsrssr
 
-**中文** · [English →](#tgsrssr-english)
+**中文** · [English](#tgsrssr-english)
 
 > **T**elegram's **R**SS **R**ust — RSS 订阅 Telegram 推送 Bot
 
-把 RSS/Atom 源的新条目定时推送到 Telegram 频道/群组，并对**微博、X (Twitter)、Telegram 频道**提供原生抓取 —— 无需依赖第三方中转。富媒体转发、内容筛选、消息反查、断点续发、持久化重试一应俱全。
+把 RSS/Atom 源的新条目定时推送到 Telegram 频道/群组，并对**微博、X (Twitter)、Telegram 频道**提供原生抓取。富媒体转发、内容筛选、消息反查、断点续发、持久化重试一应俱全。
 
 ## 效果展示
 
@@ -18,19 +18,19 @@
 
 ## 为什么选 tgsrssr
 
-- **原生平台抓取**：微博（长文全文、多图补全、视频 HD 升级、投票转 Poll）、X（GraphQL API 原图原视频）、Telegram 频道（公开频道网页预览）
+- **原生平台抓取**：微博（长文全文、多图补全、视频 HD 升级、投票转 Poll）、X（GraphQL API 原图原视频）、Telegram 频道
 - **不丢消息**：发送失败自动降级纯文本；仍失败入 outbox 持久化重试队列（指数退避，72h 放弃），绝不静默丢失
 - **富媒体管线**：图片/GIF/视频/文档自动识别分类发送，file_id 上传去重，超限自动转文档，媒体组成组发送
 - **多用户 + 管理员分级**：白名单/开放注册准入 + 频道归属按邀请者判定；管理员统一配置平台 cookie，所有用户共享
 - **单二进制部署**：Rust 编译产物 + SQLite，无外部数据库依赖，Docker 一键启动
-- **轻量常驻**：稳态运行内存 10-20 MB（RSS，轻载实测），小型 VPS 即可承载；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
+- **轻量常驻**：稳态运行内存 <30 MB（RSS，轻载实测）；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
 
 ## 快速开始
 
 ### 前置条件
 
 - Docker + Docker Compose
-- 一个 Telegram Bot（通过 [TG@BotFather](https://t.me/BotFather) 创建，获取 token）
+- 一个 Telegram Bot（通过 [TG@BotFather](https://t.me/BotFather) 创建，获取 Token）
 - 你的 Telegram 用户 ID（可通过 [TG@userinfobot](https://t.me/userinfobot) 查询）
 
 ### 方式一：Docker 镜像（推荐，无需编译）
@@ -40,8 +40,8 @@
 cp compose.example.yaml compose.yaml
 
 # 2. 编辑 compose.yaml，填入必填项：
-#    TELOXIDE_TOKEN: "你的 Bot token"
-#    ADMIN_USER_IDS: "你的用户ID"（管理员，必须且只能一个）
+#    TELOXIDE_TOKEN: "你的 Bot Token"
+#    ADMIN_USER_IDS: "你的用户ID"（管理员，有且只能一个）
 
 # 3. 拉取镜像并启动
 docker compose pull
@@ -94,17 +94,16 @@ sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
 | `/start` | 帮助 |
 | `/set [频道]` | 频道管理面板 |
 | `/list <频道>` | 查看频道订阅列表 |
-| `/sub <频道> <url...>` | 添加订阅（可一次多个；新订阅只推新增内容） |
+| `/sub <频道> <url...>` | 添加订阅（可一次多个） |
 | `/test <频道> <源地址> [条目序号]` | 立即推送指定源的某一条（0=最新） |
 | `/find <TG消息链接>` | 按 TG 消息反查 RSS 条目；也可直接转发频道消息给 bot |
-| `/cookies` | 平台登录 cookie 管理（仅管理员；配置后所有用户共享） |
+| `/cookies` | 平台登录 cookie 管理（仅管理员） |
 | `/loget <日期>` | 获取指定日期的日志文件（仅管理员） |
 | `/about` | 关于（版本信息） |
 
-默认仅 `ALLOWED_USER_IDS` 白名单与 `ADMIN_USER_IDS` 管理员可用，其余用户静默忽略；设置 `OPEN_TO_ALL=true` 可对所有用户开放。
-`/cookies`、`/loget` 仅管理员可用（命令菜单中仅管理员可见）。管理员配置的平台 cookie 由所有用户共享；未配置时用户订阅相应平台源会收到提示。
+默认仅 `ADMIN_USER_IDS` 管理员与 `ALLOWED_USER_IDS` 白名单可用，其余用户静默忽略；设置 `OPEN_TO_ALL=true` 可对所有用户开放。
+`/cookies`、`/loget` 仅管理员可用。管理员配置的平台 cookie 由所有用户共享；未配置时用户订阅相应平台源会收到提示。
 `/list`、`/sub`、`/test` 在群组/频道内可省略频道参数，默认作用于当前会话。
-左下角命令菜单按客户端语言显示：简体中文/繁体中文客户端显示中文描述，其余客户端显示英文。
 
 ## 支持的内容源
 
@@ -135,7 +134,7 @@ sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
 
 订阅格式：`https://t.me/<channel>`
 
-- 抓取公开频道网页预览（`t.me/s/<channel>`），无需登录态
+- 抓取公开频道（`t.me/s/<channel>`），无需登录态
 - 保留超链接、回复引用以 blockquote 呈现
 - 仅支持公开频道
 
@@ -144,7 +143,7 @@ sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
 按钮式 UI，列表分页（每页 10 个）：
 
 - 频道列表展示订阅源数量，源列表倒序（最新在前），暂停源带 ⏸ 标识
-- 频道页：「频道设置」「退订管理」；退订含 OPML 备份
+- 频道页：「频道设置」「退订管理」；批量退订含 OPML 备份
 - 全部启用：一键恢复所有停用源
 - 源级设置：暂停/恢复、改名、推送间隔/内容模式/来源显示/链接预览覆盖、内容筛选
 - 频道级设置（二级页）：推送间隔（新频道默认 30 分钟）/ 内容模式 / 来源显示 / 链接预览
@@ -337,19 +336,19 @@ CI（GitHub Actions）在打 tag 时自动构建多平台 Docker 镜像（linux/
 
 代码不依赖平台特定 API，路径全部使用 `PathBuf`，可在 Linux / macOS / Windows(WSL) 编译运行。Docker 部署推荐 Linux 环境（`network_mode: host` 仅 Linux 原生支持；macOS/Windows Docker Desktop 需改用 bridge 网络并调整代理配置）。
 
-## License
+## 许可
 
-[MIT](LICENSE)
+基于 MIT 许可发布，见 [LICENSE](LICENSE)。
 
 ---
 
 # tgsrssr (English)
 
-[← 中文](#tgsrssr) · **English**
+[中文](#tgsrssr) · **English**
 
 > **T**elegram's **R**SS **R**ust — an RSS subscription Telegram push bot
 
-Periodically pushes new entries from RSS/Atom feeds to Telegram channels/groups, with **native fetching for Weibo, X (Twitter), and Telegram channels** — no dependency on third-party relays. Rich media forwarding, content filtering, message reverse lookup, resumable sending, and persistent retry are all built in.
+Periodically pushes new entries from RSS/Atom feeds to Telegram channels/groups, with **native fetching for Weibo, X (Twitter), and Telegram channels**. Rich media forwarding, content filtering, message reverse lookup, resumable sending, and persistent retry are all built in.
 
 ## Showcase
 
@@ -363,12 +362,12 @@ The following channels are powered by tgsrssr — check them out to see the push
 
 ## Why tgsrssr
 
-- **Native platform fetching**: Weibo (full long-form text, multi-image completion, HD video upgrade, polls → TG Poll), X (GraphQL API with original images/videos), Telegram channels (public channel web preview)
+- **Native platform fetching**: Weibo (full long-form text, multi-image completion, HD video upgrade, polls → TG Poll), X (GraphQL API with original images/videos), Telegram channels
 - **No message loss**: send failures automatically fall back to plain text; if that still fails, entries go into a persistent outbox retry queue (exponential backoff, 72h abandonment) — never silently lost
 - **Rich media pipeline**: images/GIFs/videos/documents auto-detected and sent via the appropriate API, file_id upload dedup, oversized media auto-converted to documents, media grouped into albums
 - **Multi-user + admin tiers**: whitelist/open registration access + channel ownership by inviter; admins configure platform cookies once, shared by all users
 - **Single binary deployment**: Rust binary + SQLite, no external database, one-command Docker startup
-- **Lightweight footprint**: 10-20 MB RSS in steady state (measured under light load), comfortable on a small VPS; in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
+- **Lightweight footprint**: <30 MB RSS in steady state (measured under light load); in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
 
 ## Quick Start
 
@@ -439,17 +438,16 @@ By default the official Telegram Bot API is used (50MB upload limit). To push la
 | `/start` | Help |
 | `/set [channel]` | Channel management panel |
 | `/list <channel>` | View channel subscription list |
-| `/sub <channel> <url...>` | Add subscriptions (multiple at once; new subs only push new content) |
+| `/sub <channel> <url...>` | Add subscriptions (multiple at once) |
 | `/test <channel> <feed URL> [entry index]` | Immediately push a specific entry from a feed (0 = latest) |
 | `/find <TG message link>` | Reverse-lookup an RSS entry from a TG message; or forward a channel message to the bot |
-| `/cookies` | Platform login cookie management (admin only; shared by all users once configured) |
+| `/cookies` | Platform login cookie management (admin only) |
 | `/loget <date>` | Get the log file for a specific date (admin only) |
 | `/about` | About (version info) |
 
-By default only `ALLOWED_USER_IDS` whitelist members and `ADMIN_USER_IDS` admins can use the bot; other users are silently ignored. Set `OPEN_TO_ALL=true` to open to all users.
-`/cookies` and `/loget` are admin-only (visible only in the admin command menu). Platform cookies configured by admins are shared by all users; subscribing to a platform source without a configured cookie shows a notice.
+By default only `ADMIN_USER_IDS` admins and `ALLOWED_USER_IDS` whitelist members can use the bot; other users are silently ignored. Set `OPEN_TO_ALL=true` to open to all users.
+`/cookies` and `/loget` are admin-only. Platform cookies configured by admins are shared by all users; subscribing to a platform source without a configured cookie shows a notice.
 `/list`, `/sub`, `/test` can omit the channel argument inside a group/channel — the current chat is used.
-The slash-command menu follows the client language: Simplified/Traditional Chinese clients see Chinese descriptions, all other clients see English.
 
 ## Supported Sources
 
@@ -480,7 +478,7 @@ Subscription format: `https://x.com/<screen_name>`
 
 Subscription format: `https://t.me/<channel>`
 
-- Fetches public channel web preview (`t.me/s/<channel>`), no login required
+- Fetches public channels (`t.me/s/<channel>`), no login required
 - Preserves hyperlinks; reply quotes rendered as blockquotes
 - Public channels only
 
@@ -489,7 +487,7 @@ Subscription format: `https://t.me/<channel>`
 Button-based UI with paginated lists (10 per page):
 
 - Channel list shows subscription counts; source list in reverse order (newest first); paused sources marked with ⏸
-- Channel page: "Channel settings" and "Unsubscribe management"; unsubscribe includes OPML backup
+- Channel page: "Channel settings" and "Unsubscribe management"; batch unsubscribe includes OPML backup
 - Enable all: one-click resume of all paused sources
 - Per-source settings: pause/resume, rename, interval/content mode/source display/link preview overrides, content filter
 - Channel-level settings (secondary page): push interval (default 30 min for new channels) / content mode / source display / link preview
@@ -685,4 +683,4 @@ The code has no platform-specific API dependencies; all paths use `PathBuf`. Com
 
 ## License
 
-[MIT](LICENSE)
+Released under the MIT license — see [LICENSE](LICENSE).
