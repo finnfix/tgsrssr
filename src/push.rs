@@ -8,7 +8,7 @@ use teloxide::types::{
 use crate::db::{self, Db};
 use crate::fetcher;
 use crate::htmltext::{
-    merge_adjacent_blockquotes, split_html, strip_html_tags, strip_html_to_plain, RE_LINK_BLOCK,
+    merge_adjacent_blockquotes, split_html, strip_html_tags, truncate_html_keep_links,
 };
 use crate::media::{MediaItem, MediaKind};
 use crate::sendpolicy::{
@@ -23,8 +23,8 @@ pub use crate::htmltext::{
 };
 
 // Hot-path regexes are compiled statically once (hit on every message/chunk).
-// RE_TAG / RE_LINK_BLOCK moved to crate::htmltext along with the HTML helpers
-// (imported via the `use` at the top).
+// RE_TAG and the anchor/entity regexes live in crate::htmltext along with the
+// HTML helpers (imported via the `use` at the top).
 // Rate-limiting/backoff policy (pacer, flood_backoff, is_retryable_error,
 // SEND_BACKOFF_SECS) moved to crate::sendpolicy (imported via the `use` at
 // the top).
@@ -353,33 +353,34 @@ fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: Source
 /// Max visible characters kept in a `Title+summary` excerpt.
 const SUMMARY_MAX_CHARS: usize = 140;
 
-/// Build a short summary from the entry body: first `max_chars` visible
-/// characters (HTML tags stripped), with "......" appended when truncated.
-/// Returns empty string when the body has no visible text.
+/// Build a short summary from the entry body: the first `max_chars` visible
+/// characters as Telegram-HTML with hyperlinks preserved, with "......"
+/// appended when truncated. Returns empty string when the body has no
+/// visible text.
 fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta::EntryMeta>) -> String {
     let html = fetcher::entry_body_html(entry, 100_000, meta);
     if html.is_empty() {
         return String::new();
     }
-    // Unwrap hyperlinks to plain text: strip the <a> markup but keep the
-    // anchor's visible words (they are body content — e.g. the WeChat account
-    // name after "本文来自微信公众号：" in huxiu articles). Media hrefs were
-    // already dropped upstream in `html_to_telegram_html`, so nothing here is
-    // link-only noise except bare image credits, which is an acceptable cost
-    // of keeping real sentences intact.
-    let no_links = RE_LINK_BLOCK.replace_all(&html, "$1").to_string();
-    // Strip tags to get visible text, collapse whitespace.
-    let plain = strip_html_to_plain(&no_links);
-    let plain = plain.trim();
-    if plain.is_empty() {
+    // Truncate on the Telegram-HTML the body pipeline already produced:
+    // media hrefs were dropped upstream by `html_to_telegram_html` (per
+    // `is_media_href`), so every surviving anchor is a real content link
+    // (e.g. the WeChat article behind "本文来自微信公众号：账号名") and stays
+    // clickable in the summary. The cut counts display characters only —
+    // href text never eats into the budget.
+    let (cut, truncated) = truncate_html_keep_links(&html, max_chars);
+    // Whitespace at the edges comes from flattened block tags (the old
+    // plain-text path trimmed the same way); an all-whitespace cut means the
+    // body had no visible content.
+    let cut = cut.trim();
+    if cut.is_empty() {
         return String::new();
     }
-    let char_count = plain.chars().count();
-    if char_count <= max_chars {
-        return plain.to_string();
+    if truncated {
+        format!("{}......", cut)
+    } else {
+        cut.to_string()
     }
-    let truncated: String = plain.chars().take(max_chars).collect();
-    format!("{}......", truncated)
 }
 
 /// Format an entry into (body_html, footer_html) separately.
@@ -1852,31 +1853,77 @@ mod tests {
     }
 
     #[test]
-    fn entry_summary_keeps_anchor_text_of_inline_links() {
+    fn entry_summary_keeps_wechat_account_link_clickable() {
         // huxiu (RSSHub) real shape: the WeChat account name sits inside an
-        // <a> right after "本文来自微信公众号：". Deleting whole anchor blocks
-        // produced the dangling "微信公众号：，作者" fragment; unwrapping to
-        // $1 keeps the account name as body text.
-        let body = "<p>本文来自微信公众号：<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\"> 懒熊体育 </a>，作者：黄怡&nbsp;苏洋</p><p>正文开始，第二段内容。</p>";
+        // <a> right after "本文来自微信公众号：". The summary must keep both
+        // the anchor text and the hyperlink (the account name alone was the
+        // previous fix; the href was dropped along with it).
+        let body = "<p>本文来自微信公众号：<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\"> 懒熊体育 </a>，作者：黄怡 苏洋</p><p>正文开始，第二段内容。</p>";
         let summary = entry_summary(&rss_entry_with_body(body), 140, None);
-        // Anchor text is trimmed upstream by html_to_telegram_html, so the
-        // account name sits flush against the surrounding sentence.
-        assert!(summary.contains("微信公众号：懒熊体育，作者"), "anchor text lost: {summary}");
+        assert!(
+            summary.contains("<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\">懒熊体育</a>"),
+            "hyperlink lost: {summary}"
+        );
+        assert!(summary.contains("本文来自微信公众号："), "lead lost: {summary}");
+        // The account name stays in its sentence position (anchor text must
+        // not drift away from the surrounding words).
+        assert!(
+            summary.contains("微信公众号：<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\">懒熊体育</a>，作者"),
+            "anchor misplaced: {summary}"
+        );
         assert!(summary.contains("正文开始"), "body lost: {summary}");
-        // nbsp inside anchor text decodes to a space, not a literal entity.
-        assert!(!summary.contains("nbsp"), "entity leaked: {summary}");
-        // The summary is plain text: no HTML tags survive into it.
-        assert!(!summary.contains('<'), "markup leaked: {summary}");
+    }
+
+    #[test]
+    fn entry_summary_closes_anchor_when_cut_inside_link() {
+        // Truncation inside the anchor text must re-close <a> so the summary
+        // stays valid Telegram HTML, with the ellipsis outside the link.
+        let long_label = "长".repeat(60);
+        let body = format!(
+            "<p>前文。<a href=\"https://mp.weixin.qq.com/s/abc\">{long_label}</a>后续内容。</p>"
+        );
+        let summary = entry_summary(&rss_entry_with_body(&body), 20, None);
+        assert!(summary.ends_with("</a>......"), "unbalanced or misplaced suffix: {summary}");
+        assert_eq!(summary.matches("<a ").count(), 1, "unbalanced anchor: {summary}");
+        assert_eq!(summary.matches("</a>").count(), 1, "unbalanced anchor: {summary}");
+        assert!(summary.starts_with("前文。"), "lead lost: {summary}");
+    }
+
+    #[test]
+    fn entry_summary_drops_anchor_without_visible_text_in_budget() {
+        // An <a> whose text starts past the cut point must not appear as an
+        // empty hyperlink.
+        let body = "<p>正文内容比较长按 here</p><p><a href=\"https://mp.weixin.qq.com/s/x\">后面的链接</a></p>";
+        let summary = entry_summary(&rss_entry_with_body(body), 6, None);
+        assert!(!summary.contains("<a"), "empty/dangling anchor emitted: {summary}");
+        assert!(!summary.contains("</a>"), "orphan close emitted: {summary}");
+        assert!(summary.ends_with("......"), "truncation marker missing: {summary}");
+    }
+
+    #[test]
+    fn entry_summary_never_splits_entity_reference() {
+        // Text entities survive the body pipeline as references. The cut
+        // counts each reference as one display character and must emit it
+        // whole: a split "&am" makes Telegram reject the message with a
+        // parse-entities error.
+        let body = "<p>成本&lt;100&amp;更多&gt;一些文字继续更多内容截断部分。</p>";
+        // Budget ends exactly after the "&amp;" reference.
+        let summary = entry_summary(&rss_entry_with_body(body), 7, None);
+        assert_eq!(summary, "成本&lt;100&amp;......", "entity cut wrong: {summary}");
+        // Budget ends just before it: nothing of the reference may appear.
+        let summary = entry_summary(&rss_entry_with_body(body), 6, None);
+        assert_eq!(summary, "成本&lt;100......", "entity cut wrong: {summary}");
     }
 
     #[test]
     fn entry_summary_still_drops_media_only_anchors() {
         // Media links (href is a media resource) were removed upstream by
-        // html_to_telegram_html before the anchor-unwrap pass, so the summary
+        // html_to_telegram_html before the summary cut, so the summary
         // keeps no video page URL or its card text.
         let body = "<p>正文。</p><a href=\"https://video.weibo.com/show?fid=1034:1\">微博视频</a>";
         let summary = entry_summary(&rss_entry_with_body(body), 140, None);
         assert!(summary.contains("正文。"), "body lost: {summary}");
         assert!(!summary.contains("video.weibo.com"), "media href leaked: {summary}");
+        assert!(!summary.contains("<a"), "media anchor survived: {summary}");
     }
 }

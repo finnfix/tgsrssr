@@ -11,16 +11,17 @@ use std::sync::LazyLock;
 /// Strip HTML tags (visible-length computation, plain-text degradation).
 pub static RE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
-/// Unwrap `<a>…</a>` blocks keeping the anchor's visible text (capture `$1`
-/// replaces the whole match). Used by plain-text summary extraction: the
-/// hyperlink markup is noise there, but the anchor text is body content.
-/// Deleting whole blocks lost real text whenever a source put meaningful
-/// words inside an anchor (e.g. a huxiu article: "本文来自微信公众号："
-/// followed by the account name as anchor text → dangling "微信公众号：，").
-/// Nested same-tag pairs are not expected here (feed bodies are already
-/// flattened by `html_to_telegram_html`, which never nests anchors).
-pub static RE_LINK_BLOCK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>(.*?)</a>").unwrap());
+/// Anchor opening tag carrying a non-empty href (the only shape
+/// `html_to_telegram_html` emits; feeds may also provide this form directly).
+static RE_ANCHOR_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)^<a\b[^>]*?\bhref\s*=\s*["'][^"']+["']"#).unwrap()
+});
+static RE_ANCHOR_CLOSE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)^</a\s*>").unwrap());
+/// HTML entity reference anchored at the start of a slice.
+static RE_ENTITY_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#[1-9][0-9]{0,6}|#[xX][0-9a-fA-F]{1,6});").unwrap()
+});
 
 // ---------------------------------------------------------------------------
 // Length measurement (Telegram counts in UTF-16 code units)
@@ -55,6 +56,159 @@ pub fn take_utf16_prefix(s: &str, max_units: usize) -> &str {
         units += lu;
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Visible-text truncation with hyperlink preservation
+// ---------------------------------------------------------------------------
+
+/// Truncate Telegram-HTML to at most `max_visible` display characters while
+/// keeping `<a href="…">…</a>` hyperlinks clickable.
+///
+/// - Anchor tags emitted by `html_to_telegram_html` (non-empty quoted href)
+///   pass through untouched; the href never counts against the budget.
+/// - Every other tag (and href-less anchors) flattens to a single space, the
+///   same way the previous plain-text summary path flattened them.
+/// - The character budget counts *display* units: each entity reference
+///   (`&amp;`, `&#39;`, …) counts as one unit and is never cut mid-reference
+///   (a split entity would make Telegram reject the whole message with a
+///   parse-entities error).
+/// - When the budget runs out inside an open anchor, `</a>` is appended so
+///   the output is always well-formed.
+/// - An anchor opening at or after the cut point is dropped entirely unless
+///   at least one visible character of its text fits the budget (no empty or
+///   dangling links).
+///
+/// Returns `(html, truncated)` where `truncated` means visible content
+/// existed beyond the cut point (caller appends its ellipsis suffix there).
+pub fn truncate_html_keep_links(html: &str, max_visible: usize) -> (String, bool) {
+    let mut out = String::with_capacity(html.len().min(256));
+    // Buffered <a …> opening tag, emitted only when the anchor yields its
+    // first visible character within the budget (no empty links in output).
+    let mut pending_open: Option<String> = None;
+    let mut in_link = false;
+    let mut visible = 0usize;
+    let mut truncated = false;
+    let mut i = 0usize;
+
+    while i < html.len() {
+        let rest = &html[i..];
+        // A raw '<' only starts a tag in this pipeline: visible text is
+        // escape_html'd (`&lt;`) and attribute values escape '>' as well.
+        if rest.starts_with('<') {
+            if let Some(gt) = rest.find('>') {
+                let tag = &rest[..gt + 1];
+                if RE_ANCHOR_CLOSE.is_match(tag) {
+                    if in_link {
+                        out.push_str(tag);
+                        in_link = false;
+                    }
+                    // Orphan close (or buffered empty anchor): drop it and
+                    // the buffered open.
+                    pending_open = None;
+                } else if RE_ANCHOR_OPEN.is_match(tag) && !in_link {
+                    // Replace any still-buffered empty anchor with this one.
+                    pending_open = Some(tag.to_string());
+                } else {
+                    // Non-anchor markup, or an anchor nested inside a link:
+                    // flatten to a space (never emit an unbalanced open).
+                    out.push(' ');
+                }
+                let after = gt + 1;
+                i += after;
+                if visible >= max_visible && !in_link && pending_open.is_none() {
+                    // Budget exhausted with nothing left to close: further
+                    // visible content can only mean truncation.
+                    truncated = has_visible_content(&rest[after..]);
+                    break;
+                }
+                continue;
+            }
+        }
+        // Entity reference (display unit counted as 1, emitted atomically).
+        let mut entity: Option<usize> = None;
+        let mut ch = ' ';
+        let mut ch_adv = 0usize;
+        if let Some(m) = RE_ENTITY_REF.find(rest) {
+            entity = Some(m.end());
+        } else {
+            ch = rest.chars().next().unwrap();
+            ch_adv = ch.len_utf8();
+        }
+        let is_space = match entity {
+            Some(len) => entity_is_space(&rest[..len]),
+            None => ch.is_whitespace(),
+        };
+        if visible >= max_visible {
+            // Past the budget: whitespace may trail the cut point without
+            // counting as dropped content; anything else stops the scan.
+            if is_space {
+                i += entity.unwrap_or(ch_adv);
+                continue;
+            }
+            truncated = true;
+            break;
+        }
+        if let Some(tag) = pending_open.take() {
+            out.push_str(&tag);
+            in_link = true;
+        }
+        match entity {
+            Some(len) => {
+                out.push_str(&rest[..len]);
+                i += len;
+            }
+            None => {
+                out.push(ch);
+                i += ch_adv;
+            }
+        }
+        visible += 1;
+    }
+
+    if in_link {
+        // Close the anchor whenever one is still open (truncated or not).
+        out.push_str("</a>");
+    }
+    (out, truncated)
+}
+
+/// True when `s` contains at least one visible display character: tags are
+/// skipped, entity references count as one character (space entities are not
+/// visible content), raw text counts unless whitespace.
+fn has_visible_content(s: &str) -> bool {
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with('<') {
+            if let Some(gt) = rest.find('>') {
+                i += gt + 1;
+                continue;
+            }
+        }
+        if let Some(m) = RE_ENTITY_REF.find(rest) {
+            if !entity_is_space(&rest[..m.end()]) {
+                return true;
+            }
+            i += m.end();
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        if !c.is_whitespace() {
+            return true;
+        }
+        i += c.len_utf8();
+    }
+    false
+}
+
+/// True for entity references that decode to whitespace (mirrors the
+/// space-producing mappings of `decode_entities`).
+fn entity_is_space(entity: &str) -> bool {
+    matches!(
+        entity.to_ascii_lowercase().as_str(),
+        "&nbsp;" | "&#160;" | "&#xa0;"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +252,7 @@ pub fn format_chat_title_html(title: &str, chat_id: &str) -> String {
 
 /// Decode HTML entities (common named entities + numeric references
 /// &#NNN; / &#xHH;).
-/// Shared uniformly by the plain-text degradation paths
-/// (strip_html_to_plain / strip_html_tags).
+/// Shared uniformly by the plain-text degradation paths (strip_html_tags).
 /// Edge handling: invalid code points (surrogate range / beyond u32) keep
 /// the original text; control characters (including NUL decoded from &#0;)
 /// are dropped rather than injected into messages. &amp; is decoded last to
@@ -173,13 +326,6 @@ pub fn unescape_html(s: &str) -> String {
         .replace("&apos;", "'")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
-}
-
-/// Strip HTML tags and decode common entities, yielding visible plain text.
-/// Tags are replaced with spaces (preserving word separation; used for
-/// summaries and other visible text).
-pub fn strip_html_to_plain(html: &str) -> String {
-    decode_entities(&RE_TAG.replace_all(html, " "))
 }
 
 /// Extract one cookie value from a Set-Cookie header string by name.
