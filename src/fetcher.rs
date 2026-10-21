@@ -427,13 +427,14 @@ pub fn entry_body_html(entry: &Entry, max: usize, meta: Option<&crate::entrymeta
     };
 
     // Check visible text length (strip all tags) against the limit.
-    let visible = strip_tags(&tg);
-    let visible = unescape_html(&visible);
+    // Visible text uses the text decoder (`decode_entities`); only URLs keep
+    // the URL decoder (`unescape_html`) semantics.
+    let visible = crate::htmltext::decode_entities(&strip_tags(&tg));
     if visible.chars().count() <= max {
         return tg;
     }
     // Overflow: emit truncated plain text (always parseable, no links).
-    let plain = unescape_html(&strip_tags(&html));
+    let plain = crate::htmltext::decode_entities(&strip_tags(&html));
     let plain = collapse_blank_lines(&plain);
     crate::htmltext::escape_html(&truncate_text(plain.trim(), max))
 }
@@ -545,7 +546,7 @@ pub fn html_to_telegram_html(html: &str) -> String {
             last = whole.end();
             continue;
         }
-        let text = unescape_html(&strip_tags(&caps[2]));
+        let text = crate::htmltext::decode_entities(&strip_tags(&caps[2]));
         let text = text.trim().to_string();
         let idx = links.len();
         links.push((href, text));
@@ -556,7 +557,12 @@ pub fn html_to_telegram_html(html: &str) -> String {
     buf.push_str(&s[last..]);
 
     // 4) Flatten remaining markup, decode entities, escape for Telegram.
-    let plain = unescape_html(&strip_tags(&buf));
+    //    `decode_entities` is the visible-text decoder: it maps named
+    //    entities like `&nbsp;` to real characters and decodes `&amp;` last
+    //    (single pass, no over-decoding). The URL decoder `unescape_html`
+    //    leaves `&nbsp;` literal, and the following `escape_html` would then
+    //    re-escape the `&` into a visible `&amp;nbsp;` leak.
+    let plain = crate::htmltext::decode_entities(&strip_tags(&buf));
     let mut out = crate::htmltext::escape_html(&collapse_blank_lines(&plain));
 
     // 5) Restore anchors as Telegram hyperlinks (skip empty-text links).
@@ -633,6 +639,18 @@ mod tests {
     fn plain_text_escaped_and_br_to_newline() {
         let out = html_to_telegram_html("a &lt;b&gt;<br>c");
         assert_eq!(out, "a &lt;b&gt;\nc");
+    }
+
+    #[test]
+    fn nbsp_and_named_entities_decoded_not_double_escaped() {
+        // huxiu (RSSHub) bodies carry &nbsp; inside plain text. The visible
+        // path must run the text decoder: nbsp becomes a real space. The URL
+        // decoder left it literal and the following escape turned the & into
+        // &amp; — users saw "黄怡&amp;nbsp;苏洋".
+        let out = html_to_telegram_html("<p>作者：黄怡&nbsp;苏洋 &amp; 伙伴</p>");
+        assert!(out.contains("黄怡 苏洋"), "nbsp not decoded: {out}");
+        assert!(out.contains("&amp; 伙伴"), "ampersand not re-escaped: {out}");
+        assert!(!out.contains("nbsp"), "entity leaked: {out}");
     }
 
     #[test]
