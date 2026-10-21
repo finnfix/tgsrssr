@@ -361,9 +361,13 @@ fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta
     if html.is_empty() {
         return String::new();
     }
-    // Remove hyperlink text before extracting plain text: image credits,
-    // navigation links, hashtags etc. are not body content.
-    let no_links = RE_LINK_BLOCK.replace_all(&html, "").to_string();
+    // Unwrap hyperlinks to plain text: strip the <a> markup but keep the
+    // anchor's visible words (they are body content — e.g. the WeChat account
+    // name after "本文来自微信公众号：" in huxiu articles). Media hrefs were
+    // already dropped upstream in `html_to_telegram_html`, so nothing here is
+    // link-only noise except bare image credits, which is an acceptable cost
+    // of keeping real sentences intact.
+    let no_links = RE_LINK_BLOCK.replace_all(&html, "$1").to_string();
     // Strip tags to get visible text, collapse whitespace.
     let plain = strip_html_to_plain(&no_links);
     let plain = plain.trim();
@@ -1831,5 +1835,48 @@ mod tests {
         // meta exists but has no poll field
         let meta = crate::entrymeta::EntryMeta::default();
         assert!(extract_poll(Some(&meta)).is_none());
+    }
+
+    // ===== entry_summary hyperlink handling =====
+
+    fn rss_entry_with_body(body: &str) -> Entry {
+        crate::platforms::make_entry(
+            "test-id".to_string(),
+            "测试标题".to_string(),
+            String::new(),
+            body.to_string(),
+            "text/html",
+            "https://example.com/post".to_string(),
+            None,
+        )
+    }
+
+    #[test]
+    fn entry_summary_keeps_anchor_text_of_inline_links() {
+        // huxiu (RSSHub) real shape: the WeChat account name sits inside an
+        // <a> right after "本文来自微信公众号：". Deleting whole anchor blocks
+        // produced the dangling "微信公众号：，作者" fragment; unwrapping to
+        // $1 keeps the account name as body text.
+        let body = "<p>本文来自微信公众号：<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\"> 懒熊体育 </a>，作者：黄怡&nbsp;苏洋</p><p>正文开始，第二段内容。</p>";
+        let summary = entry_summary(&rss_entry_with_body(body), 140, None);
+        // Anchor text is trimmed upstream by html_to_telegram_html, so the
+        // account name sits flush against the surrounding sentence.
+        assert!(summary.contains("微信公众号：懒熊体育，作者"), "anchor text lost: {summary}");
+        assert!(summary.contains("正文开始"), "body lost: {summary}");
+        // nbsp inside anchor text decodes to a space, not a literal entity.
+        assert!(!summary.contains("nbsp"), "entity leaked: {summary}");
+        // The summary is plain text: no HTML tags survive into it.
+        assert!(!summary.contains('<'), "markup leaked: {summary}");
+    }
+
+    #[test]
+    fn entry_summary_still_drops_media_only_anchors() {
+        // Media links (href is a media resource) were removed upstream by
+        // html_to_telegram_html before the anchor-unwrap pass, so the summary
+        // keeps no video page URL or its card text.
+        let body = "<p>正文。</p><a href=\"https://video.weibo.com/show?fid=1034:1\">微博视频</a>";
+        let summary = entry_summary(&rss_entry_with_body(body), 140, None);
+        assert!(summary.contains("正文。"), "body lost: {summary}");
+        assert!(!summary.contains("video.weibo.com"), "media href leaked: {summary}");
     }
 }

@@ -11,9 +11,16 @@ use std::sync::LazyLock;
 /// Strip HTML tags (visible-length computation, plain-text degradation).
 pub static RE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
-/// Strip entire <a> link blocks (preprocessing before summary extraction).
+/// Unwrap `<a>…</a>` blocks keeping the anchor's visible text (capture `$1`
+/// replaces the whole match). Used by plain-text summary extraction: the
+/// hyperlink markup is noise there, but the anchor text is body content.
+/// Deleting whole blocks lost real text whenever a source put meaningful
+/// words inside an anchor (e.g. a huxiu article: "本文来自微信公众号："
+/// followed by the account name as anchor text → dangling "微信公众号：，").
+/// Nested same-tag pairs are not expected here (feed bodies are already
+/// flattened by `html_to_telegram_html`, which never nests anchors).
 pub static RE_LINK_BLOCK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>.*?</a>").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>(.*?)</a>").unwrap());
 
 // ---------------------------------------------------------------------------
 // Length measurement (Telegram counts in UTF-16 code units)
