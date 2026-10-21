@@ -163,7 +163,18 @@ jobs:
           tar czf tgsrssr-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz tgsrssr
           echo "ASSET=tgsrssr-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz" >> "$GITHUB_ENV"
 
+      # Sidecar checksum named after the archive ("<asset>.sha256") so users can
+      # verify a download with `sha256sum -c <asset>.sha256` in the same folder.
+      # The recorded path is the bare archive name, matching the Release asset.
+      - name: Generate checksum
+        run: |
+          cd target/${{ matrix.target }}/release
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/${{ env.ASSET }}
+          files: |
+            target/${{ matrix.target }}/release/${{ env.ASSET }}
+            target/${{ matrix.target }}/release/${{ env.ASSET }}.sha256
