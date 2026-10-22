@@ -23,7 +23,7 @@
 - **富媒体管线**：图片/GIF/视频/文档自动识别分类发送，file_id 上传去重，超限自动转文档，媒体组成组发送
 - **多用户 + 管理员分级**：白名单/开放注册准入 + 频道归属按邀请者判定；管理员统一配置平台 cookie，所有用户共享
 - **单二进制部署**：Rust 编译产物 + SQLite，无外部数据库依赖，Docker 一键启动
-- **轻量常驻**：稳态运行内存 <30 MB（RSS，轻载实测）；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
+- **轻量常驻**：稳态运行内存 ~20 MB（RSS，轻载实测）；媒体经内存上传时有短时峰值，compose 模板默认 1 GB 限制已预留余量
 
 ## 快速开始
 
@@ -367,7 +367,7 @@ The following channels are powered by tgsrssr — check them out to see the push
 - **Rich media pipeline**: images/GIFs/videos/documents auto-detected and sent via the appropriate API, file_id upload dedup, oversized media auto-converted to documents, media grouped into albums
 - **Multi-user + admin tiers**: whitelist/open registration access + channel ownership by inviter; admins configure platform cookies once, shared by all users
 - **Single binary deployment**: Rust binary + SQLite, no external database, one-command Docker startup
-- **Lightweight footprint**: <30 MB RSS in steady state (measured under light load); in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
+- **Lightweight footprint**: ~20 MB RSS in steady state (measured under light load); in-memory media uploads cause short-lived peaks — the compose template's default 1 GB limit leaves ample headroom
 
 ## Quick Start
 
@@ -683,4 +683,4 @@ The code has no platform-specific API dependencies; all paths use `PathBuf`. Com
 
 ## License
 
-Released under the MIT license — see [LICENSE](LICENSE).
+Released under the MIT license. See [LICENSE](LICENSE).
