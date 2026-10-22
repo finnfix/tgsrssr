@@ -658,7 +658,18 @@ pub async fn handle_callback(
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
-                    let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
+                    // Strict baseline read (same contract as cfglp/srcflp): a
+                    // transient DB error must abort the toggle instead of
+                    // flipping from the FilterConfig::default() and persisting
+                    // a state that contradicts what the user actually set.
+                    let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
+                        Ok(fc) => fc,
+                        Err(e) => {
+                            tracing::warn!(sub_id = id, error = %e, "srcftoggle: filter read failed, toggle aborted");
+                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                            return Ok(());
+                        }
+                    };
                     match db::set_feed_filter_enabled(&state.db, &sub.chat_id, &sub.feed_url, !fc.enabled).await {
                         Ok(_) => {
                             render_feed_filter_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
@@ -675,7 +686,17 @@ pub async fn handle_callback(
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
-                    let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
+                    // Strict baseline read (see srcftoggle): abort on a DB
+                    // error rather than persisting a mode flipped from a
+                    // wrong default.
+                    let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
+                        Ok(fc) => fc,
+                        Err(e) => {
+                            tracing::warn!(sub_id = id, error = %e, "srcfmode: filter read failed, toggle aborted");
+                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                            return Ok(());
+                        }
+                    };
                     let next = if fc.mode == "whitelist" { "blacklist" } else { "whitelist" };
                     match db::set_feed_filter_mode(&state.db, &sub.chat_id, &sub.feed_url, next).await {
                         Ok(_) => {
