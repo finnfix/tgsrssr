@@ -642,7 +642,15 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         tracing::info!("/test: skip_media=true, no media fetch");
         crate::media::PreparedMedia::empty()
     } else {
-        crate::media::prepare_entry_media(state, entry, &transport, meta, lang).await
+        crate::media::prepare_entry_media(
+            state,
+            entry,
+            &transport,
+            meta,
+            lang,
+            opts.mode.single_media(),
+        )
+        .await
     };
 
     tracing::info!(

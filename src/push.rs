@@ -295,6 +295,16 @@ impl ContentMode {
     pub fn skip_media(&self) -> bool {
         matches!(self, ContentMode::TitleLink | ContentMode::TitleOnly)
     }
+
+    /// Whether this mode keeps only the first media item (title_summary).
+    /// At fetch time `prepare_entry_media` stops after the first successfully
+    /// downloaded image/video (audio/documents and GIFs are never fetched);
+    /// the slice in `send_entry_with_media` stays as a compatibility guard
+    /// for outbox rows serialized by older versions (they can still carry a
+    /// full media set). Shared by scheduler and /test to avoid rule drift.
+    pub fn single_media(&self) -> bool {
+        matches!(self, ContentMode::TitleSummary)
+    }
 }
 
 /// Source footer display.
@@ -679,9 +689,13 @@ pub async fn send_entry_with_media(
     let full_caption = format_caption(entry, feed_title, author, opts, meta);
     let caption_above = caption_above_media;
 
-    // Title+summary mode keeps media minimal: when images are present only
-    // the first one is sent (no full album group); without images the
-    // existing video/document behavior is kept.
+    // Title+summary keeps at most one media item. The fetch layer already
+    // enforces this for new downloads (prepare_entry_media single_media:
+    // stops after the first image/video, never fetches audio or GIFs), so
+    // this slice is a compatibility guard for outbox rows serialized by
+    // older versions: when images are present only the first one is sent
+    // (no full album group); otherwise the existing video/document behavior
+    // is kept.
     // (Title+link / title-only modes already skip media downloads at the
     // scheduler layer and never reach here.)
     let media: &[MediaItem] = if opts.mode == ContentMode::TitleSummary {

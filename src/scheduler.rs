@@ -678,7 +678,15 @@ async fn process_feed(
                     // top of process_feed; re-querying the settings row per
                     // entry wasted a DB round-trip and fell back to En via a
                     // different (owner_id.unwrap_or(0)) path.
-                    crate::media::prepare_entry_media(state, entry, &transport, meta, lang).await
+                    crate::media::prepare_entry_media(
+                        state,
+                        entry,
+                        &transport,
+                        meta,
+                        lang,
+                        opts.mode.single_media(),
+                    )
+                    .await
                 };
                 let download_warnings = prepared.warnings;
 

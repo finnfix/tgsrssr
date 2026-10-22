@@ -472,6 +472,33 @@ fn sniff_gif(path: &std::path::Path) -> bool {
     }
 }
 
+/// Cheap pre-download GIF detection from the MIME hint or the URL path
+/// extension (query string stripped first). Catches the common cases—an
+/// enclosure tagged `image/gif`, or a `.gif` suffix—before any bytes are
+/// fetched. Suffix-free GIF URLs served with an `image/unknown` hint cannot
+/// be caught here; they are still detected after download via `sniff_gif`.
+/// The post-download `is_gif` computation reuses this so the two sites cannot
+/// drift.
+fn looks_like_gif(mime: &str, url: &str) -> bool {
+    mime == "image/gif"
+        || url
+            .to_lowercase()
+            .split('?')
+            .next()
+            .map(|p| p.ends_with(".gif"))
+            .unwrap_or(false)
+}
+
+/// Whether the title_summary single-media mode should drop this candidate
+/// before downloading. That mode only ever sends the first image or video, so
+/// audio/documents (`Other`) and GIFs are never pushed: fetching them would
+/// only waste a download and emit a misleading "media download failed"
+/// warning. Suffix-free GIFs slip past this cheap check and are discarded
+/// after download (see the post-download `is_gif` branch in the loop).
+fn single_mode_skips(kind: &MediaKind, mime: &str, url: &str) -> bool {
+    *kind == MediaKind::Other || (*kind == MediaKind::Image && looks_like_gif(mime, url))
+}
+
 /// Simple URL encoding (encodes everything except ASCII alphanumerics and
 /// the safe characters).
 fn urlencoding(s: &str) -> String {
@@ -806,12 +833,20 @@ async fn download_cover_fallback(
 /// Returns prepared items plus human-readable warnings (skips/downgrades) and
 /// whether any media host is Weibo/Sina (drives the native caption layout).
 /// Never fails the push pipeline: on any problem returns whatever was prepared.
+///
+/// `single_media` (title_summary mode): stop after the first image/video that
+/// downloads successfully. Candidates that are audio/documents or a
+/// detectable GIF are skipped up front (never fetched, never warned); a
+/// suffix-free GIF is dropped after download and the loop moves on. Failure
+/// of the first real candidate still counts as a warning (visible to the
+/// owner) and falls through to the next candidate.
 pub async fn prepare_entry_media(
     state: &AppState,
     entry: &Entry,
     transport: &MediaTransport,
     meta: Option<&crate::entrymeta::EntryMeta>,
     lang: crate::i18n::Lang,
+    single_media: bool,
 ) -> PreparedMedia {
     let mut out = PreparedMedia::default();
     let candidates = extract_media_urls(entry, meta);
@@ -840,6 +875,13 @@ pub async fn prepare_entry_media(
     }
 
     for (raw_url, kind, mime, is_retweet) in candidates {
+        // title_summary single-media mode: skip candidates that can never be
+        // sent (audio/documents, detectable GIFs) so they are neither fetched
+        // nor reported as a misleading "media download failed".
+        if single_media && single_mode_skips(&kind, &mime, &raw_url) {
+            debug!(url = %raw_url, "single-media mode: candidate skipped (not image/video)");
+            continue;
+        }
         // Weibo-specific: upgrade thumbnail size segment to `large`.
         let mut url = upgrade_weibo_size(&raw_url);
         // Weibo-specific: resolve HD video stream via status API.
@@ -890,6 +932,15 @@ pub async fn prepare_entry_media(
         let mut video_needs_cover = false;
         match result {
             Ok(DownloadOutcome::Item(mut item)) => {
+                // Suffix-free GIF slipped past the cheap pre-download check:
+                // title_summary never sends a GIF, so drop it (and its file)
+                // and fall through to the next candidate. Not a failure—no
+                // warning, only a debug trace.
+                if single_media && item.is_gif {
+                    debug!(url = %url, "single-media mode: GIF dropped after sniffing, trying next");
+                    let _ = tokio::fs::remove_file(&item.path).await;
+                    continue;
+                }
                 item.is_retweet = is_retweet;
                 out.items.push(item);
             }
@@ -931,6 +982,24 @@ pub async fn prepare_entry_media(
         }
         if video_needs_cover {
             download_cover_fallback(state, &poster_map, &raw_url, &outbound, transport, &mut out).await;
+        }
+        // title_summary single-media mode: the first image/video (or a video
+        // cover fallback) is all this mode ever sends—stop fetching. Failure
+        // branches above left items empty, so the loop naturally falls
+        // through to the next candidate. A cover fallback that turned out to
+        // be a GIF is dropped here (the main-candidate GIF is caught before
+        // push), preserving the invariant that this mode never sends a GIF.
+        if single_media {
+            match out.items.last().map(|m| m.is_gif) {
+                Some(true) => {
+                    if let Some(gif) = out.items.pop() {
+                        debug!(path = %gif.path.display(), "single-media mode: GIF cover dropped, trying next candidate");
+                        let _ = tokio::fs::remove_file(&gif.path).await;
+                    }
+                }
+                Some(false) => break,
+                None => {}
+            }
         }
         if out.items.len() >= MAX_MEDIA_PER_ENTRY {
             break;
@@ -1161,15 +1230,9 @@ async fn download_one(
     // and some CDNs serve GIFs at suffix-free URLs (/img/<hash>), so
     // extension checks alone miss them. Read the 6-byte magic header from the
     // downloaded file as a definitive fallback ("GIF87a"/"GIF89a").
-    let is_gif = *kind == MediaKind::Image
-        && (mime == "image/gif"
-            || sniff_gif(&path)
-            || url
-                .to_lowercase()
-                .split('?')
-                .next()
-                .map(|p| p.ends_with(".gif"))
-                .unwrap_or(false));
+    // The cheap mime/extension part is shared with the pre-download check
+    // (`looks_like_gif`) so the two detection sites cannot drift.
+    let is_gif = *kind == MediaKind::Image && (looks_like_gif(mime, url) || sniff_gif(&path));
 
     // #21: ffmpeg/ffprobe probing moved to prepare_entry_media, running
     // after the semaphore is released, to avoid occupying a download
@@ -1471,5 +1534,54 @@ mod tests {
         assert!(!image_goes_to_doc(1024 * 1024, 1000, 3000, 8.0));
         // Zero-dimension defense.
         assert!(!image_goes_to_doc(1024, 0, 0, 8.0));
+    }
+
+    // ===== single-media mode candidate filtering (title_summary) =====
+
+    #[test]
+    fn single_mode_skips_other_and_detectable_gif() {
+        // Audio/documents are never sent in single-media mode.
+        assert!(single_mode_skips(&MediaKind::Other, "audio/mpeg", "https://cdn.example.com/a.mp3"));
+        assert!(single_mode_skips(&MediaKind::Other, "", "https://cdn.example.com/doc.pdf"));
+        // GIFs detectable before download (mime hint or .gif path suffix)
+        // are skipped so they are never fetched or warned about.
+        assert!(single_mode_skips(&MediaKind::Image, "image/gif", "https://cdn.example.com/x"));
+        assert!(single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/x.gif"));
+        // Query string must not hide the extension.
+        assert!(single_mode_skips(
+            &MediaKind::Image,
+            "image/unknown",
+            "https://cdn.example.com/x.gif?width=800"
+        ));
+        // Plain images and videos pass through.
+        assert!(!single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/x.png"));
+        assert!(!single_mode_skips(&MediaKind::Video, "video/mp4", "https://cdn.example.com/v.mp4"));
+        // Suffix-free GIF served under an unknown mime: slips the cheap check
+        // (caught after download via sniff_gif instead).
+        assert!(!single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/img/abcdef"));
+    }
+
+    #[test]
+    fn looks_like_gif_matches_post_download_precedence() {
+        // The shared helper must agree with what the pre-download skip used
+        // to test standalone: mime exact match, path suffix, case-insensitive.
+        assert!(looks_like_gif("image/gif", "https://e/x"));
+        assert!(looks_like_gif("image/unknown", "https://e/X.GIF"));
+        assert!(!looks_like_gif("image/gif/", "https://e/x"));
+        assert!(!looks_like_gif("image/png", "https://e/x.gifv"));
+    }
+
+    #[test]
+    fn sniff_gif_still_detects_magic_header_after_download() {
+        // A suffix-free file whose bytes are a GIF must still be caught
+        // post-download (the pre-download cheap check deliberately misses
+        // it). This pins the behavior the loop's drop-after-sniff branch
+        // relies on.
+        let path = std::env::temp_dir().join(format!("tgsrssr_gif_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"GIF89a\x01\x00\x00\x00").unwrap();
+        assert!(sniff_gif(&path));
+        std::fs::write(&path, b"\x89PNG\r\n").unwrap();
+        assert!(!sniff_gif(&path));
+        std::fs::remove_file(&path).ok();
     }
 }
