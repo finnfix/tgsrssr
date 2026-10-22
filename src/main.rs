@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Scheduler: fetch job + cleanup job + auto-heal job
-    let sched = JobScheduler::new().await?;
+    let mut sched = JobScheduler::new().await?;
     scheduler::register_fetch_job(&sched, state.clone(), bot.clone()).await?;
     scheduler::register_heal_job(&sched, state.clone()).await?;
     register_cleanup_job(&sched, state.clone()).await?;
@@ -193,6 +193,15 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .dispatch()
         .await;
+
+    // Dispatcher returns on Ctrl-C (or a fatal update-stream error). The
+    // JobScheduler's ticker is an independent task and keeps firing cron jobs
+    // (fetch/outbox notifications included) unless explicitly shut down, so
+    // stop it before exiting rather than relying on process teardown.
+    info!("shutting down scheduler");
+    if let Err(e) = sched.shutdown().await {
+        tracing::warn!(error = %e, "scheduler shutdown returned an error");
+    }
 
     Ok(())
 }
