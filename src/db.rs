@@ -624,14 +624,41 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
 /// Manual pause/resume (bot button). Manual operations set auto_disabled=0,
 /// guaranteeing that a source the user actively stopped is never auto-restored
 /// by the self-heal job.
+///
+/// Resuming (active=true) also mirrors the auto-heal recovery: it resets the
+/// failure counter and clears the auto-disable notification dedup flag, so a
+/// source the user manually resumes starts from a clean slate. Without this,
+/// a manual resume left the stale error_count in place, so the very next
+/// failure could immediately re-trigger auto-disable — and because the
+/// notified flag was still set, that re-disable was silent (the user perceives
+/// the resume button as "not working"). Pausing leaves the counters untouched.
 pub async fn set_subscription_active(db: &Db, sub_id: i64, active: bool) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE subscriptions SET active = ?, auto_disabled = 0, disabled_at = NULL WHERE id = ?",
-    )
-    .bind(if active { 1 } else { 0 })
-    .bind(sub_id)
-    .execute(db)
-    .await?;
+    let mut tx = db.begin().await?;
+    if active {
+        sqlx::query(
+            "UPDATE subscriptions SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL WHERE id = ?",
+        )
+        .bind(sub_id)
+        .execute(&mut *tx)
+        .await?;
+        // Clear the per-feed auto-disable notification dedup flag (exact key
+        // match, same shape as the unsubscribe cascade) so the next genuine
+        // disable can notify again.
+        sqlx::query(
+            "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+        )
+        .bind(sub_id)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE subscriptions SET active = 0, auto_disabled = 0, disabled_at = NULL WHERE id = ?",
+        )
+        .bind(sub_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
