@@ -1051,14 +1051,19 @@ enum RichOp<'a> {
     Group(Vec<&'a MediaItem>),
 }
 
-/// Order rich media (videos/GIFs/images) as "videos first → GIFs → images",
-/// splitting into groups of ≤10 each.
+/// Order rich media (videos/GIFs/images) as "photo/video album first → GIFs
+/// last", splitting the album pool into groups of ≤10 each.
 /// Telegram sendMediaGroup allows at most 10 media per call; anything beyond
-/// that is split into follow-up groups, which quote the first group's
+/// that is split into follow-up albums, which quote the first album's
 /// message when sent for easy navigation.
-/// GIFs must be separated into independent ops (sendAnimation): Telegram's
-/// sendMediaGroup does not accept the animation type — mixing one into an
-/// image/video group gets the whole group rejected
+/// Photos and videos are merged into one pool (videos leading, images after)
+/// because Telegram's sendMediaGroup accepts them in the same album — the
+/// shared type constraint only applies to documents and audios (which must be
+/// grouped with same-type peers), so those still go through `send_doc_group`
+/// as follow-up messages that quote the album.
+/// GIFs must be separated into independent ops (sendAnimation) and always
+/// follow the album: Telegram's sendMediaGroup does not accept the animation
+/// type — mixing one into an image/video album gets the whole album rejected
 /// (Bad Request: type "animation" can't be used in sendMediaGroup).
 fn build_rich_ops<'a>(
     photos: &[&'a MediaItem],
@@ -1067,30 +1072,31 @@ fn build_rich_ops<'a>(
 ) -> Vec<RichOp<'a>> {
     let mut ops: Vec<RichOp<'a>> = Vec::new();
 
-    // Videos first (user requirement), groups of ≤10
-    for chunk in videos.chunks(10) {
-        // chunks(10) never yields an empty slice, so len is always ≥1.
+    // Videos + images share one album pool (videos first, preserving the
+    // historical "video leads" ordering for multi-media entries).
+    let mut pool: Vec<&'a MediaItem> = Vec::with_capacity(videos.len() + photos.len());
+    pool.extend_from_slice(videos);
+    pool.extend_from_slice(photos);
+
+    // chunks(10) never yields an empty slice, so len is always ≥1.
+    // A single item cannot form an album (sendMediaGroup requires 2–10), so
+    // dispatch it to the dedicated single-media op by kind.
+    for chunk in pool.chunks(10) {
         if chunk.len() == 1 {
-            ops.push(RichOp::Video(chunk[0]));
+            if chunk[0].kind == MediaKind::Video {
+                ops.push(RichOp::Video(chunk[0]));
+            } else {
+                ops.push(RichOp::Photo(chunk[0]));
+            }
         } else {
             ops.push(RichOp::Group(chunk.to_vec()));
         }
     }
 
-    // GIFs are sent one by one independently (sendAnimation), never in a
-    // media group
+    // GIFs are sent one by one independently (sendAnimation), never in an
+    // album, and always after the album (they cannot share the album anyway).
     for g in gifs {
         ops.push(RichOp::Gif(g));
-    }
-
-    // Images in groups of ≤10
-    for chunk in photos.chunks(10) {
-        // chunks(10) never yields an empty slice, so len is always ≥1.
-        if chunk.len() == 1 {
-            ops.push(RichOp::Photo(chunk[0]));
-        } else {
-            ops.push(RichOp::Group(chunk.to_vec()));
-        }
     }
 
     ops
@@ -1916,5 +1922,131 @@ mod tests {
         assert!(summary.contains("正文。"), "body lost: {summary}");
         assert!(!summary.contains("video.weibo.com"), "media href leaked: {summary}");
         assert!(!summary.contains("<a"), "media anchor survived: {summary}");
+    }
+
+    // ===== build_rich_ops (album pool: videos + images in one album) =====
+
+    /// Minimal MediaItem factory for op-assembly tests: only `kind`/`is_gif`
+    /// drive build_rich_ops, and `content_hash` labels each item so tests can
+    /// assert the resulting order.
+    fn mk_item(hash: &str, kind: MediaKind, is_gif: bool) -> MediaItem {
+        MediaItem {
+            path: std::path::PathBuf::from(format!("{hash}.bin")),
+            kind,
+            width: 0,
+            height: 0,
+            size: 0,
+            is_gif,
+            thumb_path: None,
+            duration_secs: None,
+            content_hash: hash.to_string(),
+            is_retweet: false,
+        }
+    }
+
+    /// Flatten the ops into an ordered `(label, group?)` list for assertions:
+    /// each op becomes one entry, and album-group members are joined by "+"
+    /// so their internal order is checked too.
+    fn op_labels(ops: &[RichOp<'_>]) -> Vec<String> {
+        ops.iter()
+            .map(|op| match op {
+                RichOp::Photo(p) => format!("photo:{}", p.content_hash),
+                RichOp::Gif(g) => format!("gif:{}", g.content_hash),
+                RichOp::Video(v) => format!("video:{}", v.content_hash),
+                RichOp::Group(items) => {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|m| m.content_hash.to_string())
+                        .collect();
+                    format!("group[{}]", parts.join("+"))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rich_ops_merge_one_video_one_image_into_single_album() {
+        // The core of this change: a video and an image must land in the SAME
+        // first album (video leading), not "video msg + image quoting it".
+        let v = mk_item("v1", MediaKind::Video, false);
+        let p = mk_item("p1", MediaKind::Image, false);
+        let ops = build_rich_ops(&[&p], &[], &[&v]);
+        assert_eq!(op_labels(&ops), vec!["group[v1+p1]"]);
+    }
+
+    #[test]
+    fn rich_ops_video_leads_image_within_merged_album() {
+        // Ordering contract: all videos precede all images inside the pool.
+        let v = mk_item("v1", MediaKind::Video, false);
+        let p1 = mk_item("p1", MediaKind::Image, false);
+        let p2 = mk_item("p2", MediaKind::Image, false);
+        let ops = build_rich_ops(&[&p1, &p2], &[], &[&v]);
+        assert_eq!(op_labels(&ops), vec!["group[v1+p1+p2]"]);
+    }
+
+    #[test]
+    fn rich_ops_single_item_falls_back_to_direct_send() {
+        // sendMediaGroup requires 2–10 items, so a lone media goes through
+        // its dedicated single op, dispatched by kind.
+        let v = mk_item("v1", MediaKind::Video, false);
+        assert_eq!(op_labels(&build_rich_ops(&[], &[], &[&v])), vec!["video:v1"]);
+        let p = mk_item("p1", MediaKind::Image, false);
+        assert_eq!(op_labels(&build_rich_ops(&[&p], &[], &[])), vec!["photo:p1"]);
+    }
+
+    #[test]
+    fn rich_ops_gifs_are_standalone_and_follow_album() {
+        // GIFs cannot enter an album and must be emitted after it.
+        let v = mk_item("v1", MediaKind::Video, false);
+        let p = mk_item("p1", MediaKind::Image, false);
+        let g1 = mk_item("g1", MediaKind::Image, true);
+        let g2 = mk_item("g2", MediaKind::Image, true);
+        let ops = build_rich_ops(&[&p], &[&g1, &g2], &[&v]);
+        assert_eq!(
+            op_labels(&ops),
+            vec!["group[v1+p1]", "gif:g1", "gif:g2"]
+        );
+    }
+
+    #[test]
+    fn rich_ops_overflow_splits_into_follow_up_albums() {
+        // 12 media > the 10-per-album cap: first album fills to 10, the
+        // remainder becomes a follow-up album (which the sender replies to
+        // the first). Videos lead, then images fill the same pool.
+        let videos: Vec<MediaItem> =
+            (0..3).map(|i| mk_item(&format!("v{i}"), MediaKind::Video, false)).collect();
+        let photos: Vec<MediaItem> =
+            (0..9).map(|i| mk_item(&format!("p{i}"), MediaKind::Image, false)).collect();
+        let vrefs: Vec<&MediaItem> = videos.iter().collect();
+        let prefs: Vec<&MediaItem> = photos.iter().collect();
+        let ops = build_rich_ops(&prefs, &[], &vrefs);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            op_labels(&ops),
+            vec![
+                "group[v0+v1+v2+p0+p1+p2+p3+p4+p5+p6]",
+                "group[p7+p8]",
+            ]
+        );
+    }
+
+    #[test]
+    fn rich_ops_title_summary_slice_still_yields_single_photo() {
+        // Compatibility guard: TitleSummary keeps only the first image, so
+        // the pool is a lone image and must not become an album.
+        let v = mk_item("v1", MediaKind::Video, false);
+        let p = mk_item("p1", MediaKind::Image, false);
+        let media = [v.clone(), p.clone()];
+        let sliced: &[MediaItem] = match media.iter().position(|m| m.kind == MediaKind::Image) {
+            Some(i) => &media[i..i + 1],
+            None => &media,
+        };
+        let prefs: Vec<&MediaItem> = sliced
+            .iter()
+            .filter(|m| m.kind == MediaKind::Image && !m.is_gif)
+            .collect();
+        let vrefs: Vec<&MediaItem> = sliced.iter().filter(|m| m.kind == MediaKind::Video).collect();
+        let ops = build_rich_ops(&prefs, &[], &vrefs);
+        assert_eq!(op_labels(&ops), vec!["photo:p1"]);
     }
 }
