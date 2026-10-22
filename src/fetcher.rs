@@ -128,6 +128,18 @@ pub async fn read_body_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Res
     Ok(body_buf)
 }
 
+/// Read a response body under the size cap (via `read_body_capped`) and parse
+/// it as JSON. Platform fetch code previously called `resp.json()` directly,
+/// which bypasses MAX_BODY_BYTES and lets a hostile/oversized API response
+/// buffer unbounded. This routes every platform JSON read through the same cap
+/// the RSS pipeline uses. `ctx` identifies the source in error messages.
+pub async fn read_json_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Result<serde_json::Value> {
+    let bytes = read_body_capped(resp, ctx).await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("JSON parse failed for {}", ctx))?;
+    Ok(json)
+}
+
 /// Fetch and parse an RSS/Atom/JSON feed.
 /// Pass in the previously saved ETag / Last-Modified for a conditional
 /// request: when the source has not been updated the server returns 304,

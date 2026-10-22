@@ -405,7 +405,7 @@ async fn fetch_query_ids(state: &AppState) -> anyhow::Result<HashMap<String, Str
     if !resp.status().is_success() {
         anyhow::bail!("query-ID document HTTP {}", resp.status());
     }
-    let json: Value = resp.json().await.context("query-ID document JSON parse failed")?;
+    let json: Value = crate::fetcher::read_json_capped(resp, "query-ID document").await?;
 
     let mut ids = HashMap::new();
     for op in [OP_USER_BY_SCREEN_NAME, OP_USER_TWEETS] {
@@ -545,7 +545,7 @@ async fn gql_request_once(
         anyhow::bail!("X API HTTP {}", status);
     }
 
-    let json: Value = resp.json().await.context("X API JSON parse failed")?;
+    let json: Value = crate::fetcher::read_json_capped(resp, "X API").await?;
 
     // GraphQL errors can come with HTTP 200.
     if let Some(errors) = json.get("errors").filter(|e| e.is_array()) {

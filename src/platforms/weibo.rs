@@ -194,7 +194,7 @@ pub async fn fetch_weibo_user(
         anyhow::bail!("weibo HTTP {}", status);
     }
 
-    let json: Value = resp.json().await.context("weibo JSON parse failed")?;
+    let json: Value = crate::fetcher::read_json_capped(resp, "weibo getIndex").await?;
     if json.get("ok").and_then(|v| v.as_i64()) != Some(1) {
         let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
         // When the cookie expires, the weibo API returns ok!=1 (common msg
@@ -426,7 +426,7 @@ async fn get_weibo_json(state: &AppState, api: &str, cookies: &str, referer: &st
         warn!(ctx = ctx, status = %resp.status(), "weibo json non-success HTTP status");
         return None;
     }
-    match resp.json().await {
+    match crate::fetcher::read_json_capped(resp, ctx).await {
         Ok(j) => Some(j),
         Err(e) => {
             warn!(ctx = ctx, error = %e, "weibo json parse failed");
