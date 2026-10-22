@@ -233,7 +233,6 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
     let resp = client
         .get("https://x.com")
         .header("Cookie", format!("auth_token={}", auth_token))
-        .header("User-Agent", crate::state::BROWSER_UA)
         .send()
         .await
         .context("x.com request failed")?;
@@ -397,7 +396,6 @@ async fn fetch_query_ids(state: &AppState) -> anyhow::Result<HashMap<String, Str
     let client = state.client_for_url(QUERY_ID_DOC_URL);
     let resp = client
         .get(QUERY_ID_DOC_URL)
-        .header("User-Agent", crate::state::BROWSER_UA)
         .header("Accept", "application/json")
         .send()
         .await
@@ -515,7 +513,6 @@ async fn gql_request_once(
         .header("x-twitter-active-user", "yes")
         .header("x-twitter-client-language", "en")
         .header("Content-Type", "application/json")
-        .header("User-Agent", crate::state::BROWSER_UA)
         .header("Referer", "https://x.com/")
         .send()
         .await

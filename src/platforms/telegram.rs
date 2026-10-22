@@ -193,7 +193,6 @@ pub async fn fetch_telegram_channel(
     let client = state.client_for_url(&url);
     let resp = client
         .get(&url)
-        .header("User-Agent", crate::state::BROWSER_UA)
         .header("Accept", "text/html,application/xhtml+xml")
         .send()
         .await

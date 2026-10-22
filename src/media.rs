@@ -387,7 +387,6 @@ async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     let resp = client
         .post(gen_url)
         .header("Referer", "https://weibo.com/")
-        .header("User-Agent", crate::state::BROWSER_UA)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -420,7 +419,6 @@ async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     let resp2 = client
         .get(&incarnate_url)
         .header("Referer", "https://weibo.com/")
-        .header("User-Agent", crate::state::BROWSER_UA)
         .send()
         .await
         .ok()?;
@@ -530,7 +528,6 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
     let mut req = client
         .get(&api)
         .header("Referer", "https://weibo.com/")
-        .header("User-Agent", crate::state::BROWSER_UA)
         .header("Accept", "application/json, text/plain, */*")
         .header("X-Requested-With", "XMLHttpRequest");
     if !cookies.is_empty() {
@@ -1097,7 +1094,6 @@ async fn download_one(
                     .timeout(std::time::Duration::from_secs(300));
                 if let Some(referer) = referer_for(url) {
                     req = req.header("Referer", referer);
-                    req = req.header("User-Agent", crate::state::BROWSER_UA);
                 }
                 let r = req.send().await?;
                 if r.status().is_redirection() {
