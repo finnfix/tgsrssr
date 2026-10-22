@@ -948,13 +948,17 @@ async fn start_pending_op(
 /// The header text is always the plain title — after a cookie update the
 /// confirmation is carried by the retired prompt message, so the panel
 /// itself only needs its button statuses refreshed.
+///
+/// Lang is resolved by the caller (same convention as render_channel_list):
+/// re-resolving here with `None` would drop the Telegram client language_code
+/// hint and force English on never-configured users while adjacent panels
+/// render Chinese.
 pub async fn render_cookies_panel(
     bot: &Bot,
     target: PageTarget<'_>,
     state: &AppState,
-    user_id: i64,
+    lang: Lang,
 ) -> ResponseResult<()> {
-    let lang = resolve_lang(state, user_id, None).await;
     let text = String::from(i18n::t(lang, "ck_panel_title"));
 
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();

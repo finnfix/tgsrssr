@@ -106,7 +106,7 @@ pub async fn handle_command(
         Command::Sub => handle_sub(&bot, &msg, &state, &args, lang).await?,
         Command::Test => handle_test(&bot, &msg, &state, &args, lang).await?,
         Command::Find => handle_find(&bot, &msg, &state, &args, lang).await?,
-        Command::Cookies => handle_cookies(&bot, &msg, &state, user_id, lang).await?,
+        Command::Cookies => handle_cookies(&bot, &msg, &state, lang).await?,
         Command::Loget => handle_loget(&bot, &msg, &state, &args, lang).await?,
         Command::About => handle_start(&bot, &msg, &state, user_id).await?,
     }
@@ -758,12 +758,12 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 /// Platform login-cookie management panel (per-user). Selecting a platform
 /// prompts for the new cookie via reply; the update applies immediately
 /// without restart and is persisted across restarts.
-async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, user_id: i64, _lang: Lang) -> ResponseResult<()> {
+async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> ResponseResult<()> {
     crate::callbacks::render_cookies_panel(
         bot,
         crate::callbacks::PageTarget::Send(msg.chat.id),
         state,
-        user_id,
+        lang,
     ).await?;
     Ok(())
 }
@@ -1033,7 +1033,7 @@ pub async fn handle_pending_op(
                             teloxide::types::MessageId(panel_msg_id),
                         ),
                         state,
-                        user_id,
+                        lang,
                     ).await?;
                 }
                 Err(e) => {
