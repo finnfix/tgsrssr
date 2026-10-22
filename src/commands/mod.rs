@@ -280,10 +280,7 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             .link_preview_options(no_preview());
         // All chunks uniformly reply to the first message (flat structure, not chained).
         if let Some(rid) = first_msg {
-            req = req.reply_parameters(teloxide::types::ReplyParameters {
-                message_id: rid,
-                ..Default::default()
-            });
+            req = req.reply_parameters(teloxide::types::ReplyParameters::new(rid));
         }
         let m = req.await?;
         if first_msg.is_none() {

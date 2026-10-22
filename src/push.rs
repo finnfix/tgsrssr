@@ -556,13 +556,6 @@ fn path_input(
     }
 }
 
-fn input_for(
-    item: &MediaItem,
-    transport: &crate::media::MediaTransport,
-) -> anyhow::Result<InputFile> {
-    path_input(&item.path, transport)
-}
-
 /// Cache-aware input construction: first look up the file_id cache by
 /// "content hash:send mode"; on a hit use `InputFile::Id` directly
 /// (Telegram's server already has the file, no re-upload needed).
@@ -583,7 +576,7 @@ async fn resolve_input(
             return Ok(InputFile::file_id(teloxide::types::FileId(fid)));
         }
     }
-    input_for(item, transport)
+    path_input(&item.path, transport)
 }
 
 /// Extract the media file_id from a sent message by send mode (used to write
@@ -1076,10 +1069,11 @@ fn build_rich_ops<'a>(
 
     // Videos first (user requirement), groups of ≤10
     for chunk in videos.chunks(10) {
-        match chunk.len() {
-            0 => {}
-            1 => ops.push(RichOp::Video(chunk[0])),
-            _ => ops.push(RichOp::Group(chunk.to_vec())),
+        // chunks(10) never yields an empty slice, so len is always ≥1.
+        if chunk.len() == 1 {
+            ops.push(RichOp::Video(chunk[0]));
+        } else {
+            ops.push(RichOp::Group(chunk.to_vec()));
         }
     }
 
@@ -1091,10 +1085,11 @@ fn build_rich_ops<'a>(
 
     // Images in groups of ≤10
     for chunk in photos.chunks(10) {
-        match chunk.len() {
-            0 => {}
-            1 => ops.push(RichOp::Photo(chunk[0])),
-            _ => ops.push(RichOp::Group(chunk.to_vec())),
+        // chunks(10) never yields an empty slice, so len is always ≥1.
+        if chunk.len() == 1 {
+            ops.push(RichOp::Photo(chunk[0]));
+        } else {
+            ops.push(RichOp::Group(chunk.to_vec()));
         }
     }
 
@@ -1142,15 +1137,9 @@ async fn send_doc_group(
         let group_caption = if gi == 0 { caption } else { "" };
         // Follow-up groups quote the first message of the first group
         let rp = if gi > 0 {
-            first_msg_id.map(|rid| teloxide::types::ReplyParameters {
-                message_id: rid,
-                ..Default::default()
-            })
+            first_msg_id.map(teloxide::types::ReplyParameters::new)
         } else {
-            reply_to.map(|rid| teloxide::types::ReplyParameters {
-                message_id: rid,
-                ..Default::default()
-            })
+            reply_to.map(teloxide::types::ReplyParameters::new)
         };
 
         let mut use_cache = true;
@@ -1243,7 +1232,7 @@ async fn send_doc_msg(
     // file_id cache retry: the first round uses the cached file_id
     // (use_cache=true); if Telegram rejects it (file_id expired), invalidate
     // that cache entry and re-upload once from the local file.
-    // resolve_input(use_cache=false) is equivalent to calling input_for
+    // resolve_input(use_cache=false) is equivalent to calling path_input
     // directly, matching the behavior of the original retry path.
     let mut use_cache = true;
     let mut flood_tries = 0u32;
@@ -1265,10 +1254,7 @@ async fn send_doc_msg(
             req = req.caption(caption).parse_mode(ParseMode::Html);
         }
         if let Some(rid) = reply_to {
-            req = req.reply_parameters(teloxide::types::ReplyParameters {
-                message_id: rid,
-                ..Default::default()
-            });
+            req = req.reply_parameters(teloxide::types::ReplyParameters::new(rid));
         }
         match req.await {
             Ok(m) => break m,
@@ -1409,10 +1395,7 @@ async fn send_op(
     // types)
     let caption_owned = normalize_blockquote_fold(caption);
     let caption = caption_owned.as_str();
-    let reply_params = reply_to.map(|rid| teloxide::types::ReplyParameters {
-        message_id: rid,
-        ..Default::default()
-    });
+    let reply_params = reply_to.map(teloxide::types::ReplyParameters::new);
     // async move closures require all captures to be Copy/references;
     // reply_params is lifted to a reference.
     let rp = &reply_params;
@@ -1701,10 +1684,7 @@ async fn send_single_html(
             req = req.link_preview_options(o.clone());
         }
         if let Some(rid) = reply_to {
-            req = req.reply_parameters(teloxide::types::ReplyParameters {
-                message_id: rid,
-                ..Default::default()
-            });
+            req = req.reply_parameters(teloxide::types::ReplyParameters::new(rid));
         }
         let result = req.await;
 
@@ -1738,10 +1718,7 @@ async fn send_single_html(
                         req2 = req2.link_preview_options(o.clone());
                     }
                     if let Some(rid) = reply_to {
-                        req2 = req2.reply_parameters(teloxide::types::ReplyParameters {
-                            message_id: rid,
-                            ..Default::default()
-                        });
+                        req2 = req2.reply_parameters(teloxide::types::ReplyParameters::new(rid));
                     }
                     let m = req2.await?;
                     return Ok(m);

@@ -162,8 +162,10 @@ pub async fn fetch_feed(
     // SSRF protection (entry point): /sub and /test accept arbitrary URLs,
     // and the bot runs in host network mode; without validation, whitelisted
     // users could use the bot to probe the host's intranet ports / cloud
-    // metadata. Shares the same is_private_url check as the media download
-    // path.
+    // metadata. Both this entry pre-check (`ssrf_check`, three-state so a
+    // transient DNS blip reports LookupFailed instead of masking as a block)
+    // and the media download path (`is_private_url`) share the same
+    // private/loopback classification defined in ssrf.rs.
     // Requests routed via a proxy have their connections established on the
     // proxy side, so the local DNS resolution result does not affect the
     // actual connection target — skip the check (v1.10.14: fixed false

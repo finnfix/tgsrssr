@@ -5,7 +5,7 @@
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-use super::{deliver, deliver_error_page, load_sub_or_deliver, PageTarget};
+use super::{back_close_row, deliver, deliver_error_page, load_sub_or_deliver, PageTarget};
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
@@ -43,10 +43,7 @@ pub(super) async fn render_settings_page(
             i18n::t(lang, "settings_lp").replacen("{}", lp_label, 1),
             format!("c|cfglp|{}", chat_id),
         )],
-        vec![
-            InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|ch|{}", chat_id)),
-            InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
-        ],
+        back_close_row(lang, "back", format!("c|ch|{}", chat_id)),
     ];
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -108,10 +105,7 @@ async fn render_option_page(bot: &Bot, target: &PageTarget<'_>, spec: &OptionPag
             format!("{}|{}|inherit{}", spec.cb_prefix, spec.id_seg, spec.cb_suffix),
         )]);
     }
-    buttons.push(vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "back"), spec.back_cb.clone()),
-        InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
-    ]);
+    buttons.push(back_close_row(lang, "back", spec.back_cb.clone()));
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, target, &spec.title, Some(kb)).await?;
     Ok(())
@@ -133,7 +127,7 @@ pub(super) async fn render_settings_interval(
             vec![(i18n::t(lang, "3h"), "180".into()), (i18n::t(lang, "6h"), "360".into()), (i18n::t(lang, "12h"), "720".into())],
         ],
         current: cfg.interval_minutes.to_string(),
-        overridden: true,
+        overridden: false,
         require_override_for_mark: false,
         cb_prefix: "c|cfgiv",
         id_seg: chat_id.to_string(),
@@ -164,7 +158,7 @@ pub(super) async fn render_settings_mode(
             vec![(i18n::t(lang, "mode_media_only"), "media_only".into())],
         ],
         current: cfg.content_mode.clone(),
-        overridden: true,
+        overridden: false,
         require_override_for_mark: false,
         cb_prefix: "c|cfgmv",
         id_seg: chat_id.to_string(),
@@ -192,7 +186,7 @@ pub(super) async fn render_settings_source(
             vec![(i18n::t(lang, "src_none"), "none".into())],
         ],
         current: cfg.source_display.clone(),
-        overridden: true,
+        overridden: false,
         require_override_for_mark: false,
         cb_prefix: "c|cfgsv",
         id_seg: chat_id.to_string(),
@@ -428,10 +422,7 @@ pub(super) async fn render_feed_filter_impl(
         vec![InlineKeyboardButton::callback(toggle_label, format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page))],
         vec![InlineKeyboardButton::callback(mode_btn_label, format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page))],
         vec![InlineKeyboardButton::callback(i18n::t(lang, "filter_set_kw"), format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        vec![
-            InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page)),
-            InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
-        ],
+        back_close_row(lang, "back", format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page)),
     ];
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;

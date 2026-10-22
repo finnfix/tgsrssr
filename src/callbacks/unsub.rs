@@ -7,7 +7,7 @@ use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tracing::{error, info};
 
-use super::{deliver, deliver_error_page, nav_row, PageTarget, PAGE_SIZE};
+use super::{deliver, deliver_error_page, fetch_sub_or_toast, nav_row, paginate, PageTarget};
 use crate::push::no_preview;
 use crate::db;
 use crate::i18n::{self, Lang};
@@ -30,20 +30,10 @@ pub(super) async fn handle_unsub_callback(
     lang: Lang,
 ) -> ResponseResult<()> {
     let qid = q.id.clone();
-    let sub = match db::get_subscription_by_id(&state.db, sub_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
-            return Ok(());
-        }
-    };
-
-    let sub = match sub {
-        Some(s) => s,
-        None => {
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "sub_not_found")).await.ok();
-            return Ok(());
-        }
+    let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), sub_id, lang).await else {
+        // fetch_sub_or_toast already answered the query with the failure or
+        // "not found" toast; nothing else to do.
+        return Ok(());
     };
 
     let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url).to_string();
@@ -121,10 +111,7 @@ pub(super) async fn render_unsub_panel(
         return Ok(());
     }
 
-    let total_pages = subs.len().div_ceil(PAGE_SIZE);
-    let page = page.min(total_pages.saturating_sub(1));
-    let start = page * PAGE_SIZE;
-    let end = (start + PAGE_SIZE).min(subs.len());
+    let (total_pages, page, start, end) = paginate(subs.len(), page);
 
     let text = if total_pages > 1 {
         i18n::t(lang, "unsub_panel_multi")

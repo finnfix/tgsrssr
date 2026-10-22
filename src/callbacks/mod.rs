@@ -37,6 +37,39 @@ pub(crate) fn chat_display_title(title: Option<&str>, chat_id: &str) -> String {
     title.unwrap_or(chat_id).to_string()
 }
 
+/// Clamp a requested page to the actual page count and compute the
+/// `[start, end)` slice bounds for a PAGE_SIZE-sized window. Returns
+/// `(total_pages, clamped_page, start, end)`. `total_pages` is at least 1
+/// so an empty list still renders one blank page (never zero — that would
+/// underflow `total_pages - 1` when clamping). Previously three sites
+/// (render_channel_list / render_channel_page / render_unsub_panel) each
+/// re-typed these four lines verbatim.
+fn paginate(len: usize, page: usize) -> (usize, usize, usize, usize) {
+    let total_pages = len.div_ceil(PAGE_SIZE).max(1);
+    let page = page.min(total_pages - 1);
+    let start = page * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(len);
+    (total_pages, page, start, end)
+}
+
+/// Build a row containing only the shared Close button. Panels that need to
+/// push a plain close row into a multi-row keyboard use this instead of
+/// re-typing the button construction. `close_kb` (empty-state pages) uses it
+/// to build a single-row Markup.
+fn close_row(lang: Lang) -> Vec<InlineKeyboardButton> {
+    vec![InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop")]
+}
+
+/// Build a `[back, close]` row. Panels that repeat this pair (with a
+/// domain-specific back label key + callback data) use this helper instead
+/// of hand-writing the two-button vector at every site.
+fn back_close_row(lang: Lang, back_key: &'static str, back_cb: String) -> Vec<InlineKeyboardButton> {
+    vec![
+        InlineKeyboardButton::callback(i18n::t(lang, back_key), back_cb),
+        InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
+    ]
+}
+
 /// Build the pagination nav row (prev / indicator / next). M6 fix: three
 /// call sites duplicated this exact logic; only the callback URL differs,
 /// supplied via `mk_url`. Returns None when there is only one page.
@@ -80,7 +113,7 @@ pub use settings::render_feed_filter;
 /// #15: Fallback keyboard for empty-state/error pages — at least provide a "Close" button,
 /// so users are not left facing a dead buttonless message they cannot exit.
 fn close_kb(lang: Lang) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop")]])
+    InlineKeyboardMarkup::new(vec![close_row(lang)])
 }
 
 /// Deliver an HTML page to the target. For `Edit`/`EditMessage`, edits the
@@ -874,7 +907,7 @@ pub async fn handle_callback(
 
 /// Sub-level callback guard: look up the subscription by id; notify via toast on failure.
 /// Returns Some(sub) on success; on Ok(None)/Err a toast answer has already been sent and the caller just skips.
-async fn fetch_sub_or_toast(
+pub(super) async fn fetch_sub_or_toast(
     state: &AppState,
     bot: &Bot,
     qid: teloxide::types::CallbackQueryId,
@@ -993,7 +1026,7 @@ pub async fn render_cookies_panel(
         )]);
     }
 
-    buttons.push(vec![InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop")]);
+    buttons.push(close_row(lang));
 
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;
@@ -1028,10 +1061,7 @@ pub async fn render_channel_list(
         return Ok(());
     }
 
-    let total_pages = chats.len().div_ceil(PAGE_SIZE);
-    let page = page.min(total_pages.saturating_sub(1));
-    let start = page * PAGE_SIZE;
-    let end = (start + PAGE_SIZE).min(chats.len());
+    let (total_pages, page, start, end) = paginate(chats.len(), page);
 
     // Buttons-only list: per-item text lines duplicated the buttons, so each
     // channel is now directly a clickable button.
@@ -1086,7 +1116,7 @@ pub async fn render_channel_list(
         i18n::t(lang, "lang_btn"),
         "c|lang",
     )]);
-    buttons.push(vec![InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop")]);
+    buttons.push(close_row(lang));
 
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;
@@ -1120,10 +1150,7 @@ pub async fn render_channel_page(
         }
     };
 
-    let total_pages = subs.len().div_ceil(PAGE_SIZE).max(1);
-    let page = page.min(total_pages.saturating_sub(1));
-    let start = page * PAGE_SIZE;
-    let end = (start + PAGE_SIZE).min(subs.len());
+    let (total_pages, page, start, end) = paginate(subs.len(), page);
 
     let active_count = subs.iter().filter(|s| s.active == 1).count();
     let paused_count = subs.len() - active_count;
@@ -1180,10 +1207,7 @@ pub async fn render_channel_page(
             format!("c|resumeall|{}|{}|{}", chat_id, chlist_page, page),
         )]);
     }
-    buttons.push(vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "chpage_back"), format!("c|chlist|{}", chlist_page)),
-        InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
-    ]);
+    buttons.push(back_close_row(lang, "chpage_back", format!("c|chlist|{}", chlist_page)));
 
     let kb = InlineKeyboardMarkup::new(buttons);
 
@@ -1320,7 +1344,7 @@ async fn render_feed_page_impl(
             format!("c|srcfsp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
-            i18n::t(lang, "feed_link_preview").replacen("{}", if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),
+            i18n::t(lang, "settings_lp").replacen("{}", if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),
             format!("c|srcflp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         // Note: under Approach A, picking a value identical to the channel automatically clears
@@ -1346,10 +1370,7 @@ async fn render_feed_page_impl(
         )]);
     }
 
-    buttons.push(vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "feed_back"), format!("c|ch|{}|{}|{}", sub.chat_id, ch_page, chlist_page)),
-        InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
-    ]);
+    buttons.push(back_close_row(lang, "unsub_back", format!("c|ch|{}|{}|{}", sub.chat_id, ch_page, chlist_page)));
 
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;
