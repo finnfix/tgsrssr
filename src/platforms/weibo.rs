@@ -440,9 +440,18 @@ async fn get_weibo_json(state: &AppState, api: &str, cookies: &str, referer: &st
 /// (question, options, multi-select flag, expiry) lives in the desktop
 /// endpoint's `page_info.card_info.vote_object`. Returns None on failure
 /// (the entry is still pushed as text, just without a poll).
+/// A weibo status mid is always alphanumeric; anything else (empty, or a
+/// value carrying URL/query punctuation) would corrupt the `?id={mid}` query
+/// it is spliced into, so both detail fetchers reject it up front. Mirrors the
+/// queryId charset check in x.rs (supply-chain defense against abnormal API
+/// data reaching the URL builder).
+fn is_safe_mid(mid: &str) -> bool {
+    !mid.is_empty() && mid.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 async fn fetch_vote_object(state: &AppState, cookies: &str, mid: &str) -> Option<Value> {
-    if mid.is_empty() {
-        warn!("fetch_vote_object: mid is empty, skipping");
+    if !is_safe_mid(mid) {
+        warn!("fetch_vote_object: mid empty or unsafe, skipping");
         return None;
     }
     let api = format!("https://weibo.com/ajax/statuses/show?id={}", mid);
@@ -483,8 +492,8 @@ async fn fetch_vote_object(state: &AppState, cookies: &str, mid: &str) -> Option
 /// reduced to 9 images would be completely invisible in production debugging
 /// (consistent with fetch_vote_object).
 async fn fetch_status_show(state: &AppState, cookies: &str, mid: &str) -> Option<Value> {
-    if mid.is_empty() {
-        warn!("fetch_status_show: mid is empty, skipping (falling back to list data)");
+    if !is_safe_mid(mid) {
+        warn!("fetch_status_show: mid empty or unsafe, skipping (falling back to list data)");
         return None;
     }
     let api = format!("https://m.weibo.cn/statuses/show?id={}", mid);
