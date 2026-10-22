@@ -513,23 +513,38 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
             }
             if para.contains("<pre") {
                 // Code block exceeds the limit: split on \n line boundaries,
-                // re-wrapping each chunk in its own <pre><code>.
+                // re-wrapping each chunk in its own wrapper tags.
                 // Extract the opening tag (may contain class="language-xxx")
-                // and the closing tag.
+                // and the closing tag. A bare <pre> without an inner <code>
+                // (common in external feeds) must be matched too: otherwise
+                // the original tag survives the strip and ends up nested
+                // inside the re-wrapped wrapper (malformed double-pre HTML).
                 static RE_PRE_OPEN: std::sync::LazyLock<regex::Regex> =
                     std::sync::LazyLock::new(|| {
                         regex::Regex::new(r"(?s)<pre\b[^>]*><code\b[^>]*>").unwrap()
                     });
-                let open_match = RE_PRE_OPEN.find(para.as_str());
-                let (open_tag, close_tag) = match open_match {
-                    Some(m) => (m.as_str().to_string(), "</code></pre>".to_string()),
-                    None => ("<pre><code>".to_string(), "</code></pre>".to_string()),
+                static RE_PRE_BARE: std::sync::LazyLock<regex::Regex> =
+                    std::sync::LazyLock::new(|| {
+                        regex::Regex::new(r"(?s)<pre\b[^>]*>").unwrap()
+                    });
+                let code_match = RE_PRE_OPEN.find(para.as_str());
+                let (open_tag, close_tag) = if let Some(m) = code_match.as_ref() {
+                    (m.as_str().to_string(), "</code></pre>".to_string())
+                } else if let Some(m) = RE_PRE_BARE.find(para.as_str()) {
+                    (m.as_str().to_string(), "</pre>".to_string())
+                } else {
+                    ("<pre><code>".to_string(), "</code></pre>".to_string())
                 };
                 let pre_start = para.find("<pre").unwrap_or(0);
                 let prefix = para[..pre_start].trim_end_matches('\n').to_string();
-                let inner = RE_PRE_OPEN
-                    .replace_all(&para[pre_start..], "")
-                    .replace("</code></pre>", "");
+                let inner = {
+                    let stripped = if code_match.is_some() {
+                        RE_PRE_OPEN.replace_all(&para[pre_start..], "").to_string()
+                    } else {
+                        RE_PRE_BARE.replace_all(&para[pre_start..], "").to_string()
+                    };
+                    stripped.replace(&close_tag, "")
+                };
                 let inner_limit = limit.saturating_sub(
                     utf16_len(&open_tag) + utf16_len(&close_tag),
                 );
@@ -709,9 +724,192 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
+/// HTML void elements: they never have a closing tag, so they must never be
+/// pushed onto the split-inheritance stack.
+const VOID_TAGS: [&str; 14] = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// A safe split position inside the scan window, with the tag-balance
+/// fragments needed to keep both sides well-formed on their own.
+struct CutCandidate {
+    /// Byte offset where the head chunk ends (always > 0).
+    pos: usize,
+    /// Full opening tags to prepend to the tail chunk (outermost first).
+    openers: String,
+    /// Closing tags to append to the head chunk (innermost first).
+    closers: String,
+}
+
+impl CutCandidate {
+    fn at(pos: usize, stack: &[(String, String)]) -> Self {
+        Self {
+            pos,
+            openers: stack.iter().map(|(_, tag)| tag.as_str()).collect(),
+            closers: stack
+                .iter()
+                .rev()
+                .map(|(name, _)| format!("</{name}>"))
+                .collect(),
+        }
+    }
+}
+
+/// Lowercased tag name of a tag token (`<name …>` or `</name>`), None when the
+/// token carries no name (`<>`).
+fn tag_name(tag: &str) -> Option<String> {
+    let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
+    let inner = inner.strip_prefix('/').unwrap_or(inner);
+    let name: String = inner.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    (!name.is_empty()).then(|| name.to_lowercase())
+}
+
+/// Result of scanning one split window.
+struct SplitScan {
+    /// Safe-position candidates by priority (see `scan_split_candidates`).
+    best: [Option<CutCandidate>; 4],
+    /// Open tags still spanning the window end: their fragments are needed to
+    /// balance the raw fallback cut.
+    end_stack: Vec<(String, String)>,
+    /// Largest byte offset a raw fallback cut can use without landing inside
+    /// a tag (an unterminated tag shrinks this to the tag's start).
+    window_end: usize,
+}
+
+/// True when `s` starts with `&` and could still grow into a complete entity
+/// reference — so the scan window ended inside an entity and a raw cut must
+/// back off before the `&`. A body containing `;` is a completed (or dead)
+/// reference, never a pending prefix.
+fn is_entity_prefix(s: &str) -> bool {
+    let Some(body) = s.strip_prefix('&') else {
+        return false;
+    };
+    if body.is_empty() || body.contains(';') {
+        return body.is_empty();
+    }
+    if let Some(hex) = body.strip_prefix('#') {
+        if let Some(x) = hex.strip_prefix(['x', 'X']) {
+            return x.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return hex.chars().all(|c| c.is_ascii_digit());
+    }
+    let mut chars = body.chars();
+    chars
+        .next()
+        .map(|c| c.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && chars.all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Back a raw cut position off the end of `window[..pos]` when the text there
+/// ends inside a partial entity reference (`&amp` without the `;` yet), so a
+/// fallback split never amputates an entity.
+fn entity_backoff(text: &str, pos: usize) -> usize {
+    let head = &text[..pos];
+    match head.rfind('&') {
+        Some(amp) if is_entity_prefix(&head[amp..]) => amp,
+        _ => pos,
+    }
+}
+
+/// Scan the first `limit` UTF-16 units of `text` for safe split positions.
+/// A position is safe only when it sits outside every tag and every entity
+/// reference, so no chunk can ever contain half of `<a href="…">` or `&amp;`.
+/// Returns candidates by priority: 0 = right after a closing tag, 1 = right
+/// before an opening tag, 2 = after whitespace in text, 3 = after a completed
+/// atomic token (entity, void or self-closing tag). The last occurrence
+/// within each priority wins. Text runs without whitespace (e.g. a long CJK
+/// anchor text) get no candidate here; they fall back to the raw cut, which
+/// `split_html_safe` balances with the stack state reported in `end_stack`.
+fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
+    let window = take_utf16_prefix(text, limit);
+    let mut best: [Option<CutCandidate>; 4] = Default::default();
+    // Open tags spanning the current scan position: (name, full opening tag).
+    let mut stack: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < window.len() {
+        let rest = &window[i..];
+        if rest.starts_with('<') {
+            // A raw '<' only starts a tag in this pipeline: visible text is
+            // escape_html'd (`&lt;`) and attribute values escape '>' as well.
+            let Some(gt) = rest.find('>') else {
+                // Unterminated tag: the raw cut cannot pass its start, and no
+                // further safe position exists in this window. Drop any
+                // candidate that would land inside the unterminated tag.
+                for slot in best.iter_mut() {
+                    if slot.as_ref().is_some_and(|c| c.pos > i) {
+                        *slot = None;
+                    }
+                }
+                return SplitScan {
+                    best,
+                    end_stack: stack,
+                    window_end: i,
+                };
+            };
+            let tag = &rest[..gt + 1];
+            let end = i + gt + 1;
+            match tag_name(tag) {
+                // Unnamed token (`<>`): inert, safe to split after.
+                None => best[3] = Some(CutCandidate::at(end, &stack)),
+                Some(name) if tag.starts_with("</") => {
+                    // Close: pop the matching open (implicitly closing any
+                    // unclosed inner tags). Orphan closes leave the stack.
+                    if let Some(idx) = stack.iter().rposition(|(n, _)| *n == name) {
+                        stack.truncate(idx);
+                    }
+                    best[0] = Some(CutCandidate::at(end, &stack));
+                }
+                Some(name) if tag.ends_with("/>") || VOID_TAGS.contains(&name.as_str()) => {
+                    // Self-contained opening token: nothing left unbalanced.
+                    if i > 0 {
+                        best[1] = Some(CutCandidate::at(i, &stack));
+                    }
+                    best[3] = Some(CutCandidate::at(end, &stack));
+                }
+                Some(name) => {
+                    // Opening tag that demands a close: split before it, never
+                    // right after it (the inherited opener would cost more
+                    // than such a cut consumes, risking zero progress).
+                    if i > 0 {
+                        best[1] = Some(CutCandidate::at(i, &stack));
+                    }
+                    stack.push((name, tag.to_string()));
+                }
+            }
+            i = end;
+            continue;
+        }
+        if let Some(m) = RE_ENTITY_REF.find(rest) {
+            i += m.end();
+            best[3] = Some(CutCandidate::at(i, &stack));
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        let next = i + c.len_utf8();
+        if c.is_whitespace() {
+            best[2] = Some(CutCandidate::at(next, &stack));
+        }
+        i = next;
+    }
+    SplitScan {
+        best,
+        end_stack: stack,
+        window_end: window.len(),
+    }
+}
+
 /// Split a single HTML paragraph that exceeds `limit` at safe positions:
-/// after closing tags (</a>, </b>, </i>) or before opening tags (<a, <b, <i).
-/// Falls back to char-boundary split if no safe position found.
+/// after closing tags, before opening tags, or after whitespace — never
+/// inside a tag or an entity reference. Tags still open at the cut are
+/// balanced by inheritance: the head chunk gets explicit closers and the tail
+/// chunk is re-opened with the same opening tags, so every chunk is
+/// well-formed Telegram HTML on its own. Text runs with no whitespace (a long
+/// CJK link text) fall back to a raw UTF-16 window cut, which is balanced the
+/// same way via the scan's end-of-window stack; the raw cut also backs off a
+/// pending entity so it never amputates `&amp`. A cut is taken at the limit
+/// itself when the window is pure text (nothing to balance).
 pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
     // Defense: limit=0 would cause a zero-progress infinite loop (all
     // current call sites use constants, so this cannot trigger).
@@ -719,59 +917,68 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut remaining = text.to_string();
 
+    // Absolute convergence guard: each iteration consumes at least one unit
+    // from `remaining`, so this can never trip for real inputs, but it turns
+    // any theoretical non-progress (pathological deep nesting vs a tiny
+    // limit) into a benign over-long tail instead of an infinite loop.
+    let mut iters = 0usize;
     while utf16_len(&remaining) > limit {
-        // Find the best split position within the first `limit` UTF-16 units
-        // (Telegram's length unit).
-        let window: String = take_utf16_prefix(&remaining, limit).to_string();
-
-        // Try to find a safe split point (search backwards from the end).
-        let mut split_pos = None;
-
-        // Priority 1: after a closing tag like </a>, </b>, </i>, </blockquote>
-        for tag in ["</blockquote>", "</a>", "</b>", "</i>"] {
-            if let Some(pos) = window.rfind(tag) {
-                let end = pos + tag.len();
-                // Make sure we're at a char boundary.
-                if window.is_char_boundary(end) {
-                    split_pos = Some(end);
-                    break;
-                }
-            }
+        iters += 1;
+        if iters > 200_000 {
+            chunks.push(remaining);
+            return chunks;
         }
-
-        // Priority 2: before an opening tag like <a, <b, <i
-        if split_pos.is_none() {
-            for tag in ["<a ", "<b>", "<i>"] {
-                if let Some(pos) = window.rfind(tag) {
-                    if pos > 0 && window.is_char_boundary(pos) {
-                        split_pos = Some(pos);
-                        break;
-                    }
-                }
-            }
+        let scan = scan_split_candidates(&remaining, limit);
+        // A safe candidate is usable only when the head it produces stays
+        // within `limit` once its re-wrapped closers are appended, AND the
+        // consumed prefix is longer than the openers re-prepended to the tail
+        // (otherwise the same fragment would be split forever).
+        let usable = |c: &&CutCandidate| {
+            utf16_len(&remaining[..c.pos]) + utf16_len(&c.closers) <= limit
+                && utf16_len(&remaining[..c.pos]) > utf16_len(&c.openers)
+        };
+        if let Some(c) = scan.best.iter().flatten().find(usable) {
+            chunks.push(format!("{}{}", &remaining[..c.pos], c.closers));
+            remaining = format!("{}{}", c.openers, &remaining[c.pos..]);
+            continue;
         }
-
-        // Priority 3: at a space or newline
-        if split_pos.is_none() {
-            if let Some(pos) = window.rfind([' ', '\n']) {
-                if window.is_char_boundary(pos + 1) {
-                    split_pos = Some(pos + 1);
-                }
-            }
+        // Raw fallback for a text run with no whitespace (e.g. one long CJK
+        // link text): cut at the UTF-16 window boundary minus the space the
+        // appended closers need, never inside an unterminated tag, and back
+        // off a pending entity so the head's end never splits `&amp`. Balance
+        // both sides with the stack that spans the cut.
+        let openers: String = scan.end_stack.iter().map(|(_, t)| t.as_str()).collect();
+        let closers: String = scan
+            .end_stack
+            .iter()
+            .rev()
+            .map(|(n, _)| format!("</{n}>"))
+            .collect();
+        // Reserve room for the closers so the head stays within `limit`; the
+        // reserve is capped at half the limit so the window keeps real width.
+        let reserve = utf16_len(&closers).min(limit / 2);
+        let raw_window = take_utf16_prefix(&remaining, limit - reserve)
+            .len()
+            .min(scan.window_end);
+        let mut cut = entity_backoff(&remaining, raw_window);
+        // Guarantee strict progress: the consumed prefix must outweigh the
+        // openers we hand to the tail. (Deep nesting under a tiny limit is the
+        // only way to hit this; accept a slightly over-limit head to advance.)
+        if utf16_len(&remaining[..cut]) <= utf16_len(&openers) {
+            cut = entity_backoff(
+                &remaining,
+                take_utf16_prefix(&remaining, utf16_len(&openers) + 1).len(),
+            );
         }
-
-        // Fallback: hard split at limit (char boundary).
-        let split_at = split_pos.unwrap_or_else(|| {
-            // Find the last valid char boundary at or before limit.
-            let mut pos = window.len();
-            while pos > 0 && !window.is_char_boundary(pos) {
-                pos -= 1;
-            }
-            pos
-        });
-
-        chunks.push(window[..split_at].to_string());
-        remaining = remaining[split_at..].to_string();
+        if cut == 0 {
+            cut = remaining
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+        }
+        chunks.push(format!("{}{}", &remaining[..cut], closers));
+        remaining = format!("{}{}", openers, &remaining[cut..]);
     }
 
     if !remaining.is_empty() {
@@ -1071,5 +1278,105 @@ mod tests {
         let out = normalize_blockquote_fold("<blockquote>甲</blockquote><blockquote>乙</blockquote>");
         assert_eq!(out.matches("</blockquote>").count(), 2, "got: {}", out);
         assert!(out.contains("甲") && out.contains("乙"), "got: {}", out);
+    }
+
+    // ===== split_html_safe: tag/entity atomicity (P1 batch A) =====
+
+    fn tag_balanced(c: &str) -> bool {
+        c.matches("<a ").count() == c.matches("</a>").count()
+            && c.matches("<b>").count() == c.matches("</b>").count()
+            && c.matches("<pre").count() == c.matches("</pre>").count()
+    }
+
+    #[test]
+    fn split_safe_long_anchor_never_splits_tag() {
+        // The original defect (P1#1): a single oversized anchor paragraph was
+        // hard-split inside the opening `<a href=…>` tag, leaving a chunk
+        // starting with a bare `href="…"`. Every chunk must now be well-formed.
+        // The limit stays above the open-tag width so a split point exists.
+        let inner = "字".repeat(100);
+        let html = format!(r#"<a href="https://ex.com/a/b?x=1&y=2">{inner}</a>"#);
+        let out = split_html_safe(&html, 60);
+        assert!(out.len() > 2);
+        for c in &out {
+            assert!(tag_balanced(c), "unbalanced anchor chunk: {c:?}");
+        }
+        // Content is preserved across the balanced re-wrapped fragments (the
+        // inner text is contiguous per chunk, not across chunk boundaries).
+        assert_eq!(out.iter().map(|c| c.matches('字').count()).sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn split_safe_never_splits_entity() {
+        // A chunk must never end with a partial entity reference (`&amp;` cut
+        // to `&am`). The old fallback hard-cut in the middle of entities.
+        let text = "ab&amp;".repeat(60);
+        let out = split_html_safe(&text, 23);
+        assert!(out.len() >= 5);
+        for c in &out {
+            assert!(!c.ends_with('&'), "chunk ends with dangling & {c}");
+            for probe in ["&am", "&amp", "&#3", "&not", "&gt", "&lt"] {
+                assert!(
+                    !(c.ends_with(probe) && !c.ends_with(&format!("{probe};"))),
+                    "split entity {probe:?} in {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_safe_balances_open_tags() {
+        // Text split while inside an open <b> must close it in the head and
+        // re-open it in the tail — never leave a chunk with a stray closer.
+        let text = format!("<b>{}</b>", "x".repeat(90));
+        let out = split_html_safe(&text, 20);
+        for c in &out {
+            assert!(
+                c.matches("<b>").count() == c.matches("</b>").count(),
+                "unbalanced <b>: {c}"
+            );
+        }
+        assert!(out.concat().matches('x').count() == 90, "content lost");
+    }
+
+    #[test]
+    fn split_html_oversized_bare_pre_rewraps_wellformed() {
+        // End-to-end (P1#2): external feeds commonly emit bare <pre> with no
+        // inner <code>. The old code matched only <pre><code>, left the
+        // original <pre> inside the extracted content and re-wrapped it,
+        // producing <pre><code><pre>… (double open). Every chunk must now have
+        // matched pre/code counts.
+        let text = format!("<pre>{}</pre>", "line of code here\n".repeat(30));
+        let out = split_html(&text, 50);
+        assert!(out.len() >= 2, "expected multiple chunks");
+        for c in &out {
+            assert_eq!(
+                c.matches("<pre").count(),
+                c.matches("</pre>").count(),
+                "unbalanced pre: {c}"
+            );
+            assert!(
+                !c.contains("<pre><code><pre"),
+                "double pre open in chunk: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_html_oversized_anchor_wellformed() {
+        // End-to-end (P1#1): an anchor whose text alone exceeds the limit is
+        // routed to split_html_safe via the no-tag branch; the old fallback
+        // cut inside `<a href=…>`. Now every chunk must keep <a> balanced.
+        let inner = "字".repeat(200);
+        let html = format!(r#"<a href="https://ex.com/x?y=1">{inner}</a>"#);
+        let out = split_html(&html, 60);
+        assert!(out.len() >= 3);
+        for c in &out {
+            assert_eq!(
+                c.matches("<a ").count(),
+                c.matches("</a>").count(),
+                "unbalanced anchor chunk: {c}"
+            );
+        }
     }
 }
