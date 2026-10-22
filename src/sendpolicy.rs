@@ -52,8 +52,10 @@ pub async fn flood_backoff(err_str: &str, tries: &mut u32, chat_id: i64) -> bool
 /// the media group.
 /// (#14 fix: extracted as a single module-level function, deduplicating the
 /// two original closures.)
-/// pub: the scheduler's transient RSS-fetch retries (is_fetch_transient_error)
-/// reuse the same criteria.
+/// pub: the scheduler's transient RSS-fetch retry (scheduler.rs `process_feed`,
+/// the v1.10.3 debounce path) reuses this same criterion via
+/// `sendpolicy::is_net_error`, so fetch and send classify connection errors
+/// identically.
 pub fn is_net_error(err_str: &str) -> bool {
     // Two reqwest-flavoured prefixes plus the pre-send DNS check from
     // fetcher.rs (entry + redirect hops): "dns resolve failed: ..." is

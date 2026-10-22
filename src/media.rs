@@ -537,7 +537,11 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
         req = req.header("Cookie", cookies);
     }
     let resp = req.send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
+    // Route through the shared capped JSON reader (same 20MB limit as the RSS
+    // pipeline and the other platform JSON reads). `.ok()?` keeps the previous
+    // silent-None-on-any-failure semantics; the only change is that an
+    // oversized/malformed API response can no longer buffer unbounded.
+    let json = crate::fetcher::read_json_capped(resp, "weibo HD playback API").await.ok()?;
 
     let list = json
         .pointer("/page_info/media_info/playback_list")
