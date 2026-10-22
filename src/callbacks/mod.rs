@@ -730,6 +730,17 @@ pub async fn handle_callback(
             ) {
                 let ch_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                // Range guard mirroring the chat-level cfgiv path: a forged or
+                // edge callback with a 0/negative interval makes the due check
+                // always true, hammering the source every tick (rate-limit /
+                // IP-ban risk). "inherit" clears the override and is allowed.
+                if parts[1] == "srcfi" && *val != "inherit" {
+                    let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
+                    if !ok {
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed")).await.ok();
+                        return Ok(());
+                    }
+                }
                 if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
                     let field = match parts[1] {
                         "srcfi" => "interval_minutes",
