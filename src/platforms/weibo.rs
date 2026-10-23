@@ -94,21 +94,16 @@ static RE_SINAURL_MD: LazyLock<regex::Regex> =
 /// guarantees this premise holds.
 static RE_SINAURL_HTML: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["'](https://weibo\.cn/sinaurl\?u=[^"']+)["'][^>]*>(.*?)</a>"#).unwrap());
-/// Video card links (video.weibo.com/show): the video has already been sent
-/// as media, so the card link in the body is removed.
-/// Tightened to the card form: must contain the url-icon icon span inside
-/// (the card signature), consistent with the vote card regex (same fix as
-/// #2), to avoid `.*?</a>` swallowing adjacent links under abnormal anchor
-/// structures.
-static RE_VIDEO_CARD_LINK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["'][^"']*video\.weibo\.com/show[^"']*["'][^>]*>.*?url-icon.*?</a>"#).unwrap());
-/// Vote card links (t.cn short links): the vote has already been converted
-/// to a TG native Poll, so the card link in the body is removed.
-/// Tightened to the vote card form: href is a t.cn short link and the anchor
-/// contains the url-icon icon span inside (the card signature), to avoid
-/// wrongly removing other t.cn short links that users share normally (#2 fix).
-static RE_VOTE_CARD_LINK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["'][^"']*t\.cn/[^"']*["'][^>]*>.*?url-icon.*?</a>"#).unwrap());
+/// Anchor tokens for the balanced card-link scan. The Rust regex crate has no
+/// lookahead, so the previous `.*?url-icon.*?</a>` card patterns could cross
+/// an earlier `</a>` and delete the body text between two anchors. The scan
+/// below matches anchors by nesting depth instead.
+static RE_ANCHOR_OPEN_ANY: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>").unwrap());
+static RE_ANCHOR_CLOSE_ANY: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?is)</a\s*>").unwrap());
+static RE_ANCHOR_HREF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?is)href\s*=\s*["']([^"']*)["']"#).unwrap());
 
 /// True when the feed URL is a weibo user homepage that should be fetched
 /// natively: https://weibo.com/u/<uid> (also m.weibo.cn / www variants).
@@ -148,16 +143,18 @@ pub fn parse_uid(url: &str) -> Option<String> {
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let uid = parse_uid(&url)
         .ok_or_else(|| anyhow::anyhow!("invalid weibo user homepage URL: {}", url))?;
-    fetch_weibo_user(state, &uid).await
+    fetch_weibo_user(state, &uid, known_sent).await
 }
 
 /// Fetch a weibo user timeline and convert to FetchResult.
 pub async fn fetch_weibo_user(
     state: &AppState,
     uid: &str,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let cookies = match state.get_cookie("weibo").await {
         Some(c) if !c.trim().is_empty() => c,
@@ -173,7 +170,7 @@ pub async fn fetch_weibo_user(
     // page HTML and produce a "JSON parse failed" error (without the "cookie"
     // substring), so neither the expiry flag nor the notification would trigger.
     // With redirects disabled, the is_redirection() branch below actually works.
-    let client = state.fetch_client_no_redirect_for_url(&api);
+    let client = state.media_client_for_url(&api);
     let resp = client
         .get(&api)
         .header("Cookie", &cookies)
@@ -190,7 +187,10 @@ pub async fn fetch_weibo_user(
     // string must contain the "cookie" substring: the scheduler uses it to set
     // the expiry flag (/cookies panel status + expiry notification).
     if status.is_redirection() {
-        anyhow::bail!("weibo cookie expired ({} redirected to login); please update via /cookies", status);
+        return Err(crate::platforms::auth_expired(
+            "Weibo",
+            format!("getIndex redirected to login (HTTP {})", status),
+        ));
     }
     if !status.is_success() {
         anyhow::bail!("weibo HTTP {}", status);
@@ -205,7 +205,10 @@ pub async fn fetch_weibo_user(
         // to set the cookie_expired_notified flag (/cookies panel status +
         // expiry notice).
         if msg.contains("登录") || msg.contains("验证") || msg.contains("login") {
-            anyhow::bail!("weibo cookie expired (API returned an error: {}); please update via /cookies", msg);
+            return Err(crate::platforms::auth_expired(
+                "Weibo",
+                format!("API returned an error: {}", msg),
+            ));
         }
         anyhow::bail!("weibo API returned an error: {}", msg);
     }
@@ -262,13 +265,19 @@ pub async fn fetch_weibo_user(
             tracing::debug!(
                 mid = %mblog_id,
                 is_vote = ?mblog["is_vote"].as_i64(),
-                has_card_link = RE_VOTE_CARD_LINK.is_match(text),
+                has_card_link = has_card_anchor(text, |href| href.contains("t.cn/")),
                 has_tcn = text.contains("t.cn/"),
                 page_info_type = ?mblog["page_info"]["type"].as_str(),
                 text_len = text.len(),
                 "weibo mblog vote signals"
             );
         }
+        // Already-pushed entries still appear in the timeline. Their detail /
+        // vote enrichment is pure overhead (and extra risk-control exposure),
+        // so skip those requests; the scheduler filters them from the push
+        // list via the same sent-entry set.
+        let known_entry = known_sent.is_some_and(|s| s.contains(&mblog_id));
+
         // Mutable copy: once detail data is fetched, overwrite pics in place /
         // extract the full text
         let mut mblog = mblog.clone();
@@ -283,7 +292,7 @@ pub async fn fetch_weibo_user(
         // the complete list.
         // The long-text full content and the extra images share this single
         // request; on failure fall back to the list data without losing the entry.
-        if status_needs_detail(&mblog) {
+        if !known_entry && status_needs_detail(&mblog) {
             if let Some(detail) = fetch_status_show(state, &cookies, &mblog_id).await {
                 if mblog["isLongText"].as_bool() == Some(true) {
                     full_text = detail["text"]
@@ -295,7 +304,7 @@ pub async fn fetch_weibo_user(
             }
         }
         // The retweeted status can also be long text / pic-truncated; same fix.
-        if status_needs_detail(&mblog["retweeted_status"]) {
+        if !known_entry && status_needs_detail(&mblog["retweeted_status"]) {
             let rt_mid = status_id_str(&mblog["retweeted_status"]).unwrap_or_default();
             if let Some(detail) = fetch_status_show(state, &cookies, &rt_mid).await {
                 if mblog["retweeted_status"]["isLongText"].as_bool() == Some(true) {
@@ -311,7 +320,7 @@ pub async fn fetch_weibo_user(
         // details (question/options/multi-select) must be fetched via the
         // desktop ajax/statuses/show endpoint. A failure does not block the
         // entry push (it degrades to plain text).
-        let vote_obj = if mblog["is_vote"].as_i64() == Some(1) {
+        let vote_obj = if !known_entry && mblog["is_vote"].as_i64() == Some(1) {
             fetch_vote_object(state, &cookies, &mblog_id).await
         } else {
             None
@@ -753,15 +762,92 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
 /// Returns the (possibly) cleaned body; callers assign it back.
 fn strip_pushed_card_links(mut body: String, page_type: &str, video_attached: bool, poll_attached: bool) -> String {
     if page_type == "video" && video_attached {
-        body = RE_VIDEO_CARD_LINK.replace_all(&body, "").to_string();
+        body = strip_card_anchors(&body, |href| href.contains("video.weibo.com/show"));
     }
     if poll_attached {
         // poll_attached is only true when the vote details were fetched and
         // converted (see the fetch loop / main-post call site), so no need to
         // re-check is_vote here.
-        body = RE_VOTE_CARD_LINK.replace_all(&body, "").to_string();
+        body = strip_card_anchors(&body, |href| href.contains("t.cn/"));
     }
     body
+}
+
+/// Remove anchors whose href satisfies `is_card` AND whose inner HTML carries
+/// the `url-icon` card marker. Uses a balanced anchor scan: Rust's regex
+/// crate has no lookahead, so the old `.*?url-icon.*?</a>` pattern could span
+/// an earlier `</a>` and delete the body text between two anchors.
+/// Byte spans of anchors whose href satisfies `is_card` and whose inner HTML
+/// carries the `url-icon` card marker. Unbalanced trailing anchors are left
+/// out (the caller keeps them untouched).
+fn card_anchor_spans(html: &str, is_card: impl Fn(&str) -> bool) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    while let Some(open) = RE_ANCHOR_OPEN_ANY.find(&html[pos..]) {
+        let start = pos + open.start();
+        let after_open = pos + open.end();
+        // Balanced scan for the matching </a>.
+        let mut depth = 1usize;
+        let mut cursor = after_open;
+        let mut close: Option<(usize, usize)> = None;
+        loop {
+            let next_open = RE_ANCHOR_OPEN_ANY.find(&html[cursor..]);
+            let next_close = RE_ANCHOR_CLOSE_ANY.find(&html[cursor..]);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o.start() < c.start() => {
+                    depth += 1;
+                    cursor += o.end();
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    let close_start = cursor + c.start();
+                    let close_end = cursor + c.end();
+                    if depth == 0 {
+                        close = Some((close_start, close_end));
+                        break;
+                    }
+                    cursor = close_end;
+                }
+                (Some(o), None) => {
+                    cursor += o.end();
+                }
+                (None, None) => break,
+            }
+        }
+        let Some((close_start, close_end)) = close else {
+            break;
+        };
+        let href = RE_ANCHOR_HREF
+            .captures(&html[start..after_open])
+            .map(|c| c[1].to_string())
+            .unwrap_or_default();
+        let inner = &html[after_open..close_start];
+        if is_card(&href) && inner.to_lowercase().contains("url-icon") {
+            spans.push((start, close_end));
+        }
+        pos = close_end;
+    }
+    spans
+}
+
+/// Whether the body contains at least one card anchor (used for diagnostics).
+fn has_card_anchor(html: &str, is_card: impl Fn(&str) -> bool) -> bool {
+    !card_anchor_spans(html, is_card).is_empty()
+}
+
+fn strip_card_anchors(html: &str, is_card: impl Fn(&str) -> bool) -> String {
+    let spans = card_anchor_spans(html, is_card);
+    if spans.is_empty() {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    for (start, end) in spans {
+        out.push_str(&html[pos..start]);
+        pos = end;
+    }
+    out.push_str(&html[pos..]);
+    out
 }
 
 /// Convert one mblog JSON object into a feed-rs Entry + structured metadata.
@@ -939,7 +1025,7 @@ fn mblog_to_entry(
     let published = parse_weibo_time(mblog["created_at"].as_str().unwrap_or(""));
 
     // Title: first 50 visible chars of text (strip tags)
-    let plain = strip_tags(&text);
+    let plain = crate::fetcher::html_to_plain(&text);
     let title = crate::platforms::make_title(&plain, "(微博)");
 
     let link = format!("https://weibo.com/{}/{}", uid, bid);
@@ -963,6 +1049,12 @@ fn mblog_to_entry(
 
 /// Parse weibo created_at. Handles absolute format and relative forms.
 fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
+    parse_weibo_time_at(s, Utc::now())
+}
+
+/// Testable core of parse_weibo_time: `now` is injected so the UTC/CST year
+/// boundary can be covered deterministically.
+fn parse_weibo_time_at(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     // Absolute: "Wed Sep 25 20:09:08 +0800 2026" — same format as Twitter's
     // created_at, but weibo's weekday field is not guaranteed to match the
     // date. So strip the first token (weekday) and let chrono parse the
@@ -976,7 +1068,6 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
     }
     // Relative: "刚刚" (just now) / "x分钟前" (x minutes ago) /
     // "x小时前" (x hours ago) / "昨天 HH:MM" (yesterday HH:MM)
-    let now = Utc::now();
     if s == "刚刚" {
         return Some(now);
     }
@@ -998,13 +1089,16 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
             return Some(dt.with_timezone(&Utc));
         }
     }
-    // "MM-DD" (this year)
+    // "MM-DD" (this year, in China Standard Time — the year must be taken
+    // from the CST calendar, not UTC: around New Year a CST 00:00-08:00 post
+    // would otherwise be parsed as Jan 1 of the previous year).
     if s.len() == 5 && s.chars().nth(2) == Some('-') {
+        let cst = *CST;
+        let cst_now = now.with_timezone(&cst);
         if let Ok(md) = chrono::NaiveDate::parse_from_str(
-            &format!("{}-{}", now.format("%Y"), s),
+            &format!("{}-{}", cst_now.format("%Y"), s),
             "%Y-%m-%d",
         ) {
-            let cst = *CST;
             let dt = md.and_hms_opt(0, 0, 0)?.and_local_timezone(cst).single()?;
             // Cross-year correction: weibo relative times carry no year, so a
             // post from last December fetched in January would be parsed as a
@@ -1018,6 +1112,14 @@ fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
             } else {
                 dt
             };
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    // "YYYY-MM-DD" (older posts / pinned posts: no year inference needed).
+    if s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
+        let cst = *CST;
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let dt = d.and_hms_opt(0, 0, 0)?.and_local_timezone(cst).single()?;
             return Some(dt.with_timezone(&Utc));
         }
     }
@@ -1530,13 +1632,6 @@ fn convert_emoji_markers(text: &str) -> String {
         .into_owned()
 }
 
-/// Strip HTML tags for title extraction. Thin alias (one-line forwarder) of
-/// `crate::fetcher::html_to_plain`, kept so the local call sites stay stable;
-/// behavior is exactly html_to_plain's, do not diverge it.
-fn strip_tags(html: &str) -> String {
-    crate::fetcher::html_to_plain(html)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1678,8 +1773,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_weibo_time_mm_dd_cst_new_year() {
+        // 2026-01-01 00:30 CST is still 2025-12-31 16:30 UTC. The year of a
+        // bare MM-DD must come from the CST calendar, otherwise "01-01" is
+        // parsed as Jan 1 of the previous year.
+        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 12, 31)
+            .unwrap()
+            .and_hms_opt(16, 30, 0)
+            .unwrap()
+            .and_utc();
+        let t = parse_weibo_time_at("01-01", now).expect("01-01 should parse");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(cst)
+            .single()
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn parse_weibo_time_full_date() {
+        let now = chrono::Utc::now();
+        let t = parse_weibo_time_at("2024-03-05", now).expect("YYYY-MM-DD should parse");
+        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2024, 3, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(cst)
+            .single()
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(t, expected);
+    }
+
+    #[test]
     fn strip_tags_works() {
-        assert_eq!(strip_tags("<a href=\"x\">hello</a><br/>world"), "helloworld");
+        assert_eq!(crate::fetcher::html_to_plain("<a href=\"x\">hello</a><br/>world"), "helloworld");
     }
 
     #[test]
@@ -2006,5 +2140,21 @@ mod tests {
         let out = render_weibo_markdown(input);
         assert!(out.contains("# comment"), "out: {}", out);
         assert!(!out.contains("<b>comment</b>"), "out: {}", out);
+    }
+
+    #[test]
+    fn card_anchor_scan_does_not_delete_between_anchors() {
+        // A bare video link followed by an unrelated card anchor: the old
+        // `.*?url-icon.*?</a>` pattern spanned from the first anchor to the
+        // second anchor's close and deleted the text between them.
+        let html = r#"<a href="https://video.weibo.com/show?fid=1">bare</a> KEEP <a href="https://video.weibo.com/show?fid=2"><span class="url-icon"></span>card</a>"#;
+        let out = strip_card_anchors(html, |href| href.contains("video.weibo.com/show"));
+        assert!(out.contains("bare"), "out: {}", out);
+        assert!(out.contains("KEEP"), "out: {}", out);
+        assert!(!out.contains("card"), "out: {}", out);
+        assert!(has_card_anchor(
+            r#"<a href="https://video.weibo.com/show?fid=1"><span class="url-icon"></span>视频</a>"#,
+            |href| href.contains("video.weibo.com/show")
+        ));
     }
 }

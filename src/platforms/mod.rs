@@ -80,6 +80,52 @@ pub fn make_entry(
     }
 }
 
+/// Typed platform failures. Authentication expiry is the only class that must
+/// set the cookie-expired flag and notify the admin; before this type the
+/// scheduler keyed that decision on the substring "cookie", so an x.com
+/// 429/5xx/Cloudflare response without ct0 was misclassified as an expired
+/// cookie and counted toward auto-disable.
+#[derive(Debug)]
+pub enum PlatformError {
+    AuthExpired {
+        platform: &'static str,
+        detail: String,
+    },
+    RateLimited {
+        platform: &'static str,
+        status: u16,
+    },
+}
+
+impl std::fmt::Display for PlatformError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlatformError::AuthExpired { platform, detail } => {
+                write!(f, "{} cookie expired: {}; please update via /cookies", platform, detail)
+            }
+            PlatformError::RateLimited { platform, status } => {
+                write!(f, "{} rate limited (HTTP {}); will retry later", platform, status)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlatformError {}
+
+/// Build an `AuthExpired` error (keeps the "cookie" wording for user-facing
+/// compatibility, but the scheduler detects it by type first).
+pub fn auth_expired(platform: &'static str, detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PlatformError::AuthExpired {
+        platform,
+        detail: detail.into(),
+    })
+}
+
+/// Build a `RateLimited` error: transient, must not be treated as auth expiry.
+pub fn rate_limited(platform: &'static str, status: u16) -> anyhow::Error {
+    anyhow::Error::new(PlatformError::RateLimited { platform, status })
+}
+
 /// Async fetch function registered per platform. Receives the full feed URL
 /// (owned, moved into the future); returns entries newest-first.
 /// Higher-ranked over the `AppState` borrow so the returned future may borrow
@@ -87,6 +133,7 @@ pub fn make_entry(
 pub type PlatformFetchFn = for<'a> fn(
     &'a AppState,
     String,
+    Option<&'a std::collections::HashSet<String>>,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<crate::fetcher::FetchResult>> + Send + 'a>>;
 
 /// Platform descriptor: identity (cookie panel) + routing (URL match,
@@ -119,7 +166,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
         needs_cookie: true,
         match_url: weibo::is_weibo_url,
         canonical_url: |url| weibo::parse_uid(url).map(|uid| format!("https://weibo.com/u/{}", uid)),
-        fetch: |state, url| Box::pin(weibo::fetch_by_url(state, url)),
+        fetch: |state, url, known| Box::pin(weibo::fetch_by_url(state, url, known)),
     },
     PlatformDef {
         id: "x",
@@ -136,7 +183,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
             x::parse_screen_name(url)
                 .map(|name| format!("https://x.com/{}", name.to_ascii_lowercase()))
         },
-        fetch: |state, url| Box::pin(x::fetch_by_url(state, url)),
+        fetch: |state, url, known| Box::pin(x::fetch_by_url(state, url, known)),
     },
     PlatformDef {
         id: "telegram",
@@ -150,7 +197,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
             telegram::parse_channel_name(url)
                 .map(|ch| format!("https://t.me/{}", ch.to_ascii_lowercase()))
         },
-        fetch: |state, url| Box::pin(telegram::fetch_by_url(state, url)),
+        fetch: |state, url, known| Box::pin(telegram::fetch_by_url(state, url, known)),
     },
 ];
 

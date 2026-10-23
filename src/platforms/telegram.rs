@@ -143,6 +143,21 @@ static RE_PHOTO_BG: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_VIDEO_SRC: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)<video\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap()
 });
+/// Non-text message containers. The web preview has no `js-message_text`
+/// div and no photo/video tag for these, so without a fallback the message
+/// would be dropped silently (see message_to_entry).
+static RE_MSG_POLL: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)tgme_widget_message_poll").unwrap());
+static RE_MSG_DOCUMENT: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)tgme_widget_message_document").unwrap());
+static RE_MSG_AUDIO: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)tgme_widget_message_(?:audio|voice)").unwrap());
+static RE_MSG_STICKER: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)tgme_widget_message_sticker").unwrap());
+/// Document file name shown in the preview (optional).
+static RE_DOC_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)tgme_widget_message_document_title[^>]*>(.*?)</span>"#).unwrap()
+});
 /// Timestamp of the message link. Used only relative to an anchor position
 /// (see `extract_published`) — never as "first datetime in the block", since
 /// the reply block precedes the main text and embeds the quoted message's own
@@ -179,6 +194,7 @@ static RE_DIV_CLOSE: LazyLock<regex::Regex> =
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
+    _known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let channel = parse_channel_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid Telegram channel URL: {}", url))?;
@@ -333,6 +349,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str) -> Option<En
     let reply_html = extract_reply_blockquote(block);
 
     // Compose body: reply quote at top (TG-style) + main text + media tags.
+    let link = format!("https://t.me/{}", data_post);
     let mut body = String::new();
     if !reply_html.is_empty() {
         body.push_str(&reply_html);
@@ -343,16 +360,46 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str) -> Option<En
     body.push_str(&main_html);
     append_media_tags(&mut body, block);
 
-    // Skip empty service messages (no text, no media).
+    // Native polls/documents/audio/stickers have no text container and no
+    // photo/video tag, so the body would be empty and the message silently
+    // dropped. Keep them as a link-only entry; genuine service messages
+    // (joins, pins, ...) are still skipped.
     if body.trim().is_empty() {
-        return None;
+        let marker: Option<String> = if RE_MSG_POLL.is_match(block) {
+            Some("🗳️".to_string())
+        } else if RE_MSG_DOCUMENT.is_match(block) {
+            let name = RE_DOC_TITLE
+                .captures(block)
+                .map(|c| crate::fetcher::html_to_plain(&c[1]))
+                .unwrap_or_default();
+            Some(if name.is_empty() {
+                "📎".to_string()
+            } else {
+                format!("📎 {}", crate::push::escape_html(&name))
+            })
+        } else if RE_MSG_AUDIO.is_match(block) {
+            Some("🎧".to_string())
+        } else if RE_MSG_STICKER.is_match(block) {
+            Some("🖼️".to_string())
+        } else {
+            None
+        };
+        match marker {
+            Some(m) => {
+                body = format!("<a href=\"{}\">{}</a>", crate::push::escape_attr(&link), m);
+            }
+            None => {
+                tracing::debug!(post = %data_post, "telegram message skipped (service or unsupported)");
+                return None;
+            }
+        }
     }
 
     // Title: plain-text first 50 visible chars (strip tags for display).
-    let plain = strip_tags_for_title(&main_html);
+    let plain = crate::fetcher::html_to_plain(&main_html);
     let title = crate::platforms::make_title(&plain, "(媒体消息)");
 
-    let link = format!("https://t.me/{}", data_post);
+
 
     Some(crate::platforms::make_entry(data_post.to_string(), title, feed_title.to_string(), body, "text/html", link, published))
 }
@@ -371,11 +418,12 @@ fn extract_reply_blockquote(block: &str) -> String {
     let open_end = reply_caps.get(0).map(|m| m.end()).unwrap_or(0);
     let inner = extract_balanced_anchor_inner(block, open_end);
 
-    // Author name (the channel/user being replied to).
+    // Author name (the channel/user being replied to). Use html_to_plain so
+    // entities in the name (`&amp;`) are decoded rather than shown literally.
     let author = RE_REPLY_AUTHOR
         .captures(&inner)
         .map(|c| {
-            crate::fetcher::strip_tags(&c[1]).trim().to_string()
+            crate::fetcher::html_to_plain(&c[1]).trim().to_string()
         })
         .unwrap_or_default();
 
@@ -544,11 +592,6 @@ fn balanced_close_start(
     None
 }
 
-/// Strip all HTML tags and decode entities, producing plain text for titles.
-fn strip_tags_for_title(html: &str) -> String {
-    crate::fetcher::html_to_plain(html)
-}
-
 /// Append `<img>`/`<video>` tags for the message's media to the body.
 fn append_media_tags(body: &mut String, block: &str) {
     for caps in RE_PHOTO_BG.captures_iter(block) {
@@ -599,8 +642,8 @@ mod tests {
     #[test]
     fn strip_tags_for_title_works() {
         let html = r#"Hello <b>world</b> <a href="https://example.com">link</a>"#;
-        assert_eq!(strip_tags_for_title(html), "Hello world link");
-        assert_eq!(strip_tags_for_title(""), "");
+        assert_eq!(crate::fetcher::html_to_plain(html), "Hello world link");
+        assert_eq!(crate::fetcher::html_to_plain(""), "");
     }
 
     #[test]
@@ -730,5 +773,26 @@ mod tests {
         let blocks = split_message_blocks(html);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, "telegram/1");
+    }
+
+    #[test]
+    fn non_text_messages_keep_a_link_entry() {
+        // Polls/documents/audio/stickers have no text container; they must
+        // become a link-only entry instead of being dropped silently.
+        let poll = r#"<div class="tgme_widget_message_poll"><div class="tgme_widget_message_poll_question">Q?</div></div>"#;
+        let entry = message_to_entry("chan/1", poll, "Chan").expect("poll entry");
+        let body = entry.content.unwrap().body.unwrap();
+        assert!(body.contains("https://t.me/chan/1"));
+        assert!(body.contains('🗳'));
+
+        let doc = r#"<div class="tgme_widget_message_document_wrap"><span class="tgme_widget_message_document_title">report.pdf</span></div>"#;
+        let entry = message_to_entry("chan/2", doc, "Chan").expect("document entry");
+        let body = entry.content.unwrap().body.unwrap();
+        assert!(body.contains("https://t.me/chan/2"));
+        assert!(body.contains("report.pdf"));
+
+        // Genuine service messages are still skipped.
+        let service = r#"<div class="tgme_widget_message_service">joined the channel</div>"#;
+        assert!(message_to_entry("chan/3", service, "Chan").is_none());
     }
 }

@@ -112,16 +112,18 @@ pub fn parse_screen_name(url: &str) -> Option<String> {
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let screen_name = parse_screen_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid X user profile URL: {}", url))?;
-    fetch_x_user(state, &screen_name).await
+    fetch_x_user(state, &screen_name, known_sent).await
 }
 
 /// Fetch an X user's timeline and convert to FetchResult.
 pub async fn fetch_x_user(
     state: &AppState,
     screen_name: &str,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let auth_token = match state.get_cookie("x").await {
         Some(c) if !c.trim().is_empty() => c,
@@ -134,7 +136,7 @@ pub async fn fetch_x_user(
     // The cached ct0 may have expired (403): clear the cache, re-fetch ct0 and
     // retry the whole flow once. Only a second 403 means the auth_token cookie
     // itself is dead.
-    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name).await;
+    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent).await;
     let result = match result {
         Err(e) if e.downcast_ref::<StaleCt0Error>().is_some() => {
             tracing::info!(screen_name = screen_name, "X ct0 looks stale; refreshing and retrying once");
@@ -147,13 +149,13 @@ pub async fn fetch_x_user(
                     fetched_at: Instant::now(),
                 });
             }
-            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name).await
+            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent).await
         }
         other => other,
     };
     result.map_err(|e| {
         if e.downcast_ref::<StaleCt0Error>().is_some() {
-            anyhow::anyhow!("X cookie expired (HTTP 403); please update via /cookies")
+            crate::platforms::auth_expired("X", "HTTP 403 after a ct0 refresh")
         } else {
             e
         }
@@ -165,12 +167,13 @@ async fn fetch_x_user_with_ct0(
     auth_token: &str,
     ct0: &str,
     screen_name: &str,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     // Step 2: resolve screen_name → rest_id + display name.
     let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;
 
     // Step 3: fetch user timeline.
-    let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name).await?;
+    let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name, known_sent).await?;
 
     // Step 4: convert to entries (dedup by entry id within the batch, matching
     // the Weibo behavior; fix for #8).
@@ -229,7 +232,7 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
     // ends up with the final page so is_redirection() never fires
     // (same lesson as Weibo's getIndex; see the comment on the
     // fetch_client_no_redirect_for_url call inside fetch_weibo_user in weibo.rs).
-    let client = state.fetch_client_no_redirect_for_url("https://x.com");
+    let client = state.media_client_for_url("https://x.com");
     let resp = client
         .get("https://x.com")
         .header("Cookie", format!("auth_token={}", auth_token))
@@ -248,11 +251,26 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
         }
     }
     if ct0.is_empty() {
-        // If no ct0 in response, the cookie is likely invalid (redirect to login).
-        if resp.status().is_redirection() {
-            anyhow::bail!("X cookie expired (302 redirect to login); please update via /cookies");
+        // No ct0 in the response. Only redirects/401/login pages mean the
+        // cookie is dead; 429/5xx/Cloudflare risk-control pages are transient
+        // and must NOT be reported as an expired cookie (the scheduler used
+        // to key cookie-expiry detection on the substring "cookie", so every
+        // such response wrongly notified the admin and counted toward
+        // auto-disable).
+        let status = resp.status();
+        if status.is_redirection()
+            || status == reqwest::StatusCode::UNAUTHORIZED
+            || resp.url().path().contains("/i/flow/login")
+        {
+            return Err(crate::platforms::auth_expired(
+                "X",
+                format!("ct0 missing (HTTP {})", status),
+            ));
         }
-        anyhow::bail!("Failed to obtain ct0 from x.com (the cookie may have expired); please update via /cookies");
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(crate::platforms::rate_limited("X", status.as_u16()));
+        }
+        anyhow::bail!("X ct0 unavailable (HTTP {}); response shape may have changed", status);
     }
     Ok(ct0)
 }
@@ -318,6 +336,11 @@ const QUERY_ID_DOC_URL: &str =
 
 /// Cached query IDs stay fresh this long before we re-fetch the document.
 const QUERY_ID_TTL: Duration = Duration::from_secs(6 * 3600);
+/// After a failed refresh, keep using cached/fallback IDs for this long before
+/// retrying the document. Without it, a jsdelivr outage made every GraphQL
+/// call (up to 4 per feed per round) retry the document request and burn its
+/// 30s client timeout on the serial platform channel.
+const QUERY_ID_NEGATIVE_TTL: Duration = Duration::from_secs(300);
 
 const OP_USER_BY_SCREEN_NAME: &str = "UserByScreenName";
 const OP_USER_TWEETS: &str = "UserTweets";
@@ -325,6 +348,7 @@ const OP_USER_TWEETS: &str = "UserTweets";
 struct QueryIdCache {
     ids: HashMap<String, String>,
     fetched_at: Option<Instant>,
+    last_failure: Option<Instant>,
 }
 
 static QUERY_IDS: OnceLock<Mutex<QueryIdCache>> = OnceLock::new();
@@ -334,6 +358,7 @@ fn query_id_cache() -> &'static Mutex<QueryIdCache> {
         Mutex::new(QueryIdCache {
             ids: HashMap::new(),
             fetched_at: None,
+            last_failure: None,
         })
     })
 }
@@ -353,10 +378,19 @@ fn fallback_query_id(op: &str) -> &'static str {
 /// fetch failure falls back to any stale cached ID, then to the constant.
 /// `force` bypasses the TTL (used after a suspected stale-ID 404).
 async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
-    // Fast path: a fresh cached ID.
+    // Fast path: a fresh cached ID, or a recent refresh failure (negative
+    // cache) — retrying the document on every GraphQL call would amplify an
+    // outage into multi-second stalls on the serial platform channel.
     {
         let cache = query_id_cache().lock().await;
         if !force {
+            if cache.last_failure.is_some_and(|t| t.elapsed() < QUERY_ID_NEGATIVE_TTL) {
+                return cache
+                    .ids
+                    .get(op)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_query_id(op).to_string());
+            }
             if let Some(at) = cache.fetched_at {
                 if at.elapsed() < QUERY_ID_TTL {
                     if let Some(id) = cache.ids.get(op) {
@@ -374,6 +408,7 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
             let resolved = ids.get(op).cloned();
             cache.ids = ids;
             cache.fetched_at = Some(Instant::now());
+            cache.last_failure = None;
             resolved.unwrap_or_else(|| fallback_query_id(op).to_string())
         }
         Err(e) => {
@@ -381,7 +416,8 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
             // under the "query-ID document request failed" context), so a
             // proxy/TLS failure here is distinguishable from a parse failure.
             tracing::warn!(error = format!("{:#}", e), op = op, "X query-ID refresh failed; using cached/fallback ID");
-            let cache = query_id_cache().lock().await;
+            let mut cache = query_id_cache().lock().await;
+            cache.last_failure = Some(Instant::now());
             cache
                 .ids
                 .get(op)
@@ -521,7 +557,7 @@ async fn gql_request_once(
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         // 401 = the auth_token itself is invalid; no point retrying.
-        anyhow::bail!("X cookie expired (HTTP 401); please update via /cookies");
+        return Err(crate::platforms::auth_expired("X", "HTTP 401"));
     }
     if status == reqwest::StatusCode::FORBIDDEN {
         // 403 may be an expired cached ct0 (rather than a dead cookie): throw
@@ -530,7 +566,7 @@ async fn gql_request_once(
         return Err(anyhow::Error::new(StaleCt0Error));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("X API rate limited (429); retry later");
+        return Err(crate::platforms::rate_limited("X", status.as_u16()));
     }
     if status == reqwest::StatusCode::NOT_FOUND {
         // A 404 on a GraphQL path almost always means the queryId no longer
@@ -604,6 +640,7 @@ async fn fetch_user_tweets(
     ct0: &str,
     rest_id: &str,
     screen_name: &str,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut tweets: Vec<Value> = Vec::new();
     // Accumulated across pages: distinguishes a "truly empty timeline" from
@@ -671,6 +708,17 @@ async fn fetch_user_tweets(
         let page = extract_timeline_page(instructions);
         total_non_cursor_entries += page.non_cursor_entries;
         let page_tweet_count = page.tweets.len();
+        // If every tweet on this page is already sent, older pages cannot
+        // contain unseen newer tweets; stop paginating to save requests
+        // (2 extra pages × 1.1s per X feed per round in the steady state).
+        // Pinned tweets are included in the check, so a pinned old tweet with
+        // unseen newer tweets on the same page still continues.
+        let page_all_known = known_sent.is_some_and(|known| {
+            !page.tweets.is_empty()
+                && page.tweets.iter().all(|t| {
+                    tweet_id_of(t).is_some_and(|id| known.contains(id))
+                })
+        });
         tweets.extend(page.tweets);
 
         // Stop conditions (none can loop forever): no bottom cursor, a cursor
@@ -682,6 +730,9 @@ async fn fetch_user_tweets(
         // re-pushes).
         let Some(next) = page.bottom_cursor else { break };
         if page_tweet_count == 0 || Some(&next) == cursor.as_ref() {
+            break;
+        }
+        if page_all_known {
             break;
         }
         cursor = Some(next);
@@ -1175,16 +1226,20 @@ fn tweet_full_text(result: &Value) -> String {
 }
 
 /// Append a RT/QT blockquote to the body. `prefix` = "RT" or "QT".
-/// `include_media`: whether to append the quoted tweet's media tags. Both
-/// call sites in tweet_to_entry now pass true (v1.10.16: QT media was
-/// included to match RT, so image-only quote tweets no longer degrade to
-/// plain text when the main tweet itself has no media); the flag is kept
-/// for flexibility and tests.
-/// M7 fix: the former RT and QT blocks (~25 lines) were verbatim duplicates;
+/// Quoted media is always included (QT matches RT, v1.10.16): an image-only
+/// quote tweet must not degrade to plain text when the main tweet itself has
+/// no media. M7 fix: the former RT and QT blocks were verbatim duplicates;
 /// collapsed into a single function.
-fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_media: bool) {
+fn append_quote_block(body: &mut String, result: &Value, prefix: &str) {
     // Handle TweetWithVisibilityResults wrapper (shared with tweet_to_entry).
     let result = unwrap_tweet_result(result);
+    // Deleted/protected quotes arrive as TweetTombstone/TweetUnavailable with
+    // no legacy payload. Rendering them produced an empty quote block and a
+    // bogus link to x.com/unknown (extract_screen_name falls back to
+    // "unknown").
+    if !quote_renderable(result) {
+        return;
+    }
     let legacy = &result["legacy"];
     let text = tweet_full_text(result);
     let screen = extract_screen_name(result);
@@ -1195,9 +1250,9 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str, include_m
         mentions.push(screen.to_string());
     }
     let mut inner = linkify_hashtags(&linkify_mentions(&tweet_text_to_html(&text), &mentions));
-    if include_media {
-        append_media_tags(&mut inner, legacy);
-    }
+    // Quoted media is always included (QT matches RT): an image-only quote
+    // tweet must not degrade to plain text when the main tweet has no media.
+    append_media_tags(&mut inner, legacy);
     // Link to the specific tweet if id is available, else user profile.
     let link = match legacy["id_str"].as_str() {
         Some(tid) => format!("https://x.com/{}/status/{}", screen, tid),
@@ -1284,7 +1339,7 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Conve
 
     // Retweet → blockquote (including the RT's media tags).
     if !rt.is_null() {
-        append_quote_block(&mut body, rt, "RT", true);
+        append_quote_block(&mut body, rt, "RT");
     }
 
     // Quote tweet → also blockquote (including the quoted tweet's media tags).
@@ -1294,7 +1349,7 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Conve
     // Changed to true to align with RT.
     let quote = &tweet["quoted_status_result"]["result"];
     if !quote.is_null() {
-        append_quote_block(&mut body, quote, "QT", true);
+        append_quote_block(&mut body, quote, "QT");
     }
 
     // Parse created_at: "Wed Oct 10 20:19:24 +0000 2018"
@@ -1308,6 +1363,29 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Conve
     ConvertOutcome::Ok(Box::new(crate::platforms::make_entry(
         id, title, display_name.to_string(), body, "text/html", link, published,
     )))
+}
+
+/// Stable tweet id of a timeline item (legacy id_str, then rest_id).
+fn tweet_id_of(value: &Value) -> Option<&str> {
+    let tr = unwrap_tweet_result(value);
+    tr["legacy"]["id_str"]
+        .as_str()
+        .or_else(|| tr["rest_id"].as_str())
+}
+
+/// Whether a quoted/retweeted payload is a real tweet (not a tombstone or
+/// an unavailable/protected placeholder) and carries something renderable.
+fn quote_renderable(tr: &Value) -> bool {
+    let legacy = &tr["legacy"];
+    if !legacy.is_object() {
+        return false;
+    }
+    let has_id = legacy["id_str"].as_str().is_some_and(|s| !s.is_empty())
+        || tr["rest_id"].as_str().is_some_and(|s| !s.is_empty());
+    let has_text = !tweet_full_text(tr).trim().is_empty();
+    let has_media = legacy["extended_entities"]["media"].is_array()
+        || legacy["entities"]["media"].is_array();
+    has_id && (has_text || has_media)
 }
 
 /// Extract screen_name from a tweet result object, trying multiple API paths.
@@ -1718,13 +1796,13 @@ mod tests {
         });
         // body non-empty: must have a \n separator
         let mut body = String::from("Grok <a href=\"https://x.com/Bot\">@Bot</a>");
-        append_quote_block(&mut body, &tweet, "QT", false);
+        append_quote_block(&mut body, &tweet, "QT");
         assert!(body.contains("@Bot</a>\n<blockquote>"), "missing \\n separator: {}", body);
         assert!(!body.contains("@Bot</a><blockquote>"), "blockquote glued to anchor: {}", body);
 
         // body empty (pure RT): no leading \n
         let mut empty_body = String::new();
-        append_quote_block(&mut empty_body, &tweet, "RT", false);
+        append_quote_block(&mut empty_body, &tweet, "RT");
         assert!(empty_body.starts_with("<blockquote>"), "empty body should not have leading \\n: {}", empty_body);
     }
 
@@ -1965,5 +2043,19 @@ mod tests {
             body,
             "<video src=\"https://video.twimg.com/z/g.mp4\"></video>"
         );
+    }
+
+    #[test]
+    fn tombstoned_quote_is_not_renderable() {
+        let tombstone: Value = serde_json::json!({
+            "__typename": "TweetTombstone",
+            "tombstone": { "text": { "text": "This Tweet is unavailable" } }
+        });
+        assert!(!quote_renderable(unwrap_tweet_result(&tombstone)));
+        let normal: Value = serde_json::json!({
+            "rest_id": "123",
+            "legacy": { "id_str": "123", "full_text": "hello" }
+        });
+        assert!(quote_renderable(&normal));
     }
 }
