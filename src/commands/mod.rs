@@ -142,9 +142,15 @@ async fn handle_start(bot: &Bot, msg: &Message, state: &AppState, user_id: i64) 
     let key = Lang::setting_key(user_id);
     let lang = match db::get_setting(&state.db, &key).await {
         Ok(Some(v)) => Lang::from_db_value(&v),
-        _ => {
+        Ok(None) => {
             // First time: persist detected language
             let _ = db::set_setting(&state.db, &key, detected.db_value()).await;
+            detected
+        }
+        Err(e) => {
+            // A transient read error must not overwrite the stored
+            // preference; use the detected language for this reply only.
+            tracing::warn!(user_id = user_id, error = %e, "language preference read failed, using detected value without persisting");
             detected
         }
     };
@@ -368,7 +374,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // NOT added. Otherwise the title falls back to the URL and, worse, the
         // "mark existing entries as read" step is skipped — the first successful
         // cycle would then dump the whole feed history into the channel.
-        let fetch_result = fetcher::fetch_feed(state, url_str, None, None).await;
+        let fetch_result = fetcher::fetch_feed(state, url_str, None, None, None).await;
         let fr = match fetch_result {
             Ok(fr) => fr,
             Err(e) => {
@@ -387,29 +393,16 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // Don't use try_or_reply!: a mid-batch DB error must not abort the whole command
         // (otherwise all accumulated results are lost and remaining URLs are never processed).
         // Record the error in results and continue.
-        let new_sub_id = match db::add_subscription(&state.db, &chat_id, url_str, title.as_deref()).await {
-            Ok(id) => id,
-            Err(e) => {
-                results.push(
-                    i18n::t(lang, "sub_add_failed")
-                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1)
-                );
-                continue;
-            }
-        };
-
-        // Mark all current entries as sent (only push future entries)
+        // Insert the subscription and mark all current entries as sent in a
+        // single transaction (only future entries are pushed). The previous
+        // two-step flow rolled back by deleting the returned row id, which for
+        // a re-enabled existing subscription was the user's original row —
+        // a mark failure deleted it. The transaction makes the rollback
+        // implicit and cannot touch pre-existing data.
         let ids: Vec<String> = fr.entries.iter().map(fetcher::entry_id).collect();
-        if let Err(e) = db::mark_all_entries_sent(&state.db, &chat_id, url_str, &ids).await {
-            // Subscription was inserted but entries were not marked read: roll back the delete,
-            // otherwise the first successful cycle would dump the entire feed history into the
-            // channel (the scenario warned about in the comment above).
-            tracing::warn!(feed = %url_str, error = %e, "mark_all_entries_sent failed, rolling back subscription");
-            if let Err(re) = db::delete_subscription(&state.db, new_sub_id).await {
-                tracing::warn!(feed = %url_str, error = %re, "rollback delete_subscription failed");
-            }
+        if let Err(e) = db::add_subscription_with_sent(&state.db, &chat_id, url_str, title.as_deref(), &ids).await {
             results.push(
-                i18n::t(lang, "sub_mark_failed")
+                i18n::t(lang, "sub_add_failed")
                     .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1)
             );
             continue;
@@ -550,7 +543,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         .await?;
     let progress_id = progress_msg.id;
 
-    let fr = match fetcher::fetch_feed(state, &feed_url, None, None).await {
+    let fr = match fetcher::fetch_feed(state, &feed_url, None, None, None).await {
         Ok(fr) => fr,
         Err(e) => {
             tracing::warn!(feed_url = %feed_url, error = %e, "/test: fetch failed");

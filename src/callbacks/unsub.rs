@@ -45,15 +45,8 @@ pub(super) async fn handle_unsub_callback(
         return Ok(());
     }
 
-    // Also drop any feed-level config overrides for this (chat, feed_url) so a
-    // later re-subscribe starts from the channel defaults instead of reviving
-    // stale per-feed settings. (chat_id, feed_url) is unique in subscriptions,
-    // so after the delete above no live subscription references this pair.
-    // Failures must be logged: otherwise the "unsubscribe clears config" contract is silently
-    // broken and stale config would revive on re-subscribe.
-    if let Err(e) = db::reset_feed_config(&state.db, &chat_id, &feed_url).await {
-        tracing::warn!(chat_id = %chat_id, feed = %feed_url, error = %e, "reset_feed_config failed on unsubscribe");
-    }
+    // feed_configs overrides are dropped inside delete_subscription's
+    // transaction, so a re-subscribe starts from channel defaults.
 
     info!(sub_id = sub_id, feed = %feed_url, "subscription removed");
 
@@ -308,11 +301,8 @@ pub(super) async fn handle_unsub_all_callback(
         }
     };
 
-    // Drop all feed-level config overrides for this chat so re-subscribes
-    // start from the channel defaults (no orphaned per-feed settings linger).
-    if let Err(e) = db::delete_feed_configs_for_chat(&state.db, chat_id).await {
-        tracing::warn!(chat_id = %chat_id, error = %e, "delete_feed_configs_for_chat failed on unsuball");
-    }
+    // feed_configs overrides are dropped inside delete_all_subscriptions'
+    // transaction, so re-subscribes start from channel defaults.
 
     info!(chat_id = chat_id, count = count, "all subscriptions removed with backup");
 

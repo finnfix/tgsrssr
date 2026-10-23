@@ -53,7 +53,9 @@ impl Lang {
 }
 
 /// Translate a static string by key.
-/// Falls back to the key itself if not found (should never happen in practice).
+/// A missing Chinese key falls back to the English text; a missing English key
+/// returns the "[?]" marker (caught by the completeness test, which extracts
+/// every key from this source).
 pub fn t(lang: Lang, key: &str) -> &'static str {
     match (lang, key) {
         // ===== Common =====
@@ -83,6 +85,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "op_failed") => "Operation failed: {:#}",
         (Lang::Zh, "set_failed") => "设置失败：{:#}",
         (Lang::En, "set_failed") => "Setting failed: {:#}",
+        (Lang::Zh, "invalid_interval") => "无效的间隔值（需 ≥1 分钟）",
+        (Lang::En, "invalid_interval") => "Invalid interval (must be at least 1 minute)",
 
         // ===== /start & /about =====
         (Lang::Zh, "start_text") => "你好，我是 RSS 订阅 Bot，将我加入频道或群组后开始工作。\n版本：v{}",
@@ -114,8 +118,6 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "sub_fetch_failed") => "• Fetch failed:\n<blockquote>{}</blockquote>",
         (Lang::Zh, "sub_add_failed") => "• 添加失败：\n<blockquote>{}</blockquote>",
         (Lang::En, "sub_add_failed") => "• Add failed:\n<blockquote>{}</blockquote>",
-        (Lang::Zh, "sub_mark_failed") => "• 标记已读失败（已回滚）：\n<blockquote>{}</blockquote>",
-        (Lang::En, "sub_mark_failed") => "• Mark-read failed (rolled back):\n<blockquote>{}</blockquote>",
         (Lang::Zh, "sub_reenabled") => "（已重新启用）",
         (Lang::En, "sub_reenabled") => " (re-enabled)",
         (Lang::Zh, "sub_platform_closed") => "• {} 源暂不可用：管理员未配置该平台的登录凭证",
@@ -417,7 +419,7 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Zh, "unsub_back") => "返回频道页",
         (Lang::En, "unsub_back") => "Back to channel",
         (Lang::Zh, "unsuball_confirm") => "确认退订 {} ({}) 的全部 {} 个订阅源？\n退订前会生成 OPML 备份文件发送给你。\n此操作不可恢复。",
-        (Lang::En, "unsuball_confirm") => "Unsubscribe all {} feeds from {} ({})?\nAn OPML backup will be sent to you first.\nThis cannot be undone.",
+        (Lang::En, "unsuball_confirm") => "Unsubscribe all feeds from {} ({})? {} feeds in total.\nAn OPML backup will be sent to you first.\nThis cannot be undone.",
         (Lang::Zh, "unsuball_confirm_btn") => "确认退订全部",
         (Lang::En, "unsuball_confirm_btn") => "Confirm unsubscribe all",
         (Lang::Zh, "unsuball_processing") => "⏳ 正在退订全部订阅…",
@@ -431,7 +433,7 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Zh, "unsuball_backup_failed") => "备份文件发送失败，已中止退订",
         (Lang::En, "unsuball_backup_failed") => "Backup file send failed, unsubscribe aborted",
         (Lang::Zh, "unsuball_ok") => "已退订 {} ({}) 的全部 {} 个源，OPML 备份已发送。",
-        (Lang::En, "unsuball_ok") => "Unsubscribed all {} feeds from {} ({}). OPML backup sent.",
+        (Lang::En, "unsuball_ok") => "Unsubscribed all feeds from {} ({}); {} feeds in total. OPML backup sent.",
         (Lang::Zh, "unsuball_view") => "查看频道页",
         (Lang::En, "unsuball_view") => "View channel page",
         (Lang::Zh, "unsuball_toast") => "已退订 {} 个源，备份已发送",
@@ -462,6 +464,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "notif_timeout_72h") => "Retry timeout (72h), entry abandoned.",
         (Lang::Zh, "notif_media_expired") => "仅媒体模式，但媒体文件已过期无法重试。",
         (Lang::En, "notif_media_expired") => "Media-only mode, but media files expired.",
+        (Lang::Zh, "notif_media_unreadable") => "仅媒体模式，但媒体记录为空或无法读取。",
+        (Lang::En, "notif_media_unreadable") => "Media-only mode, but the media record is empty or unreadable.",
         (Lang::Zh, "notif_media_dl_fail") => "仅媒体模式，媒体下载连续失败 {} 次，条目已放弃。",
         (Lang::En, "notif_media_dl_fail") => "Media-only mode, {} consecutive download failures, entry abandoned.",
         (Lang::Zh, "notif_video_oversized") => "视频{}未推送，已发送纯文本消息：\n{}",
@@ -501,8 +505,11 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Zh, "lang_switched") => "✅ 语言已切换为中文",
         (Lang::En, "lang_switched") => "✅ Language switched to English",
 
+        // Missing ZH translation: fall back to English rather than a marker,
+        // so a forgotten key degrades to the other language instead of "[?]".
+        (Lang::Zh, _) => t(Lang::En, key),
         // Fallback: return a static marker (should never happen in practice)
-        _ => "[?]",
+        (Lang::En, _) => "[?]",
     }
 }
 
@@ -536,10 +543,20 @@ mod tests {
 
     #[test]
     fn translation_completeness() {
-        // Verify a few keys exist in both languages
-        for key in ["close", "back", "start_text", "sub_usage", "test_usage"] {
-            assert_ne!(t(Lang::Zh, key), key, "Missing ZH translation for {key}");
-            assert_ne!(t(Lang::En, key), key, "Missing EN translation for {key}");
+        // Extract every (Lang::Zh, <quoted key>) pair from this source at
+        // compile time and assert both languages resolve to a real
+        // translation. The previous version checked five hardcoded keys and
+        // compared against the key itself, which always passed once the
+        // fallback was "[?]".
+        let src = include_str!("i18n.rs");
+        let re = regex::Regex::new(r#"\(Lang::Zh,\s*"([a-z0-9_]+)"\)"#).unwrap();
+        let mut checked = 0;
+        for caps in re.captures_iter(src) {
+            let key = &caps[1];
+            assert_ne!(t(Lang::Zh, key), "[?]", "Missing ZH translation for {key}");
+            assert_ne!(t(Lang::En, key), "[?]", "Missing EN translation for {key}");
+            checked += 1;
         }
+        assert!(checked > 150, "only {checked} keys extracted");
     }
 }

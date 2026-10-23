@@ -543,7 +543,7 @@ pub async fn handle_callback(
                 if field == "interval_minutes" {
                     let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
                     if !ok {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed")).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "invalid_interval")).await.ok();
                         return Ok(());
                     }
                 }
@@ -752,7 +752,20 @@ pub async fn handle_callback(
                     if let Some(chat) = chat {
                         let user_id = q.from.id.0 as i64;
                         bot.answer_callback_query(qid.clone()).await.ok();
-                        let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
+                        // A failed read must abort the flow: showing the
+                        // default "(none)" baseline would make the user's
+                        // reply overwrite the real keywords.
+                        let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
+                            Ok(fc) => fc,
+                            Err(e) => {
+                                tracing::warn!(sub_id = id, error = %e, "feed filter read failed, aborting keyword flow");
+                                bot.answer_callback_query(qid.clone())
+                                    .text(i18n::t(lang, "op_failed_retry"))
+                                    .await
+                                    .ok();
+                                return Ok(());
+                            }
+                        };
                         let current = if fc.keywords.is_empty() {
                             i18n::t(lang, "none").to_string()
                         } else {
@@ -791,7 +804,7 @@ pub async fn handle_callback(
                 if parts[1] == "srcfi" && *val != "inherit" {
                     let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
                     if !ok {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed")).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "invalid_interval")).await.ok();
                         return Ok(());
                     }
                 }
