@@ -2,7 +2,7 @@
 name = "tgsrssr"
 version = "1.15.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.96"
 description = "Telegram's RSS Rust — RSS subscription Telegram bot (Rust)"
 license = "MIT"
 

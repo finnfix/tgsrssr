@@ -324,7 +324,7 @@ services:
 ## 开发者：从源码构建
 
 ```bash
-# 需要 Rust 1.85+，sqlx 离线模式（无需运行中的数据库）
+# 需要 Rust 1.96+，sqlx 离线模式（无需运行中的数据库）
 SQLX_OFFLINE=true cargo build --release
 # 产物在 target/release/tgsrssr
 ```
@@ -668,7 +668,7 @@ The following notifications are sent to admins (`ADMIN_USER_IDS`):
 ## Developers: Build from Source
 
 ```bash
-# Requires Rust 1.85+, sqlx offline mode (no running database needed)
+# Requires Rust 1.96+, sqlx offline mode (no running database needed)
 SQLX_OFFLINE=true cargo build --release
 # Output at target/release/tgsrssr
 ```
