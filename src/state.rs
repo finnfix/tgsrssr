@@ -127,6 +127,17 @@ fn cap_host_buckets(map: &mut HashMap<String, Arc<Semaphore>>, host: &str) {
     }
 }
 
+/// RAII guard that clears an AtomicBool flag on every exit path. Shared by the
+/// fetch-cycle, outbox-retry and cleanup reentrancy guards (previously two
+/// byte-identical local guard structs).
+pub struct ActiveFlagGuard(pub Arc<AtomicBool>);
+
+impl Drop for ActiveFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -287,68 +298,63 @@ impl AppState {
     }
 
     /// Client routing decision: based on the insecure whitelist / no_proxy
-    /// list, decides which class of client the target URL should use.
-    /// client_for_url and media_client_for_url share this decision; only the
-    /// concrete client they map to differs (the media variants disable
-    /// auto-redirect).
-    fn route_kind(&self, url: &str) -> RouteKind {
+    /// list, decides which class of client the target URL should use and
+    /// whether the actual connection is made through the proxy. Both values
+    /// come from the same decision so callers cannot mix them (previously the
+    /// client was chosen from the original URL while the SSRF skip used the
+    /// redirect target's routing).
+    fn route_kind(&self, url: &str) -> (RouteKind, bool) {
         let host = url::Url::parse(url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
             .unwrap_or_default();
 
         // Whitelisted broken-cert hosts: skip TLS verification (scoped!).
-        let is_insecure = self.config.rss_insecure_hosts.iter().any(|np| {
-            host == *np || host.ends_with(&format!(".{}", np))
-        });
-        if is_insecure {
-            return RouteKind::Insecure;
+        // The insecure client is built with the proxy whenever RSS_PROXY is
+        // set (even for a host also listed in RSS_NO_PROXY), so via_proxy
+        // follows that construction.
+        if crate::config::host_in_list(&host, &self.config.rss_insecure_hosts) {
+            return (RouteKind::Insecure, self.config.rss_proxy.is_some());
         }
 
         if self.config.rss_proxy.is_none() {
-            return RouteKind::Direct;
+            return (RouteKind::Direct, false);
         }
-        let is_no_proxy = self.config.rss_no_proxy.iter().any(|np| {
-            let np = np.trim().trim_start_matches('.').to_lowercase();
-            host == np || host.ends_with(&format!(".{}", np))
-        });
-        if is_no_proxy {
-            RouteKind::Direct
+        if crate::config::host_in_list(&host, &self.config.rss_no_proxy) {
+            (RouteKind::Direct, false)
         } else {
-            RouteKind::Proxy
+            (RouteKind::Proxy, true)
         }
     }
 
     /// Choose the appropriate HTTP client based on no_proxy rules and the
     /// insecure-host whitelist.
     pub fn client_for_url(&self, url: &str) -> &reqwest::Client {
-        match self.route_kind(url) {
+        match self.route_kind(url).0 {
             RouteKind::Insecure => &self.http_insecure,
             RouteKind::Direct => &self.http_direct,
             RouteKind::Proxy => &self.http,
         }
     }
 
-    /// Feed-fetch specific: same routing rules as client_for_url, but returns
-    /// a client with **auto-redirect disabled** (reusing the media-family
-    /// clients). SSRF protection: fetch_feed follows redirects manually hop
-    /// by hop and re-runs is_private_url on each hop, preventing a malicious
-    /// source from 302-redirecting to an intranet address to bypass the
-    /// entry check.
-    pub fn fetch_client_no_redirect_for_url(&self, url: &str) -> &reqwest::Client {
-        self.media_client_for_url(url)
-    }
-
     /// Media-download specific client selection: same routing rules as
     /// client_for_url (no_proxy / insecure whitelist), but returns a client
     /// with auto-redirect disabled (SSRF protection: download_one follows
-    /// redirects manually hop by hop and re-runs is_private_url on each hop).
+    /// redirects manually hop by hop and re-runs the SSRF check on each hop).
     pub fn media_client_for_url(&self, url: &str) -> &reqwest::Client {
-        match self.route_kind(url) {
+        self.media_route_for_url(url).0
+    }
+
+    /// Like media_client_for_url, but also reports whether that client routes
+    /// the connection through the proxy. Used for per-hop redirect checks.
+    pub fn media_route_for_url(&self, url: &str) -> (&reqwest::Client, bool) {
+        let (kind, via_proxy) = self.route_kind(url);
+        let client = match kind {
             RouteKind::Insecure => &self.media_insecure,
             RouteKind::Direct => &self.media_direct,
             RouteKind::Proxy => &self.media,
-        }
+        };
+        (client, via_proxy)
     }
 
     /// Whether this URL's connection will be made via the RSS_PROXY proxy
@@ -359,7 +365,7 @@ impl AppState {
     /// (v1.10.14: fixed false blocks caused by local DNS resolving CDN
     /// domains to private addresses).
     pub fn is_routed_via_proxy(&self, url: &str) -> bool {
-        matches!(self.route_kind(url), RouteKind::Proxy)
+        self.route_kind(url).1
     }
 }
 

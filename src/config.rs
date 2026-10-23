@@ -182,6 +182,17 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// True when `host` equals a list entry or is a subdomain of it. Entries are
+/// normalized like the env parsers (trim whitespace, drop a leading dot,
+/// lowercase). Shared by proxy/insecure/img-relay host matching.
+pub(crate) fn host_in_list(host: &str, list: &[String]) -> bool {
+    let host = host.to_lowercase();
+    list.iter().any(|entry| {
+        let entry = entry.trim().trim_start_matches('.').to_lowercase();
+        !entry.is_empty() && (host == entry || host.ends_with(&format!(".{}", entry)))
+    })
+}
+
 fn env_parse_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
     match std::env::var(key) {
         Err(_) => default,
@@ -231,7 +242,7 @@ fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_single_admin;
+    use super::{host_in_list, validate_single_admin};
 
     #[test]
     fn single_admin_accepted() {
@@ -249,5 +260,15 @@ mod tests {
         let err = validate_single_admin(vec![1, 2]).unwrap_err().to_string();
         assert!(err.contains("exactly one"), "unexpected message: {}", err);
         assert!(err.contains("got 2"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn host_in_list_matches_exact_and_subdomains() {
+        let list = vec!["example.com".to_string(), ".internal".to_string()];
+        assert!(host_in_list("example.com", &list));
+        assert!(host_in_list("www.example.com", &list));
+        assert!(host_in_list("a.internal", &list));
+        assert!(!host_in_list("badexample.com", &list));
+        assert!(!host_in_list("example.com.evil.org", &list));
     }
 }

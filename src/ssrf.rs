@@ -39,6 +39,10 @@ pub enum SsrfOutcome {
     Private,
     /// DNS resolution failed (transient): cannot confirm the target.
     LookupFailed,
+    /// The URL could not be parsed or has no host: blocked, but reported
+    /// separately so callers do not label a malformed media URL as a private
+    /// address.
+    InvalidUrl,
 }
 
 /// Resolve `host:port` and classify every returned address. Shared by the
@@ -73,12 +77,14 @@ fn classify_addrs(addrs: &[SocketAddr]) -> SsrfOutcome {
 
 /// Three-state SSRF verdict. See SsrfOutcome.
 pub async fn ssrf_check(url: &str) -> SsrfOutcome {
-    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::Private };
-    let Some(host) = u.host_str() else { return SsrfOutcome::Private };
-    // Only http/https allowed; other schemes (file, ftp…) blocked.
+    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::InvalidUrl };
+    // Only http/https allowed; other schemes (file, ftp, ws…) blocked. Check
+    // the scheme before host_str: file URLs parse without a host and would
+    // otherwise be reported as an invalid URL instead of a blocked scheme.
     if u.scheme() != "http" && u.scheme() != "https" {
         return SsrfOutcome::Private;
     }
+    let Some(host) = u.host_str() else { return SsrfOutcome::InvalidUrl };
     // Literal IP: check directly.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_private_ip(&ip) {
@@ -90,16 +96,6 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
     // Hostname: async DNS lookup, check all returned addresses.
     let port = u.port_or_known_default().unwrap_or(443);
     lookup_classify(host, port).await.0
-}
-
-/// SSRF guard: reject URLs whose host resolves to a private/loopback address.
-/// Covers 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, ::1, fc00::/7.
-/// Shared by the feed-fetch path and the media download path
-/// (same private-address determination for both). DNS failures fold into
-/// `true` (fail-closed) — callers wanting the three-state verdict (to retry
-/// transient lookups) use ssrf_check directly.
-pub async fn is_private_url(url: &str) -> bool {
-    matches!(ssrf_check(url).await, SsrfOutcome::Private | SsrfOutcome::LookupFailed)
 }
 
 /// Connection-layer DNS guard closing the rebinding window of the pre-check.
@@ -138,7 +134,7 @@ impl Resolve for GuardedResolver {
                 // io::Error mirrors hyper-util's GaiResolver error type; the
                 // message keeps the "dns resolve failed" substring so
                 // sendpolicy::is_net_error classifies DNS blips as transient.
-                SsrfOutcome::Private | SsrfOutcome::LookupFailed => {
+                SsrfOutcome::Private | SsrfOutcome::LookupFailed | SsrfOutcome::InvalidUrl => {
                     warn!(host = %host, "ssrf: connection-layer DNS guard rejected lookup");
                     Err(Box::new(std::io::Error::other(GUARD_RESOLVE_FAILED))
                         as Box<dyn std::error::Error + Send + Sync>)
@@ -170,10 +166,26 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 return is_private_ip(&std::net::IpAddr::V4(v4));
             }
             let seg = v6.segments();
+            // NAT64: 64:ff9b::/96 embeds the IPv4 target in the last 32 bits.
+            // The local-use range 64:ff9b:1::/48 has no fixed embedding, so
+            // block the whole 64:ff9b::/32 prefix outright.
+            if seg[0] == 0x0064 && seg[1] == 0xff9b {
+                if seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+                    let v4 = std::net::Ipv4Addr::new(
+                        (seg[6] >> 8) as u8,
+                        seg[6] as u8,
+                        (seg[7] >> 8) as u8,
+                        seg[7] as u8,
+                    );
+                    return is_private_ip(&std::net::IpAddr::V4(v4));
+                }
+                return true;
+            }
             v6.is_loopback()                     // ::1
                 || (seg[0] & 0xfe00) == 0xfc00   // fc00::/7 ULA
                 || v6.is_unspecified()
                 || (seg[0] & 0xffc0) == 0xfe80   // fe80::/10 link-local
+                || (seg[0] & 0xff00) == 0xff00   // ff00::/8 multicast
                 || seg[0] == 0x2002              // 2002::/16 6to4 (embeds arbitrary IPv4)
                 || seg[0] == 0x2001 && seg[1] == 0 // 2001::/32 Teredo (embeds arbitrary IPv4)
         }
@@ -200,6 +212,18 @@ mod tests {
         assert_eq!(classify_addrs(&[sa("93.184.216.34", 0), sa("127.0.0.1", 0)]), SsrfOutcome::Private);
         assert_eq!(classify_addrs(&[sa("169.254.169.254", 0)]), SsrfOutcome::Private);
         assert_eq!(classify_addrs(&[sa("::1", 0)]), SsrfOutcome::Private);
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_and_multicast_blocked() {
+        // 64:ff9b::/96 embeds the IPv4 target in the last 32 bits.
+        assert!(is_private_ip(&"64:ff9b::a9fe:a9fe".parse().unwrap())); // 169.254.169.254
+        assert!(is_private_ip(&"64:ff9b::7f00:1".parse().unwrap())); // 127.0.0.1
+        assert!(!is_private_ip(&"64:ff9b::808:808".parse().unwrap())); // 8.8.8.8 public
+        // Local-use NAT64 prefix has no fixed embedding: blocked wholesale.
+        assert!(is_private_ip(&"64:ff9b:1::1".parse().unwrap()));
+        // IPv6 multicast.
+        assert!(is_private_ip(&"ff02::1".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -241,8 +265,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
             assert_eq!(ssrf_check("file:///etc/passwd").await, SsrfOutcome::Private);
-            assert_eq!(ssrf_check("gopher://example.com").await, SsrfOutcome::Private);
-            assert_eq!(ssrf_check("not a url").await, SsrfOutcome::Private);
+            assert_eq!(ssrf_check("ws://example.com").await, SsrfOutcome::Private);
+            // Some non-special schemes fail Url::parse outright (reported as
+            // InvalidUrl): either way they must never be Allowed.
+            assert_ne!(ssrf_check("gopher://example.com").await, SsrfOutcome::Allowed);
+            assert_eq!(ssrf_check("not a url").await, SsrfOutcome::InvalidUrl);
         });
     }
 }

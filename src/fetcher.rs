@@ -151,11 +151,14 @@ pub async fn fetch_feed(
     feed_url: &str,
     etag: Option<&str>,
     last_modified: Option<&str>,
+    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<FetchResult> {
     // Native platform fetch (weibo / X / Telegram): bypass the RSS/HTTP
     // pipeline entirely. Registry-driven — new platforms route automatically.
+    // `known_sent` lets platform fetchers skip enrichment requests for entries
+    // the scheduler already pushed (Weibo long-text/vote detail, X pagination).
     if let Some(p) = crate::platforms::platform_for_url(feed_url) {
-        return (p.fetch)(state, feed_url.to_string()).await;
+        return (p.fetch)(state, feed_url.to_string(), known_sent).await;
     }
 
     let _permit = state.fetch_semaphore.acquire().await
@@ -183,6 +186,9 @@ pub async fn fetch_feed(
             crate::ssrf::SsrfOutcome::LookupFailed => {
                 anyhow::bail!("dns resolve failed: {}", feed_url);
             }
+            crate::ssrf::SsrfOutcome::InvalidUrl => {
+                anyhow::bail!("invalid feed URL: {}", feed_url);
+            }
             crate::ssrf::SsrfOutcome::Allowed => {}
         }
     }
@@ -196,7 +202,7 @@ pub async fn fetch_feed(
     let resp;
     let mut hops = 0u32;
     loop {
-        let client = state.fetch_client_no_redirect_for_url(&cur_url);
+        let client = state.media_client_for_url(&cur_url);
         let mut req = client
             .get(&cur_url)
             .header("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml, */*");
@@ -246,6 +252,9 @@ pub async fn fetch_feed(
                     }
                     crate::ssrf::SsrfOutcome::LookupFailed => {
                         anyhow::bail!("dns resolve failed: {}", next_str);
+                    }
+                    crate::ssrf::SsrfOutcome::InvalidUrl => {
+                        anyhow::bail!("invalid redirect URL: {}", next_str);
                     }
                     crate::ssrf::SsrfOutcome::Allowed => {}
                 }
@@ -339,12 +348,28 @@ pub fn entry_id(entry: &Entry) -> String {
     if let Some(l) = &entry.links.first() {
         return l.href.clone();
     }
-    // Fallback: title + published timestamp (avoid same-title entries deduping each other)
+    // Fallback: title + published timestamp + body hash. The hash keeps
+    // distinct entries with the same title and no timestamp from sharing a
+    // dedup key (the old `t:title:` key made one of them skip forever).
     let title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
     let ts = entry.published.or(entry.updated)
         .map(|d| d.timestamp().to_string())
         .unwrap_or_default();
-    format!("t:{}:{}", title, ts)
+    let body = entry
+        .content
+        .as_ref()
+        .and_then(|c| c.body.clone())
+        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
+        .unwrap_or_default();
+    let hash: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(body.as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    };
+    format!("t:{}:{}:{}", title, ts, hash)
 }
 
 /// Extract entry link.

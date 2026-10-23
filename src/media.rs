@@ -12,7 +12,6 @@ use crate::fetcher;
 // name so call sites stay unchanged.
 use crate::fetcher::{RE_IMG as RE_IMG_TAG, RE_VIDEO_BLOCK};
 use crate::state::AppState;
-use crate::ssrf::is_private_url;
 
 /// Static regexes for media URL extraction (extract_media_urls runs once per
 /// entry).
@@ -642,6 +641,24 @@ fn kind_label(lang: crate::i18n::Lang, kind: &MediaKind) -> &'static str {
     }
 }
 
+/// Resolve a possibly-relative media URL against the entry link. Feeds are
+/// required to resolve relative references against the entry/feed base;
+/// doing it here keeps download_one's SSRF check from rejecting a raw
+/// relative path as an invalid (and therefore "private") URL.
+fn absolutize_media_url(entry: &Entry, raw: &str) -> String {
+    if url::Url::parse(raw).is_ok() {
+        return raw.to_string();
+    }
+    let Some(base) = entry.links.first().map(|l| l.href.as_str()) else {
+        return raw.to_string();
+    };
+    url::Url::parse(base)
+        .ok()
+        .and_then(|b| b.join(raw).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
 /// Extract candidate media URLs from an entry: media objects/enclosures first,
 /// then <img>/<video>/<source> tags inside the body HTML.
 /// Returns (url, kind, mime, is_retweet) — is_retweet is true for images
@@ -650,6 +667,7 @@ fn kind_label(lang: crate::i18n::Lang, kind: &MediaKind) -> &'static str {
 pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMeta>) -> Vec<(String, MediaKind, String, bool)> {
     let mut out: Vec<(String, MediaKind, String, bool)> = Vec::new();
     let mut push = |url: String, mime: String, is_rt: bool| {
+        let url = absolutize_media_url(entry, &url);
         if url.is_empty() || out.iter().any(|(u, _, _, _)| *u == url) || out.len() >= MAX_MEDIA_PER_ENTRY
         {
             return;
@@ -789,7 +807,10 @@ pub fn extract_video_posters(entry: &Entry) -> Vec<(String, String)> {
             continue;
         };
         if !poster.is_empty() && !src.is_empty() {
-            out.push((src, poster));
+            out.push((
+                absolutize_media_url(entry, &src),
+                absolutize_media_url(entry, &poster),
+            ));
         }
     }
     out
@@ -1041,18 +1062,6 @@ async fn download_one(
     outbound: &std::path::Path,
     transport: &MediaTransport,
 ) -> anyhow::Result<DownloadOutcome> {
-    // SSRF protection: reject media URLs pointing at private/loopback
-    // addresses (a malicious feed could use them to probe the internal
-    // network).
-    // Requests routed via a proxy have their connection established on the
-    // proxy side, so the local DNS resolution result does not affect the
-    // actual connection target — skip the check (otherwise local DNS
-    // resolving a CDN domain to a private address would be wrongly blocked,
-    // v1.10.14).
-    if !state.is_routed_via_proxy(url) && is_private_url(url).await {
-        anyhow::bail!("blocked: private/loopback address");
-    }
-
     // Per-host concurrency limit: prevents opening too many connections to a
     // single CDN at once, which would trigger rate limiting / risk control.
     // Stacks with the global download_semaphore (global controls the total,
@@ -1063,9 +1072,6 @@ async fn download_one(
         Err(_) => anyhow::bail!("host download semaphore closed"),
     };
 
-    // Media download client: automatic redirects disabled (SSRF protection;
-    // redirects are followed manually hop-by-hop below).
-    let client = state.media_client_for_url(url);
     // All media types (images/videos/files) are uniformly bounded by
     // MAX_VIDEO_PUSH_MB (default 100MB) and the transport cap (49MB via
     // official API, 2GB via local Bot API): prevents oversized uploads.
@@ -1094,8 +1100,26 @@ async fn download_one(
             let mut resp;
             let mut hops = 0u32;
             loop {
-                // The client has automatic redirects disabled
-                // (media_client_for_url); follow them manually here.
+                // The client and the proxy-skip decision come from the URL
+                // actually being requested (per hop), so a direct no-proxy URL
+                // cannot 302 to a private literal IP with the check skipped.
+                let (client, via_proxy) = state.media_route_for_url(&cur_url);
+                if !via_proxy {
+                    match crate::ssrf::ssrf_check(&cur_url).await {
+                        crate::ssrf::SsrfOutcome::Private => {
+                            anyhow::bail!("blocked: private/loopback address: {}", cur_url);
+                        }
+                        crate::ssrf::SsrfOutcome::LookupFailed => {
+                            anyhow::bail!("dns resolve failed: {}", cur_url);
+                        }
+                        crate::ssrf::SsrfOutcome::InvalidUrl => {
+                            anyhow::bail!("invalid media URL: {}", cur_url);
+                        }
+                        crate::ssrf::SsrfOutcome::Allowed => {}
+                    }
+                }
+                // The client has automatic redirects disabled; follow them
+                // manually here.
                 let mut req = client.get(&cur_url)
                     .timeout(std::time::Duration::from_secs(300));
                 if let Some(referer) = referer_for(url) {
@@ -1114,14 +1138,9 @@ async fn download_one(
                     let next = url::Url::parse(&cur_url)
                         .and_then(|base| base.join(loc))
                         .map_err(|e| anyhow::anyhow!("bad redirect Location: {}", e))?;
-                    let next_str = next.to_string();
-                    // When routed via a proxy, redirects are also followed on
-                // the proxy side, so the local DNS check is meaningless
-                // (same as the entry check).
-                    if !state.is_routed_via_proxy(&next_str) && is_private_url(&next_str).await {
-                        anyhow::bail!("blocked: redirect to private/loopback address");
-                    }
-                    cur_url = next_str;
+                    // Scheme and private-address checks run at the top of the
+                    // next iteration, against the URL actually requested.
+                    cur_url = next.to_string();
                     continue;
                 }
                 resp = r;
@@ -1199,6 +1218,9 @@ async fn download_one(
                             || es.contains("timed out")
                             || es.contains("timeout")
                             || es.contains("connection")
+                            // SSRF pre-check DNS blip: transient, retry instead
+                            // of classifying the media as permanently blocked.
+                            || es.contains("dns resolve failed")
                             || es.contains("incomplete")));
                 if !transient || attempt + 1 == ATTEMPTS {
                     break;
@@ -1287,7 +1309,7 @@ pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f
         // aspect ratio > 4:1 → the short side becomes too small after
         // compression; convert to document to preserve the original
         let longest = width.max(height);
-        if longest > 1280 && (ratio > 4.0 || ratio < 0.25) {
+        if longest > 1280 && !(0.25..=4.0).contains(&ratio) {
             return true;
         }
     }
@@ -1319,33 +1341,45 @@ async fn run_tool_with_timeout(tool: &str, mut cmd: tokio::process::Command) -> 
 }
 
 /// Shared ffmpeg frame-grab thumbnail implementation: grab 1 frame from
-/// `path`, scale it to width 320, and write a JPEG to `thumb`.
-/// `ss` is the start second (None = no seek). Returns true on success when
-/// the output is non-empty.
+/// `path`, fit it inside a 320x320 box (Telegram rejects thumbnails whose
+/// width OR height exceeds 320) and write a JPEG to `thumb`. `ss` is the
+/// start second (None = no seek). Returns true on success when the output is
+/// non-empty and under the 200KB thumbnail limit (with a small margin).
 async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path::Path) -> bool {
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.arg("-y");
-    if let Some(s) = ss {
-        cmd.args(["-ss", s]);
-    }
-    cmd.arg("-i")
-        .arg(path)
-        .args(["-frames:v", "1", "-q:v", "4", "-vf", "scale=320:-2"])
-        .arg(thumb);
-    let ok = run_tool_with_timeout("ffmpeg", cmd)
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let good = ok && thumb.exists() && std::fs::metadata(thumb).map(|m| m.len()).unwrap_or(0) > 0;
-    if !good {
+    // Telegram: thumbnail must be JPEG, <= 200 KB, width and height <= 320.
+    const MAX_THUMB_BYTES: u64 = 190 * 1024;
+    // Fit-inside-box first; if the encoder still overshoots the byte limit,
+    // retry smaller and with a lower quality.
+    const ATTEMPTS: [(&str, &str); 2] = [
+        ("scale=320:320:force_original_aspect_ratio=decrease", "4"),
+        ("scale=256:256:force_original_aspect_ratio=decrease", "8"),
+    ];
+    for (scale, quality) in ATTEMPTS {
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-y");
+        if let Some(s) = ss {
+            cmd.args(["-ss", s]);
+        }
+        cmd.arg("-i")
+            .arg(path)
+            .args(["-frames:v", "1", "-q:v", quality, "-vf", scale])
+            .arg(thumb);
+        let ok = run_tool_with_timeout("ffmpeg", cmd)
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            if let Ok(meta) = std::fs::metadata(thumb) {
+                if meta.len() > 0 && meta.len() <= MAX_THUMB_BYTES {
+                    return true;
+                }
+            }
+        }
         // ffmpeg may have been killed mid-write on timeout (kill_on_drop), or
-        // failed after creating a partial/empty file. Remove the leftover so it
-        // does not accumulate as an orphan: cleanup.rs only reclaims thumbnails
-        // registered on an outbox MediaItem.thumb_path, and a failed grab_thumb
-        // never registers one.
+        // produced an oversized/invalid file: remove it and try the next size.
         let _ = tokio::fs::remove_file(thumb).await;
     }
-    good
+    false
 }
 
 /// Grab one frame from an image and scale it to a JPEG thumbnail (for the
@@ -1589,5 +1623,19 @@ mod tests {
         std::fs::write(&path, b"\x89PNG\r\n").unwrap();
         assert!(!sniff_gif(&path));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn extract_media_resolves_relative_urls() {
+        // RSS relative references resolve against the entry link; without
+        // this the SSRF pre-check classifies the raw path as an invalid URL
+        // and the image is silently dropped.
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><link>https://example.com/</link><item><title>i</title><link>https://example.com/posts/1</link><description><![CDATA[<img src="/a.jpg">]]></description></item></channel></rss>"#;
+        let feed = feed_rs::parser::parse(xml.as_bytes()).expect("feed should parse");
+        let urls = extract_media_urls(&feed.entries[0], None);
+        assert!(
+            urls.iter().any(|(u, _, _, _)| u == "https://example.com/a.jpg"),
+            "urls: {urls:?}"
+        );
     }
 }
