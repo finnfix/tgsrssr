@@ -807,7 +807,13 @@ async fn download_cover_fallback(
     transport: &MediaTransport,
     out: &mut PreparedMedia,
 ) {
-    let Some(cover) = poster_map.get(raw_url).cloned() else { return };
+    let Some(cover) = poster_map.get(raw_url).cloned() else {
+        // The video was already dropped and the source exposed no cover URL:
+        // the entry loses its visual element with no download attempt to fail,
+        // so without this line the missing cover is invisible at info level.
+        warn!(video_url = %raw_url, "no poster for failed video, entry stays text-only");
+        return;
+    };
     let cover_resolved = fetcher::resolve_url(state, &upgrade_weibo_size(&cover));
     match download_one(state, &cover_resolved, &MediaKind::Image, "image/unknown", outbound, transport).await {
         Ok(DownloadOutcome::Item(item)) => {

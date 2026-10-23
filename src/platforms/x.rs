@@ -867,7 +867,8 @@ fn upgrade_x_cover(url: &str) -> String {
 
 /// Append `<img>`/`<video>` tags for a tweet's media to the HTML body.
 /// Photos get ?name=orig (highest resolution); videos pick the highest-bitrate
-/// mp4 variant. Reads extended_entities.media, falling back to entities.media.
+/// mp4 variant and carry their cover frame as the poster attribute. Reads
+/// extended_entities.media, falling back to entities.media.
 fn append_media_tags(body: &mut String, legacy: &Value) {
     let Some(media_arr) = legacy["extended_entities"]["media"]
         .as_array()
@@ -903,10 +904,14 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
                         // fallback in media.rs has a URL to send. The field is
                         // an object with a url in some response shapes and a
                         // bare string in others, so accept both (same
-                        // dual-shape handling as weibo page_pic).
+                        // dual-shape handling as weibo page_pic). Timeline
+                        // responses can omit it entirely (observed for videos
+                        // inside retweets); media_url_https then carries the
+                        // same preview frame, so fall back to it.
                         let poster = m["preview_image_url"]["url"]
                             .as_str()
                             .or_else(|| m["preview_image_url"].as_str())
+                            .or_else(|| m["media_url_https"].as_str())
                             .filter(|s| !s.is_empty())
                             .map(upgrade_x_cover);
                         match poster {
@@ -1917,6 +1922,28 @@ mod tests {
         assert_eq!(
             upgrade_x_cover("https://pbs.twimg.com/media/D.jpg?name=large"),
             "https://pbs.twimg.com/media/D.jpg?name=large"
+        );
+    }
+
+    #[test]
+    fn append_media_tags_video_poster_falls_back_to_media_url() {
+        // Timeline responses can omit preview_image_url for video entities
+        // (observed for videos inside retweets); media_url_https carries the
+        // same preview frame and must become the poster.
+        let legacy: Value = serde_json::json!({
+            "extended_entities": { "media": [{
+                "type": "video",
+                "media_url_https": "https://pbs.twimg.com/amplify_video_thumb/123/img/cover.jpg",
+                "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 100, "url": "https://video.twimg.com/x/a.mp4?tag=29" }
+                ]}
+            }]}
+        });
+        let mut body = String::new();
+        append_media_tags(&mut body, &legacy);
+        assert_eq!(
+            body,
+            "<video src=\"https://video.twimg.com/x/a.mp4?tag=29\" poster=\"https://pbs.twimg.com/amplify_video_thumb/123/img/cover.jpg?name=large\"></video>"
         );
     }
 
