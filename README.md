@@ -60,7 +60,7 @@ docker compose up -d --build   # 首次约 5-10 分钟
 
 ### 方式三：静态二进制（无需 Docker）
 
-从 [Releases](../../releases) 下载对应平台的 tar.gz，解压后设置环境变量直接运行：
+从 [Releases](../../releases) 下载 Linux 二进制 tar.gz（提供 x86_64 / aarch64 两种架构，musl 静态链接），解压后设置环境变量直接运行：
 
 ```bash
 tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
@@ -226,9 +226,9 @@ sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
 | `BACKUP_RETENTION_DAYS` | 数据库备份保留天数 | 7 |
 | `FILE_ID_CACHE_RETENTION_DAYS` | file_id 缓存保留天数 | 30 |
 | `SENT_MESSAGES_MAX_ROWS` | /find 反查登记表行数上限 | 5000 |
-| `DB_PATH` | SQLite 路径 | /app/data/rss_bot.db |
-| `MEDIA_DIR` | 媒体目录 | /app/media |
-| `LOG_DIR` | 日志目录 | /app/logs |
+| `DB_PATH` | SQLite 路径（Docker 镜像内置 `/app/data/rss_bot.db`；静态二进制默认相对路径 `data/rss_bot.db`） | data/rss_bot.db |
+| `MEDIA_DIR` | 媒体目录（Docker 镜像内置 `/app/media`；静态二进制默认相对路径 `media`） | media |
+| `LOG_DIR` | 日志目录（Docker 镜像内置 `/app/logs`；静态二进制默认相对路径 `logs`） | logs |
 | `RUST_LOG` | 日志级别（tracing EnvFilter） | info |
 
 ## 可选增强：本地 Bot API 服务器
@@ -404,7 +404,7 @@ docker compose up -d --build   # ~5-10 minutes on first run
 
 ### Option 3: Static binary (no Docker)
 
-Download the tar.gz for your platform from [Releases](../../releases), extract, set env vars, and run:
+Download a Linux tar.gz from [Releases](../../releases) (x86_64 / aarch64, statically linked against musl), extract, set env vars, and run:
 
 ```bash
 tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
@@ -570,9 +570,9 @@ Per-source filtering (/set source page → "Content filter"):
 | `BACKUP_RETENTION_DAYS` | Database backup retention (days) | 7 |
 | `FILE_ID_CACHE_RETENTION_DAYS` | file_id cache retention (days) | 30 |
 | `SENT_MESSAGES_MAX_ROWS` | /find reverse-lookup registry row limit | 5000 |
-| `DB_PATH` | SQLite path | /app/data/rss_bot.db |
-| `MEDIA_DIR` | Media directory | /app/media |
-| `LOG_DIR` | Log directory | /app/logs |
+| `DB_PATH` | SQLite path (Docker image sets `/app/data/rss_bot.db`; static binary defaults to relative `data/rss_bot.db`) | data/rss_bot.db |
+| `MEDIA_DIR` | Media directory (Docker image sets `/app/media`; static binary defaults to relative `media`) | media |
+| `LOG_DIR` | Log directory (Docker image sets `/app/logs`; static binary defaults to relative `logs`) | logs |
 | `RUST_LOG` | Log level (tracing EnvFilter) | info |
 
 ## Optional Enhancement: Local Bot API Server

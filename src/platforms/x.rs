@@ -227,8 +227,8 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
     // Use a client with auto-redirect disabled: when the cookie is invalid
     // x.com 302-redirects to the login page, and a redirect-following client
     // ends up with the final page so is_redirection() never fires
-    // (same lesson as Weibo's getIndex; see the comment on
-    // fetch_client_no_redirect_for_url in weibo.rs).
+    // (same lesson as Weibo's getIndex; see the comment on the
+    // fetch_client_no_redirect_for_url call inside fetch_weibo_user in weibo.rs).
     let client = state.fetch_client_no_redirect_for_url("https://x.com");
     let resp = client
         .get("https://x.com")

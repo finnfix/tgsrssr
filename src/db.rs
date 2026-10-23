@@ -69,9 +69,10 @@ pub const DEFAULT_CAPTION_ABOVE_MEDIA: i64 = 0;
 pub const DEFAULT_LINK_PREVIEW: i64 = 1;
 
 /// Row types for queries.
-// Some fields (chat_type/added_by/enabled etc.) are only used in SQL
-// WHERE/COALESCE and never read on the Rust side — kept to preserve the
-// complete mapping of the database schema.
+// Some fields (chat_type/enabled etc.) only appear in SQL
+// WHERE/COALESCE and are never read on the Rust side — kept to preserve the
+// complete mapping of the database schema. (Exception: added_by is read on
+// the Rust side by get_chat_owner / can_manage_chat.)
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatRow {

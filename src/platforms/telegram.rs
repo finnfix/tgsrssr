@@ -174,7 +174,8 @@ static RE_DIV_CLOSE: LazyLock<regex::Regex> =
 
 /// Registry fetch entry: parse the channel name from the full feed URL, then
 /// delegate to [`fetch_telegram_channel`]. Called via `PlatformDef.fetch`
-/// (URL passed owned; owner_id unused — public web preview needs no cookie).
+/// (URL passed owned; public web preview needs no cookie, so no cookie
+/// state is consulted).
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,

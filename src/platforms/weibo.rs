@@ -26,18 +26,20 @@ use crate::state::AppState;
 
 // Weibo uses the mobile UA (state::MOBILE_BROWSER_UA, iPhone Safari).
 // m.weibo.cn is a mobile endpoint, so a mobile UA is the most natural fit;
-// the desktop UA is used by the other endpoints.
+// only the weibo.com desktop endpoints (vote object, HD playback lookup)
+// use the desktop UA.
 
-/// Static regexes: HTML cleaning runs on every weibo status.
+/// Static regexes: absolutize relative hrefs on every weibo status body.
 static RE_HREF_DQ: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?i)href\s*=\s*"(/[^"]*)""#).unwrap());
 static RE_HREF_SQ: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)href\s*=\s*'(/[^']*)'").unwrap());
 
-/// China Standard Time (UTC+8): the weibo API emits relative timestamps in
-/// CST without an explicit zone, so every relative-time parse needs this
-/// fixed offset. Built once here instead of repeating the inline
-/// `east_opt(8 * 3600).unwrap()` construction at each call site.
+/// China Standard Time (UTC+8): the weibo API emits date-only / "yesterday"
+/// timestamps in CST without an explicit zone, so those parses need this
+/// fixed offset ("just now" / "N minutes ago" / "N hours ago" are computed
+/// against Utc::now() directly). Built once here instead of repeating the
+/// inline `east_opt(8 * 3600).unwrap()` construction at each call site.
 static CST: LazyLock<chrono::FixedOffset> =
     LazyLock::new(|| chrono::FixedOffset::east_opt(8 * 3600).expect("valid UTC+8 offset"));
 
@@ -1215,8 +1217,9 @@ fn render_weibo_markdown(text: &str) -> String {
             // so `&amp;` inside a code block must not become `&amp;amp;`.
             crate::push::escape_html(&crate::htmltext::decode_entities(&content))
         );
-        // Store as a placeholder to prevent the trailing RE_MD_BLANK_LINES
-        // from collapsing blank lines inside the code
+        // Store as a placeholder to prevent the trailing RE_BLANK_LINES
+        // (fetcher::RE_BLANK_LINES, applied at the end of rendering) from
+        // collapsing blank lines inside the code
         let idx = pres.len();
         pres.push(html);
         out.push(format!("\u{FFFE}PB{}\u{FFFE}", idx));

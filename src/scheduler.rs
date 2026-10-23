@@ -350,7 +350,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     // down state that the other healthy sources could never pull back.
     // v1.11.0: after cookies were globalized, the health stats were globalized
     // accordingly (no longer isolated per owner); anomaly/recovery
-    // notifications go to all admins.
+    // notifications go to the single admin (v1.11.3).
     const HYSTERESIS_ROUNDS: i64 = 2;
     let seen = stats.seen.lock().await.clone();
     let failed = stats.failed.lock().await.clone();
@@ -384,7 +384,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 }
 
                 // Hysteresis threshold reached and not currently down: report
-                // the anomaly (notify all admins)
+                // the anomaly (notify the single admin)
                 if streak >= HYSTERESIS_ROUNDS && !is_down {
                     let err = last_err.get(&p).map(String::as_str).unwrap_or("unknown error");
                     maybe_notify_platform_down(bot, state, p, err).await;
@@ -401,7 +401,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 }
 
                 // Hysteresis threshold reached and currently down: report recovery
-                // (notify all admins)
+                // (notify the single admin)
                 if ok_streak <= -HYSTERESIS_ROUNDS && is_down {
                     maybe_notify_platform_recovered(bot, state, p).await;
                 }
@@ -1135,7 +1135,7 @@ fn platform_of_url(feed_url: &str) -> Option<&'static str> {
 /// Platform-level health detection (failure direction): called after the
 /// hysteresis evaluation in run_fetch_cycle. The atomic flip guarantees a
 /// single notification on ok → down only; no repeat while persistently down.
-/// v1.11.0: after cookies were globalized, notifications go to all admins.
+/// v1.11.0: after cookies were globalized, notifications go to the single admin (v1.11.3).
 async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str, err_msg: &str) {
     // Atomic edge trigger: returns true only when the state flips from
     // non-down to down. DB errors and "already down" are handled differently:
@@ -1173,7 +1173,7 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
 /// this platform's sources succeeded this round (avoiding flapping where a
 /// partial success reports recovery). Edge-triggered: notify only on
 /// down → ok; also clears the cookie-expired flag.
-/// v1.11.0: after cookies were globalized, notifications go to all admins.
+/// v1.11.0: after cookies were globalized, notifications go to the single admin (v1.11.3).
 async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: &str) {
     let health_key = db::setting_key::platform_health(platform);
     // Pre-check: attempt recovery only when clearly in the down state.

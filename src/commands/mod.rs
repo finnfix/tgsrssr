@@ -71,9 +71,9 @@ fn cmd_args(msg: &Message) -> String {
     }
 }
 
-/// Link preview is always disabled for command responses. Commands only run
-/// for whitelisted users (private chat), and responses with hyperlinked feed
-/// URLs don't need preview cards.
+/// Link preview is always disabled for command responses. Responses may
+/// contain hyperlinked feed URLs that don't need preview cards (commands run
+/// in private chats as well as in groups/channels).
 /// The implementation is consolidated in push::no_preview (re-exported here so existing call paths stay unchanged).
 pub use crate::push::no_preview;
 
@@ -752,9 +752,10 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
 // ===== /cookies =====
 
-/// Platform login-cookie management panel (per-user). Selecting a platform
-/// prompts for the new cookie via reply; the update applies immediately
-/// without restart and is persisted across restarts.
+/// Platform login-cookie management panel (global, admin-only since
+/// v1.11.0). Selecting a platform prompts for the new cookie via reply; the
+/// update applies immediately without restart and is persisted across
+/// restarts.
 async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> ResponseResult<()> {
     crate::callbacks::render_cookies_panel(
         bot,
@@ -1115,9 +1116,8 @@ fn resolve_target_input(msg: &Message, args: &str) -> Option<String> {
 }
 
 /// Best-effort chat registration: try getChat, but never fail the command.
-/// Used by read/cleanup commands (/list, /unsub) so that orphan
-/// subscriptions (chat no longer registered / bot removed) can still be listed
-/// and deleted.
+/// Used by /list so that orphan subscriptions (chat no longer registered /
+/// bot removed) can still be listed and managed.
 async fn try_register_chat(bot: &Bot, state: &AppState, chat_id: &str, user_id: i64) {
     if let Err(e) = ensure_chat_registered(bot, state, chat_id, user_id).await {
         tracing::debug!(chat_id = %chat_id, error = %e, "soft registration skipped");

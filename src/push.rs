@@ -32,9 +32,10 @@ pub use crate::htmltext::{
 // sidecar); RE_VOTE_DIV has been removed.
 
 /// Leave room for suffixes. Telegram's hard limit is 4096 visible chars;
-/// the footer (source line) is appended to the last chunk with a reserved
-/// budget (see send_entry_msg), so 4096 is safe as long as the footer's
-/// visible length stays within the 500-char reserve.
+/// the footer (source line) is appended to the last chunk, and the split
+/// budget reserves the footer's visible length + 2 separator chars up front
+/// (see send_entry_msg), so staying within this limit keeps the combined
+/// text under 4096.
 const SAFE_LIMIT: usize = 4096;
 /// Telegram caption limit for media messages.
 const CAPTION_LIMIT: usize = 1024;
