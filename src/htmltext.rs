@@ -721,7 +721,42 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
     if !current.is_empty() {
         chunks.push(current);
     }
+    rebalance_chunks(&mut chunks);
     chunks
+}
+
+/// Close tags left open at the end of each chunk and re-open them at the
+/// start of the next one. The paragraph segmentation above can cut inside an
+/// anchor whose text spans a blank line, or inside a nested blockquote, and
+/// the resulting chunks would be rejected by Telegram's HTML parser (the
+/// text path degrades to plain text; the media caption path loses the
+/// media). Void tags are never carried.
+fn rebalance_chunks(chunks: &mut [String]) {
+    let mut carried: Vec<String> = Vec::new();
+    for i in 0..chunks.len() {
+        if !carried.is_empty() {
+            let mut s = String::new();
+            for tag in carried.drain(..) {
+                s.push_str(&tag);
+            }
+            s.push_str(&chunks[i]);
+            chunks[i] = s;
+        }
+        if i + 1 == chunks.len() {
+            break;
+        }
+        // usize::MAX scans the whole chunk; only the final stack is needed.
+        let scan = scan_split_candidates(&chunks[i], usize::MAX);
+        if scan.end_stack.is_empty() {
+            continue;
+        }
+        let mut closers = String::new();
+        for (name, _) in scan.end_stack.iter().rev() {
+            closers.push_str(&format!("</{}>", name));
+        }
+        chunks[i].push_str(&closers);
+        carried = scan.end_stack.into_iter().map(|(_, tag)| tag).collect();
+    }
 }
 
 /// HTML void elements: they never have a closing tag, so they must never be
@@ -1317,7 +1352,7 @@ mod tests {
             assert!(!c.ends_with('&'), "chunk ends with dangling & {c}");
             for probe in ["&am", "&amp", "&#3", "&not", "&gt", "&lt"] {
                 assert!(
-                    !(c.ends_with(probe) && !c.ends_with(&format!("{probe};"))),
+                    !c.ends_with(probe) || c.ends_with(&format!("{probe};")),
                     "split entity {probe:?} in {c}"
                 );
             }
@@ -1377,6 +1412,44 @@ mod tests {
                 c.matches("</a>").count(),
                 "unbalanced anchor chunk: {c}"
             );
+        }
+    }
+
+    #[test]
+    fn split_html_balances_anchor_spanning_blank_lines() {
+        // An anchor whose text contains a blank line is split at that
+        // boundary by paragraph pre-segmentation. The rebalance pass must
+        // close the anchor in the head chunk and re-open it in the tail, or
+        // Telegram rejects the chunk (text path loses links; caption path
+        // loses the media).
+        let html = r#"<a href="https://ex.com/x">first paragraph
+
+second paragraph</a> tail"#;
+        let out = split_html(html, 25);
+        assert!(out.len() >= 2);
+        for c in &out {
+            let scan = scan_split_candidates(c, usize::MAX);
+            assert!(
+                scan.end_stack.is_empty(),
+                "unclosed tags in chunk: {c}"
+            );
+            assert!(visible_len(c) <= 25, "chunk exceeds limit: {c}");
+            assert_eq!(c.matches("<a ").count(), c.matches("</a>").count(), "unbalanced anchor: {c}");
+        }
+    }
+
+    #[test]
+    fn split_html_balances_nested_blockquote() {
+        // Nested blockquotes: pre-segmentation stops at the inner close, so
+        // the outer open tag can end up unclosed in a chunk. Rebalancing must
+        // make every chunk well-formed.
+        let html = "<blockquote>outer <blockquote>inner</blockquote> text\n\nmore</blockquote> tail";
+        let out = split_html(html, 20);
+        assert!(out.len() >= 2);
+        for c in &out {
+            let scan = scan_split_candidates(c, usize::MAX);
+            assert!(scan.end_stack.is_empty(), "unclosed tags in chunk: {c}");
+            assert!(visible_len(c) <= 20, "chunk exceeds limit: {c}");
         }
     }
 }

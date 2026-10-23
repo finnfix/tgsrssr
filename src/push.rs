@@ -279,12 +279,14 @@ pub enum ContentMode {
 
 impl ContentMode {
     pub fn from_str(s: &str) -> Self {
-        match s {
-            "title_summary" => Self::TitleSummary,
-            "title_content" => Self::TitleContent,
-            "title_only" => Self::TitleOnly,
-            "content_only" => Self::ContentOnly,
-            "media_only" => Self::MediaOnly,
+        // Accept the legacy camel-case spellings used by older schema
+        // defaults ('TitleSummary') in addition to the canonical snake_case.
+        match s.to_ascii_lowercase().as_str() {
+            "title_summary" | "titlesummary" => Self::TitleSummary,
+            "title_content" | "titlecontent" => Self::TitleContent,
+            "title_only" | "titleonly" => Self::TitleOnly,
+            "content_only" | "contentonly" => Self::ContentOnly,
+            "media_only" | "mediaonly" => Self::MediaOnly,
             _ => Self::TitleLink,
         }
     }
@@ -405,64 +407,75 @@ pub fn format_entry_parts(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> Option<(String, String)> {
+    render_parts(entry, feed_title, author, opts, meta)
+        .map(|r| (r.parts.join("\n\n"), r.footer))
+}
+
+/// Shared rendering for the plain-text and caption paths. These were two
+/// near-identical implementations that had already drifted once (TitleContent
+/// silently lost the body on the media path), so the rules live here only.
+struct RenderedParts {
+    parts: Vec<String>,
+    footer: String,
+}
+
+fn render_parts(
+    entry: &Entry,
+    feed_title: &str,
+    author: Option<&str>,
+    opts: RenderOpts,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> Option<RenderedParts> {
     let title = fetcher::entry_title(entry);
     let link = fetcher::entry_link(entry);
+    let head = |linked: bool| -> String {
+        match (&link, linked) {
+            (Some(url), true) => format!(
+                "<b><a href=\"{}\">{}</a></b>",
+                escape_attr(url),
+                escape_html(&title)
+            ),
+            _ => format!("<b>{}</b>", escape_html(&title)),
+        }
+    };
 
     let mut parts: Vec<String> = Vec::new();
-
     match opts.mode {
         ContentMode::MediaOnly => return None,
-        ContentMode::TitleLink => {
-            parts.push(match &link {
-                Some(url) => format!("<b><a href=\"{}\">{}</a></b>", escape_attr(url), escape_html(&title)),
-                None => format!("<b>{}</b>", escape_html(&title)),
-            });
-        }
+        ContentMode::TitleLink => parts.push(head(true)),
         ContentMode::TitleSummary => {
-            // Title hyperlinked to the entry + summary (first
-            // SUMMARY_MAX_CHARS chars of body + "......")
-            parts.push(match &link {
-                Some(url) => format!("<b><a href=\"{}\">{}</a></b>", escape_attr(url), escape_html(&title)),
-                None => format!("<b>{}</b>", escape_html(&title)),
-            });
+            parts.push(head(true));
             let summary = entry_summary(entry, SUMMARY_MAX_CHARS, meta);
             if !summary.is_empty() {
                 parts.push(summary);
             }
         }
         ContentMode::TitleContent => {
-            // Title hyperlinked to the entry
-            parts.push(match &link {
-                Some(url) => format!("<b><a href=\"{}\">{}</a></b>", escape_attr(url), escape_html(&title)),
-                None => format!("<b>{}</b>", escape_html(&title)),
-            });
+            parts.push(head(true));
             // Body is already Telegram-HTML (media stripped, links as <a>).
-            // Pass a large limit: splitting into multiple messages happens at
-            // send time, so we never want to fall back to plain text here.
+            // A large limit: splitting into multiple messages happens at send
+            // time, so we never want to fall back to plain text here.
             let body = fetcher::entry_body_html(entry, 100_000, meta);
             if !body.is_empty() {
                 parts.push(body);
             }
         }
-        ContentMode::TitleOnly => {
-            parts.push(format!("<b>{}</b>", escape_html(&title)));
-        }
+        ContentMode::TitleOnly => parts.push(head(false)),
         ContentMode::ContentOnly => {
-            // Same as TitleContent: large limit, splitting happens at send time.
             let body = fetcher::entry_body_html(entry, 100_000, meta);
             if body.is_empty() {
                 // No-content fallback: degrade to a bold title to avoid an
-                // empty message
-                parts.push(format!("<b>{}</b>", escape_html(&title)));
+                // empty message (both text and caption paths).
+                parts.push(head(false));
             } else {
                 parts.push(body);
             }
         }
     }
-
-    let body = parts.join("\n\n");
-    let footer = source_line(entry, feed_title, author, opts.source);
-    Some((body, footer))
+    Some(RenderedParts {
+        parts,
+        footer: source_line(entry, feed_title, author, opts.source),
+    })
 }
 
 /// Build a media caption. All modes are platform-agnostic — Weibo gets no
@@ -482,62 +495,12 @@ fn format_caption(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> String {
-    let footer = source_line(entry, feed_title, author, opts.source);
-    if opts.mode == ContentMode::MediaOnly {
-        return footer;
-    }
-
-    // ContentOnly: render the body text directly instead of a bold title.
-    if opts.mode == ContentMode::ContentOnly {
-        let text = fetcher::entry_body_html(entry, 100_000, meta);
-        let mut parts: Vec<String> = Vec::new();
-        if !text.is_empty() {
-            parts.push(text);
-        }
-        if !footer.is_empty() {
-            parts.push(footer);
-        }
-        return parts.join("\n\n");
-    }
-
-    // Title modes: bold title (linked for link/summary/content modes).
-    let title = fetcher::entry_title(entry);
-    let link = fetcher::entry_link(entry);
-    let head = match (&link, opts.mode) {
-        (Some(url), ContentMode::TitleLink)
-        | (Some(url), ContentMode::TitleSummary)
-        | (Some(url), ContentMode::TitleContent) => format!(
-            "<b><a href=\"{}\">{}</a></b>",
-            escape_attr(url),
-            escape_html(&title)
-        ),
-        _ => format!("<b>{}</b>", escape_html(&title)),
+    let Some(rendered) = render_parts(entry, feed_title, author, opts, meta) else {
+        return source_line(entry, feed_title, author, opts.source);
     };
-
-    let mut parts: Vec<String> = vec![head];
-
-    // Title+summary: append a summary of the first SUMMARY_MAX_CHARS chars
-    if opts.mode == ContentMode::TitleSummary {
-        let summary = entry_summary(entry, SUMMARY_MAX_CHARS, meta);
-        if !summary.is_empty() {
-            parts.push(summary);
-        }
-    }
-
-    // Title+content: append the full body, mirroring the plain-text path in
-    // format_entry_parts. Without this, a TitleContent source that happens to
-    // carry media rendered only the title + source line (the body silently
-    // vanished on the media path, while the media-less text path sent the full
-    // body) — a content-loss bug found in the post-v1.11.2 audit.
-    if opts.mode == ContentMode::TitleContent {
-        let body = fetcher::entry_body_html(entry, 100_000, meta);
-        if !body.is_empty() {
-            parts.push(body);
-        }
-    }
-
-    if !footer.is_empty() {
-        parts.push(footer);
+    let mut parts = rendered.parts;
+    if !rendered.footer.is_empty() {
+        parts.push(rendered.footer);
     }
     parts.join("\n\n")
 }
@@ -633,6 +596,13 @@ async fn invalidate_op_cache(db: &Db, op: &RichOp<'_>) {
 fn is_file_id_error(es: &str) -> bool {
     let s = es.to_lowercase();
     s.contains("file_id") || s.contains("file identifier") || s.contains("wrong file")
+}
+
+/// Telegram rejects thumbnails outside 320x320 / 200KB. A thumbnail-related
+/// 400 must drop the thumbnail and retry, not fail the whole document.
+fn is_thumbnail_error(es: &str) -> bool {
+    let s = es.to_lowercase();
+    s.contains("thumbnail") || s.contains("photo_invalid_dimensions") || s.contains("wrong file dimensions")
 }
 
 /// Entry context for one push: collapses the many parameters of
@@ -781,11 +751,19 @@ pub async fn send_entry_with_media(
     // The entry's main message (the first rich-media message); document
     // messages quote it for easy navigation.
     let mut anchor: Option<Message> = None;
+    // True once the caption carrier (first rich op or the full-text fallback)
+    // has been delivered; the post-send sanity check below must not treat a
+    // partial media failure as "caption undelivered" and trigger an outbox
+    // replay that duplicates it.
+    let mut caption_delivered = false;
 
     if !rich_ops.is_empty() {
         let rich = send_rich_ops_with_retry(bot, db, chat_id, &caption, caption_above, &rich_ops, transport, None, "main").await;
         match rich {
-            Ok((_, first_msg)) => anchor = first_msg,
+            Ok((_, first_msg)) => {
+                anchor = first_msg;
+                caption_delivered = true;
+            }
             Err((sent, e)) => {
                 tracing::warn!(
                     chat_id = chat_id,
@@ -800,7 +778,25 @@ pub async fn send_entry_with_media(
                 let mut delivered_tg_link = None;
                 let mut fallback_msg_id: Option<teloxide::types::MessageId> = None;
                 let mut text_delivered = false;
-                if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
+                if sent > 0 {
+                    // The first op (which carries the caption) was delivered
+                    // before the failure. Re-sending the full title+body would
+                    // duplicate the caption in the channel, so only the
+                    // caption overflow is sent as follow-up messages.
+                    text_delivered = true;
+                    for chunk in &overflow_chunks {
+                        if let Err(te) = send_chunk_with_retry(bot, chat_id, chunk, false, None).await {
+                            tracing::warn!(
+                                chat_id = chat_id,
+                                entry_id = %fetcher::entry_id(entry),
+                                error = %te,
+                                "overflow text failed after partial media delivery"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                    }
+                } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
                     match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
                         Ok(m) => {
                             delivered_tg_link = tg_message_link(&m);
@@ -979,7 +975,7 @@ pub async fn send_entry_with_media(
         .map(|m| m.id);
     let already_delivered = anchor.is_some() || first_doc_msg.is_some();
     for chunk in &overflow_chunks {
-        if let Err(e) = send_single_html(bot, chat_id, chunk, false, overflow_reply_to).await {
+        if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await {
             if already_delivered {
                 tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "overflow text failed after delivery, not retrying");
                 media_failed = true;
@@ -1017,7 +1013,9 @@ pub async fn send_entry_with_media(
     // regardless of whether the overflow was delivered. The cost is that the
     // overflow text may be duplicated on retry, but that is better than
     // losing the body text.
-    if anchor.is_none() && first_doc_msg.is_none()
+    if !caption_delivered
+        && anchor.is_none()
+        && first_doc_msg.is_none()
         && (!docs.is_empty() || !rt_photos.is_empty())
     {
         return Err(anyhow::anyhow!(
@@ -1143,13 +1141,24 @@ async fn send_doc_group(
         // follow-up groups carry no caption
         let group_caption = if gi == 0 { caption } else { "" };
         // Follow-up groups quote the first message of the first group
-        let rp = if gi > 0 {
-            first_msg_id.map(teloxide::types::ReplyParameters::new)
-        } else {
-            reply_to.map(teloxide::types::ReplyParameters::new)
-        };
+        let reply_msg_id = if gi > 0 { first_msg_id } else { reply_to };
+        let rp = reply_msg_id.map(teloxide::types::ReplyParameters::new);
+
+        // sendMediaGroup requires 2-10 items; a trailing single document
+        // (11/21/31 docs) must go through sendDocument instead of a group.
+        if chunk.len() == 1 {
+            let m = send_doc_msg(bot, db, chat_id, chunk[0], group_caption, reply_msg_id, transport)
+                .await
+                .map_err(|e| (all_msgs.clone(), e))?;
+            if first_msg_id.is_none() {
+                first_msg_id = Some(m.id);
+            }
+            all_msgs.push(m);
+            continue;
+        }
 
         let mut use_cache = true;
+        let mut use_thumbs = true;
         let mut flood_tries = 0u32;
         let mut transient_tries = 0usize;
         let msgs = loop {
@@ -1163,9 +1172,11 @@ async fn send_doc_group(
                     im = im.caption(group_caption.to_string()).parse_mode(ParseMode::Html);
                 }
                 // Converted-to-document long/large images carry a thumbnail
-                if let Some(tp) = &d.thumb_path {
-                    if let Ok(tin) = path_input(tp, transport) {
-                        im.thumbnail = Some(tin);
+                if use_thumbs {
+                    if let Some(tp) = &d.thumb_path {
+                        if let Ok(tin) = path_input(tp, transport) {
+                            im.thumbnail = Some(tin);
+                        }
                     }
                 }
                 group.push(InputMedia::Document(im));
@@ -1186,6 +1197,11 @@ async fn send_doc_group(
                 }
                 Err(e) => {
                     let es = e.to_string();
+                    if use_thumbs && is_thumbnail_error(&es) {
+                        tracing::warn!(chat_id = chat_id, error = %es, "doc group thumbnail rejected, retrying without thumbnails");
+                        use_thumbs = false;
+                        continue;
+                    }
                     if flood_backoff(&es, &mut flood_tries, chat_id).await {
                         continue;
                     }
@@ -1242,16 +1258,20 @@ async fn send_doc_msg(
     // resolve_input(use_cache=false) is equivalent to calling path_input
     // directly, matching the behavior of the original retry path.
     let mut use_cache = true;
+    let mut attach_thumb = d.thumb_path.is_some();
     let mut flood_tries = 0u32;
     let mut transient_tries = 0usize;
     let m = loop {
         let inp = resolve_input(db, d, transport, "doc", use_cache).await?;
         let mut req = bot.send_document(ChatId(chat_id), inp);
         // Converted-to-document long/large images carry a thumbnail so the
-        // message list shows a preview
-        if let Some(tp) = &d.thumb_path {
-            if let Ok(tin) = path_input(tp, transport) {
-                req = req.thumbnail(tin);
+        // message list shows a preview; a thumbnail-related 400 drops it and
+        // retries so the document itself is still delivered.
+        if attach_thumb {
+            if let Some(tp) = &d.thumb_path {
+                if let Ok(tin) = path_input(tp, transport) {
+                    req = req.thumbnail(tin);
+                }
             }
         }
         if !caption.is_empty() {
@@ -1273,6 +1293,11 @@ async fn send_doc_msg(
             }
             Err(e) => {
                 let es = e.to_string();
+                if attach_thumb && is_thumbnail_error(&es) {
+                    tracing::warn!(chat_id = chat_id, error = %es, "document thumbnail rejected, retrying without it");
+                    attach_thumb = false;
+                    continue;
+                }
                 if flood_backoff(&es, &mut flood_tries, chat_id).await {
                     continue;
                 }
@@ -1631,17 +1656,7 @@ pub async fn send_entry_msg(
         let reply_to = first_msg.as_ref().map(|m| m.id);
         // Chunk-level bounded backoff retry: on failure only the current
         // chunk is re-sent.
-        let mut send_res = send_single_html(bot, chat_id, &text, lp, reply_to).await;
-        for backoff in SEND_BACKOFF_SECS {
-            let should_retry = matches!(&send_res, Err(e) if is_retryable_error(&e.to_string()));
-            if !should_retry {
-                break;
-            }
-            tracing::warn!(chat_id = chat_id, chunk = i, backoff = backoff, "text chunk send failed, retrying chunk");
-            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            send_res = send_single_html(bot, chat_id, &text, lp, reply_to).await;
-        }
-        let m = send_res?;
+        let m = send_chunk_with_retry(bot, chat_id, &text, lp, reply_to).await?;
         if first_msg.is_none() {
             first_msg = Some(m.clone());
         }
@@ -1735,6 +1750,29 @@ async fn send_single_html(
         }
     }
     unreachable!()
+}
+
+/// Send one already-split HTML chunk with bounded network/transient-TG
+/// backoff. Flood-control retry lives inside send_single_html; this layer
+/// covers the connection-class retry shared by the text-chunk and
+/// caption-overflow paths (the latter previously had no retry at all).
+async fn send_chunk_with_retry(
+    bot: &Bot,
+    chat_id: i64,
+    text: &str,
+    link_preview: bool,
+    reply_to: Option<teloxide::types::MessageId>,
+) -> anyhow::Result<Message> {
+    let mut send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
+    for backoff in SEND_BACKOFF_SECS {
+        if !matches!(&send_res, Err(e) if is_retryable_error(&e.to_string())) {
+            break;
+        }
+        tracing::warn!(chat_id = chat_id, backoff = backoff, "text chunk send failed, retrying");
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
+    }
+    send_res
 }
 
 /// Build a t.me link for a message in a channel/supergroup (best effort).
@@ -2049,5 +2087,22 @@ mod tests {
         let vrefs: Vec<&MediaItem> = sliced.iter().filter(|m| m.kind == MediaKind::Video).collect();
         let ops = build_rich_ops(&prefs, &[], &vrefs);
         assert_eq!(op_labels(&ops), vec!["photo:p1"]);
+    }
+
+    #[test]
+    fn thumbnail_errors_are_detected() {
+        assert!(is_thumbnail_error("Bad Request: PHOTO_INVALID_DIMENSIONS"));
+        assert!(is_thumbnail_error("Bad Request: wrong file dimensions"));
+        assert!(is_thumbnail_error("Bad Request: THUMBNAIL_DIMENSIONS_INVALID"));
+        assert!(!is_thumbnail_error("Bad Request: message is too long"));
+    }
+
+    #[test]
+    fn content_mode_accepts_legacy_camel_case_defaults() {
+        assert_eq!(ContentMode::from_str("TitleSummary"), ContentMode::TitleSummary);
+        assert_eq!(ContentMode::from_str("TitleContent"), ContentMode::TitleContent);
+        assert_eq!(ContentMode::from_str("content_only"), ContentMode::ContentOnly);
+        assert_eq!(ContentMode::from_str("MediaOnly"), ContentMode::MediaOnly);
+        assert_eq!(ContentMode::from_str("unknown"), ContentMode::TitleLink);
     }
 }
