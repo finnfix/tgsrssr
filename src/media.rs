@@ -330,7 +330,7 @@ async fn upgrade_weibo_video_hd(
     let Ok(resp) = req.send().await else {
         return url.to_string();
     };
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
+    let Ok(json) = crate::fetcher::read_json_capped(resp, "weibo HD mobile API").await else {
         return url.to_string();
     };
 
