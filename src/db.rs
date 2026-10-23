@@ -368,54 +368,77 @@ pub async fn list_chats(db: &Db, user_id: i64) -> anyhow::Result<Vec<ChatRow>> {
 
 // ===== Subscriptions =====
 
-pub async fn add_subscription(
+/// Insert (or re-activate) a subscription and mark its current entries as
+/// sent in one transaction. /sub uses this so a failure can neither leave a
+/// partially-marked subscription nor roll back a pre-existing (re-enabled)
+/// row: the previous two-step add + mark + delete-on-error flow deleted the
+/// user's original subscription when the mark step failed.
+pub async fn add_subscription_with_sent(
     db: &Db,
     chat_id: &str,
     feed_url: &str,
     feed_title: Option<&str>,
-) -> anyhow::Result<i64> {
-    let result = sqlx::query(
+    entry_ids: &[String],
+) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query(
         r#"INSERT INTO subscriptions (chat_id, feed_url, feed_title, title_overridden, active, error_count)
            VALUES (?1, ?2, ?3, 0, 1, 0)
            ON CONFLICT(chat_id, feed_url) DO UPDATE SET active = 1, error_count = 0, last_error = NULL,
+           auto_disabled = 0, disabled_at = NULL,
            feed_title = CASE WHEN title_overridden = 1 THEN feed_title ELSE excluded.feed_title END"#,
     )
     .bind(chat_id)
     .bind(feed_url)
     .bind(feed_title)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    // Do NOT rely on last_insert_rowid(): SQLite does not update it on the
-    // ON CONFLICT DO UPDATE branch (re-enabling an existing row), and with a
-    // pooled connection it may return the rowid of an unrelated earlier INSERT
-    // on the same connection. A caller uses this id to roll back the
-    // subscription on a later failure — a wrong id would delete an unrelated
-    // subscription (possibly belonging to another channel). Re-query by the
-    // UNIQUE key to always resolve the real row id.
-    let _ = result;
-    let row = sqlx::query("SELECT id FROM subscriptions WHERE chat_id = ? AND feed_url = ?")
+    for eid in entry_ids {
+        sqlx::query(
+            "INSERT OR IGNORE INTO sent_entries (chat_id, feed_url, entry_id) VALUES (?, ?, ?)",
+        )
         .bind(chat_id)
         .bind(feed_url)
-        .fetch_one(db)
+        .bind(eid)
+        .execute(&mut *tx)
         .await?;
-    Ok(row.get::<i64, _>("id"))
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
-/// Whether an entry is currently queued in the outbox (pending retry).
-/// The fetch cycle uses this to skip entries the outbox already owns, so the
-/// two cycles never push the same entry concurrently (cross-cycle double-send).
-/// A query error is treated as "not queued" (fail-open) on purpose: the outbox
-/// path re-checks is_entry_sent before sending, so a false negative here at
-/// worst falls back to the pre-existing behaviour rather than dropping an entry.
-pub async fn is_in_outbox(db: &Db, chat_id: &str, feed_url: &str, entry_id: &str) -> bool {
-    sqlx::query("SELECT 1 FROM outbox WHERE chat_id = ? AND feed_url = ? AND entry_id = ?")
+/// Batch form of `is_entry_sent` for one subscription. The fetch cycle filters
+/// entries against this set instead of running two queries per entry (a large
+/// feed could hold tens of thousands of entries), and platform fetchers use it
+/// to skip enrichment requests for already-pushed entries.
+pub async fn sent_entry_ids(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query("SELECT entry_id FROM sent_entries WHERE chat_id = ? AND feed_url = ?")
         .bind(chat_id)
         .bind(feed_url)
-        .bind(entry_id)
-        .fetch_optional(db)
-        .await
-        .map(|r| r.is_some())
-        .unwrap_or(false)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
+}
+
+/// Batch form of the per-entry outbox check for one subscription. The fetch
+/// cycle skips entries the outbox already owns (the outbox has sole retry
+/// authority). Fail-open semantics: callers treat a query error as empty,
+/// because the outbox re-checks is_entry_sent before sending.
+pub async fn outbox_entry_ids(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query("SELECT entry_id FROM outbox WHERE chat_id = ? AND feed_url = ?")
+        .bind(chat_id)
+        .bind(feed_url)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
 }
 
 pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
@@ -456,6 +479,16 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     .bind(sub_id)
     .execute(&mut *tx)
     .await?;
+    // Drop per-feed config overrides in the same transaction: a later
+    // re-subscribe must start from channel defaults instead of reviving stale
+    // interval/content/filter settings (previously this ran outside the
+    // transaction and a failure silently kept the old row).
+    sqlx::query(
+        "DELETE FROM feed_configs WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = ? AND s.chat_id = feed_configs.chat_id AND s.feed_url = feed_configs.feed_url)",
+    )
+    .bind(sub_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM subscriptions WHERE id = ?").bind(sub_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -486,6 +519,12 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
         .bind(format!("stale_zero:{}:%", chat_id))
         .execute(&mut *tx)
         .await?;
+    // Drop per-feed config overrides for this chat as well (same contract as
+    // single unsubscribe: a later re-subscribe starts from defaults).
+    sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM subscriptions WHERE chat_id = ?")
         .bind(chat_id)
         .execute(&mut *tx)
@@ -494,11 +533,14 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     Ok(result.rows_affected())
 }
 
+/// Column list shared by every `SubRow` query (keep in sync with the struct).
+const SUB_COLUMNS: &str = "id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at";
+
 pub async fn get_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<Vec<SubRow>> {
-    let rows = sqlx::query_as::<_, SubRow>(
-        "SELECT id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at
-         FROM subscriptions WHERE chat_id = ? ORDER BY id DESC",
-    )
+    let sql = format!(
+        "SELECT {SUB_COLUMNS} FROM subscriptions WHERE chat_id = ? ORDER BY id DESC"
+    );
+    let rows = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
     .bind(chat_id)
     .fetch_all(db)
     .await?;
@@ -506,10 +548,8 @@ pub async fn get_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<Vec<Sub
 }
 
 pub async fn get_subscription_by_id(db: &Db, sub_id: i64) -> anyhow::Result<Option<SubRow>> {
-    let row = sqlx::query_as::<_, SubRow>(
-        "SELECT id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at
-         FROM subscriptions WHERE id = ?",
-    )
+    let sql = format!("SELECT {SUB_COLUMNS} FROM subscriptions WHERE id = ?");
+    let row = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
     .bind(sub_id)
     .fetch_optional(db)
     .await?;
@@ -517,10 +557,8 @@ pub async fn get_subscription_by_id(db: &Db, sub_id: i64) -> anyhow::Result<Opti
 }
 
 pub async fn get_subscription_by_url(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<Option<SubRow>> {
-    let row = sqlx::query_as::<_, SubRow>(
-        "SELECT id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at
-         FROM subscriptions WHERE chat_id = ? AND feed_url = ?",
-    )
+    let sql = format!("SELECT {SUB_COLUMNS} FROM subscriptions WHERE chat_id = ? AND feed_url = ?");
+    let row = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
     .bind(chat_id)
     .bind(feed_url)
     .fetch_optional(db)
@@ -703,14 +741,23 @@ pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow:
 /// resets error counts and auto-disable flags. Returns the number of enabled
 /// sources.
 pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<u64> {
+    let mut tx = db.begin().await?;
     let res = sqlx::query(
         r#"UPDATE subscriptions
            SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL
            WHERE chat_id = ? AND active = 0"#,
     )
     .bind(chat_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    // Clear the per-feed auto-disable notification dedup flags so a source
+    // that fails again before any success can notify the owner (same cleanup
+    // as the single-subscription resume path).
+    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+        .bind(format!("auto_disable_notified:{}:%", chat_id))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -946,7 +993,7 @@ pub async fn set_feed_config_field(
         // stored keywords) keep the whole row, otherwise resetting other fields
         // would silently lose the content-filter config.
         sqlx::query(
-            "DELETE FROM feed_configs WHERE chat_id = ? AND feed_url = ? AND interval_minutes IS NULL AND content_mode IS NULL AND source_display IS NULL AND caption_above_media IS NULL AND link_preview IS NULL AND filter_enabled = 0 AND filter_keywords = ''",
+            "DELETE FROM feed_configs WHERE chat_id = ? AND feed_url = ? AND interval_minutes IS NULL AND content_mode IS NULL AND source_display IS NULL AND caption_above_media IS NULL AND link_preview IS NULL AND filter_enabled = 0 AND filter_keywords = '' AND filter_mode = 'blacklist'",
         )
         .bind(chat_id)
         .bind(feed_url)
@@ -974,26 +1021,6 @@ pub async fn set_feed_config_field(
     Ok(())
 }
 
-pub async fn reset_feed_config(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM feed_configs WHERE chat_id = ? AND feed_url = ?")
-        .bind(chat_id)
-        .bind(feed_url)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-/// Delete all feed-level config overrides for a chat. Used when all of the
-/// chat's subscriptions are removed at once, so no orphaned per-feed overrides
-/// linger and later re-subscribes start from the channel defaults.
-pub async fn delete_feed_configs_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?")
-        .bind(chat_id)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
 // ===== Sent entries =====
 
 pub async fn is_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &str) -> anyhow::Result<bool> {
@@ -1017,21 +1044,6 @@ pub async fn mark_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &
     .bind(entry_id)
     .execute(db)
     .await?;
-    Ok(())
-}
-
-/// Mark all current entries as sent (for new subscriptions — only push future entries).
-pub async fn mark_all_entries_sent(db: &Db, chat_id: &str, feed_url: &str, entry_ids: &[String]) -> anyhow::Result<()> {
-    for eid in entry_ids {
-        sqlx::query(
-            "INSERT OR IGNORE INTO sent_entries (chat_id, feed_url, entry_id) VALUES (?, ?, ?)",
-        )
-        .bind(chat_id)
-        .bind(feed_url)
-        .bind(eid)
-        .execute(db)
-        .await?;
-    }
     Ok(())
 }
 
@@ -1204,6 +1216,7 @@ pub async fn find_sent_message(
 // directly on the Rust side — kept to preserve the complete mapping of the
 // database schema.
 #[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutboxRow {
     pub id: i64,
     pub chat_id: String,
@@ -1272,35 +1285,14 @@ pub async fn outbox_insert(
 
 /// Fetch outbox entries that are due for retry.
 pub async fn outbox_fetch_due(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<OutboxRow>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query_as::<_, OutboxRow>(
         "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, last_error FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?",
     )
     .bind(now_ts)
     .bind(limit)
     .fetch_all(db)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| OutboxRow {
-            id: r.get("id"),
-            chat_id: r.get("chat_id"),
-            feed_url: r.get("feed_url"),
-            entry_id: r.get("entry_id"),
-            feed_title: r.get("feed_title"),
-            entry_json: r.get("entry_json"),
-            media_json: r.get("media_json"),
-            meta_json: r.get("meta_json"),
-            content_mode: r.get("content_mode"),
-            source_display: r.get("source_display"),
-            link_preview: r.get::<i64, _>("link_preview") != 0,
-            caption_above_media: r.get::<i64, _>("caption_above_media") != 0,
-            author: r.get("author"),
-            attempts: r.get("attempts"),
-            next_retry_at: r.get("next_retry_at"),
-            created_at: r.get("created_at"),
-            last_error: r.get("last_error"),
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// Return every media_json value still referenced by the outbox (all rows,
