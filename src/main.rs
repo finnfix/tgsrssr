@@ -337,13 +337,7 @@ async fn register_cleanup_job(sched: &JobScheduler, state: AppState) -> anyhow::
                 {
                     return;
                 }
-                struct CleanupGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-                impl Drop for CleanupGuard {
-                    fn drop(&mut self) {
-                        self.0.store(false, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                let _guard = CleanupGuard(state.cleanup_active.clone());
+                let _guard = crate::state::ActiveFlagGuard(state.cleanup_active.clone());
                 let cfg = (*state.config).clone();
                 cleanup::run_all_cleanup(&cfg, &state.db).await;
             })

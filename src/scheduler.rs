@@ -71,14 +71,6 @@ pub async fn register_heal_job(sched: &JobScheduler, state: AppState) -> anyhow:
     Ok(())
 }
 
-/// RAII guard clearing an active-flag on every exit path (cycle / outbox retry).
-struct ActiveGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
 /// Read the platform hysteresis streak counter (positive = failure streak,
 /// negative = success streak). Returns Some(n) for a valid stored value (or
 /// 0 when the key is absent — that genuinely means "no streak yet"), or None
@@ -200,7 +192,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         warn!("previous fetch cycle still running, skipping this tick");
         return Ok(());
     }
-    let _guard = ActiveGuard(state.fetch_cycle_active.clone());
+    let _guard = crate::state::ActiveFlagGuard(state.fetch_cycle_active.clone());
 
     let due = db::get_due_subscriptions(&state.db).await?;
     if due.is_empty() {
@@ -246,7 +238,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     // into the spawn closure, the source identifier can no longer be obtained
     // at the join site and failure logs would lose their locator info
     // (added in v1.10.7).
-    let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> = Vec::new();
+    let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<FeedStatus>>)> = Vec::new();
     for (idx, (sub, cfg)) in rss_subs.into_iter().enumerate() {
         let sem = feed_sem.clone();
         let state = state.clone();
@@ -263,7 +255,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
             let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(FeedStatus::Failed),
             };
             let res = process_feed(&state, &bot, sub, cfg, &stats).await;
             drop(permit);
@@ -294,11 +286,13 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         // identifier, so extract it first (v1.10.7).
         let feed_url = sub.feed_url.clone();
         let chat_id = sub.chat_id.clone();
-        if let Err(e) = process_feed(state, bot, sub, cfg, &stats).await {
-            plat_fail += 1;
-            error!(feed = %feed_url, chat_id = %chat_id, error = %e, "platform feed processing failed");
-        } else {
-            plat_ok += 1;
+        match process_feed(state, bot, sub, cfg, &stats).await {
+            Ok(FeedStatus::Ok) => plat_ok += 1,
+            Ok(FeedStatus::Failed) => plat_fail += 1,
+            Err(e) => {
+                plat_fail += 1;
+                error!(feed = %feed_url, chat_id = %chat_id, error = %e, "platform feed processing failed");
+            }
         }
     }
 
@@ -307,7 +301,9 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let mut rss_fail = 0usize;
     for (feed_url, handle) in handles {
         match handle.await {
-            Ok(Ok(())) => rss_ok += 1,
+            Ok(Ok(FeedStatus::Ok)) => rss_ok += 1,
+            // The failure was already logged and handled inside process_feed.
+            Ok(Ok(FeedStatus::Failed)) => rss_fail += 1,
             Ok(Err(e)) => {
                 rss_fail += 1;
                 error!(feed = %feed_url, error = %e, "feed processing failed")
@@ -430,6 +426,14 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
 /// window, which is the real permanent loss.
 const FEED_DEADLINE_SECS: u64 = 240;
 
+/// Outcome of processing one feed. The failure branch handles errors and
+/// notifications internally, so the cycle summary can count real successes
+/// instead of treating every handled error as a success.
+enum FeedStatus {
+    Ok,
+    Failed,
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -443,7 +447,7 @@ async fn process_feed(
     sub: db::SubRow,
     cfg: db::EffectiveConfig,
     stats: &PlatRoundStats,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FeedStatus> {
     let transport = crate::media::MediaTransport::new(&state.config);
 
     // Resolve the chat owner early: used for owner-routed notifications
@@ -481,11 +485,22 @@ async fn process_feed(
     // proxy/network connection errors that recover on their own after a few
     // seconds; a single retry can save the round.
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
+    // Batch sent-entry set: platform fetchers use it to skip enrichment
+    // requests for already-pushed entries (Weibo detail/vote, X pagination),
+    // and the push filter below reuses it instead of one query per entry.
+    let known_sent = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(feed = %cfg.feed_url, error = %e, "sent-entry batch query failed, treating as empty");
+            std::collections::HashSet::new()
+        }
+    };
     let result = fetcher::fetch_feed(
         state,
         &sub.feed_url,
         sub.http_etag.as_deref(),
         sub.http_last_modified.as_deref(),
+        Some(&known_sent),
     )
     .await;
     let result = match result {
@@ -509,12 +524,14 @@ async fn process_feed(
                 &sub.feed_url,
                 sub.http_etag.as_deref(),
                 sub.http_last_modified.as_deref(),
+                Some(&known_sent),
             )
             .await
         }
         other => other,
     };
 
+    let mut feed_failed = false;
     match result {
         Ok(fr) => {
             // Reset error count on success (a 304 "source not updated" also
@@ -539,7 +556,7 @@ async fn process_feed(
 
             // 304 Not Modified: the source has no updates, nothing to push
             if fr.not_modified {
-                return Ok(());
+                return Ok(FeedStatus::Ok);
             }
 
             // Stale-zero detector (structure-independent): a 200 full-body
@@ -574,7 +591,7 @@ async fn process_feed(
                     // debug, so warn explicitly and skip this subscription's
                     // push for this round.
                     warn!(chat_id = %cfg.chat_id, feed = %cfg.feed_url, "invalid chat_id, skipping subscription");
-                    return Ok(());
+                    return Ok(FeedStatus::Ok);
                 }
             };
             // Channel title for notices (owner already resolved at function top).
@@ -604,20 +621,39 @@ async fn process_feed(
             // publish time (old → new). RSS feeds are mostly "newest first";
             // pushing in the original order would invert the timeline of the
             // channel's message stream.
+            // Cross-cycle double-send guard: an entry queued in the outbox but
+            // not yet in sent_entries must be skipped — the outbox has sole
+            // retry authority. Both sets are batch-queried once per feed
+            // instead of two queries per entry; the outbox batch keeps the
+            // documented fail-open semantics (a query error acts as empty).
+            let outbox_ids = match db::outbox_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(feed = %cfg.feed_url, error = %e, "outbox batch query failed, treating as empty");
+                    std::collections::HashSet::new()
+                }
+            };
+            // Cooperative deadline covers filtering too: a 20MB feed can hold
+            // tens of thousands of entries, and the old code created the
+            // deadline only after the filter loop.
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
+            let mut deferred = false;
             let mut pending: Vec<&feed_rs::model::Entry> = Vec::new();
-            for entry in &fr.entries {
+            for (idx, entry) in fr.entries.iter().enumerate() {
+                if idx % 256 == 0 && tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        feed = %cfg.feed_url,
+                        "feed filtering deadline reached, remaining entries deferred to next cycle"
+                    );
+                    deferred = true;
+                    break;
+                }
                 let eid = fetcher::entry_id(entry);
-                if db::is_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await? {
+                if known_sent.contains(&eid) {
                     continue;
                 }
-                // Cross-cycle double-send guard: the fetch cycle and the outbox
-                // retry cycle run under independent AtomicBool locks and can
-                // overlap. An entry that failed a previous round is queued in
-                // the outbox but not yet in sent_entries (mark happens only
-                // after a successful send), so both cycles would otherwise pass
-                // is_entry_sent and push it concurrently. Skip entries the
-                // outbox already owns — the outbox has sole retry authority.
-                if db::is_in_outbox(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await {
+                if outbox_ids.contains(&eid) {
                     continue;
                 }
                 // Content filter: entries whose title matches a rule are marked
@@ -638,23 +674,14 @@ async fn process_feed(
                 pending.sort_by_key(|e| e.published.or(e.updated));
             }
 
-            // Cooperative deadline: after the timeout, no new entry starts
-            // processing (remaining entries continue next round).
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
-
-            // True when the entry loop was cut short by the deadline. The
-            // response's negotiation headers are only saved when the loop
+            // True when an entry loop was cut short (filtering or pushing).
+            // The response's negotiation headers are only saved when everything
             // drained fully (see after the loop): saving them while some
             // entries were deferred would let the next round's conditional
-            // request return 304 and permanently swallow the unpushed entries
-            // (the v1.11.2 "deadline → clear headers" fix only covered the
-            // deadline break, not the `?`-propagation early returns inside
-            // the loop; deferring the save covers all interruption paths at
-            // once). A `?` abort returns before this point too, so headers
-            // stay at the previous round's value and the next round re-fetches
-            // the full body (sent_entries dedup prevents double-push).
-            let mut deferred = false;
+            // request return 304 and permanently swallow the unpushed entries.
+            // A `?` abort returns before this point too, so headers stay at
+            // the previous round's value and the next round re-fetches the
+            // full body (sent_entries dedup prevents double-push).
             for entry in pending {
                 if tokio::time::Instant::now() >= deadline {
                     warn!(
@@ -724,6 +751,10 @@ async fn process_feed(
                             Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
                             Err(e) => {
                                 warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
+                                // Keep the previous conditional-request headers:
+                                // saving this round's ETag would freeze the
+                                // retry behind a 304 on the next round.
+                                deferred = true;
                                 continue;
                             }
                         };
@@ -749,7 +780,19 @@ async fn process_feed(
                             db::delete_setting(&state.db, &retry_key).await.ok();
                             db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                         } else {
-                            db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await.ok();
+                            // A failed counter write must not be swallowed: the
+                            // next round would re-read the old value and notify
+                            // forever while the retry cap is never reached.
+                            if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                                deferred = true;
+                                continue;
+                            }
+                            // The entry is still unresolved: keep the old
+                            // conditional-request headers so the next round
+                            // re-fetches the body and retries the media
+                            // instead of returning 304.
+                            deferred = true;
                             notify_download_failed(
                                 bot,
                                 lang,
@@ -1039,6 +1082,7 @@ async fn process_feed(
             }
         }
         Err(e) => {
+            feed_failed = true;
             let err_msg = format!("{:#}", e);
             warn!(feed = %sub.feed_url, error = %err_msg, "fetch failed");
 
@@ -1050,15 +1094,17 @@ async fn process_feed(
             }
 
             // Cookie-expired flag (for the /cookies panel status display):
-            // set immediately (global). Detection rule: if the error message
-            // contains "cookie", treat the cookie as expired (under normal
-            // circumstances legitimate errors never contain the word cookie —
-            // only authentication-class errors returned by platforms do).
-            // SUBSTRING CONTRACT: the check below matches the "cookie"
-            // substring in platform fetch error messages to detect cookie
-            // expiry; platform code must keep including "cookie" in such
-            // error messages.
-            if err_msg.to_lowercase().contains("cookie") {
+            // set immediately (global). Detection is typed first
+            // (PlatformError::AuthExpired); the legacy "cookie" substring is
+            // kept as a fallback for "cookie not configured" messages that
+            // predate the typed error.
+            let auth_expired = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<crate::platforms::PlatformError>(),
+                    Some(crate::platforms::PlatformError::AuthExpired { .. })
+                )
+            });
+            if auth_expired || err_msg.to_lowercase().contains("cookie") {
                 if let Some(p) = platform_of_url(&sub.feed_url) {
                     db::set_setting(&state.db, &db::setting_key::cookie_expired_notified(p), "1")
                         .await
@@ -1081,7 +1127,7 @@ async fn process_feed(
                         feed = %sub.feed_url,
                         "skip auto-disable: subscription paused by user during this round"
                     );
-                    return Ok(());
+                    return Ok(FeedStatus::Failed);
                 }
                 info!(feed = %sub.feed_url, errors = count, "subscription auto-disabled");
                 // Edge deduplication (#9 fix): no duplicate notification when
@@ -1122,7 +1168,11 @@ async fn process_feed(
         }
     }
 
-    Ok(())
+    Ok(if feed_failed {
+        FeedStatus::Failed
+    } else {
+        FeedStatus::Ok
+    })
 }
 
 /// Determine which platform (weibo / x / telegram) a feed_url belongs to;
@@ -1469,7 +1519,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     {
         return Ok(());
     }
-    let _guard = ActiveGuard(state.outbox_retry_active.clone());
+    let _guard = crate::state::ActiveFlagGuard(state.outbox_retry_active.clone());
 
     let now = chrono::Utc::now().timestamp();
     let due = db::outbox_fetch_due(&state.db, now, 10).await?;
@@ -1527,8 +1577,15 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         };
 
         // Deserialize media items (filter out files that no longer exist)
-        let all_media: Vec<crate::media::MediaItem> =
-            serde_json::from_str(&row.media_json).unwrap_or_default();
+        let all_media: Vec<crate::media::MediaItem> = if row.media_json.trim().is_empty() {
+            warn!(entry_id = %row.entry_id, "outbox: media_json is empty");
+            Vec::new()
+        } else {
+            serde_json::from_str(&row.media_json).unwrap_or_else(|e| {
+                warn!(entry_id = %row.entry_id, error = %e, "outbox: media_json deserialize failed");
+                Vec::new()
+            })
+        };
         let had_media = !all_media.is_empty();
         let original_count = all_media.len();
         let media_items: Vec<crate::media::MediaItem> = all_media
@@ -1548,15 +1605,22 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             );
         }
 
-        // MediaOnly mode with all media files gone (cleaned up): cannot send
-        // anything meaningful. Notify the owner and abandon instead of silent mark-sent.
-        if row.content_mode == "media_only" && had_media && media_items.is_empty() {
+        // MediaOnly mode with no sendable media left (files cleaned up, or a
+        // legacy/corrupt media_json): the text renderer returns None for this
+        // mode, so send_text_only would report a silent success and the entry
+        // would be marked sent without delivering anything. Abandon instead.
+        if row.content_mode == "media_only" && media_items.is_empty() {
+            let reason = if had_media {
+                "notif_media_expired"
+            } else {
+                "notif_media_unreadable"
+            };
             warn!(
                 entry_id = %row.entry_id,
                 feed = %row.feed_url,
-                "outbox entry abandoned: MediaOnly but all media files expired"
+                "outbox entry abandoned: MediaOnly without sendable media"
             );
-            abandon_outbox_row(bot, state, &row, "notif_media_expired").await;
+            abandon_outbox_row(bot, state, &row, reason).await;
             continue;
         }
 
