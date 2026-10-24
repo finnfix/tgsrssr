@@ -26,6 +26,11 @@ static RE_VIDEO_SRC: LazyLock<regex::Regex> =
 /// Extract poster attribute from <video> tags (cover image URL for fallback).
 static RE_VIDEO_POSTER: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"<video\b[^>]*?\bposter\s*=\s*["']([^"']+)["']"#).unwrap());
+/// Owning Weibo status id embedded by the native fetcher. Used to query the
+/// correct playback_list for HD video (main post vs retweeted post).
+static RE_VIDEO_OWNER_MID: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<video\b[^>]*?\bdata-weibo-mid\s*=\s*["']([^"']+)["']"#).unwrap()
+});
 static RE_ANCHOR_BLOCK: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>.*?</a>"#).unwrap());
 static RE_URL_ICON_SPAN: LazyLock<regex::Regex> =
@@ -269,7 +274,7 @@ fn is_weibo_size_seg(seg: &str) -> bool {
 /// replace the video URL; on any failure keep the original.
 async fn upgrade_weibo_video_hd(
     state: &AppState,
-    entry: &Entry,
+    owner_mid: Option<&str>,
     url: &str,
 ) -> String {
     // Only for weibo video hosts / weibo status links.
@@ -281,15 +286,15 @@ async fn upgrade_weibo_video_hd(
         return url.to_string();
     }
 
-    // Status id: entry.id is the numeric ID (mblog["id"]); the
-    // statuses/show API requires the numeric ID.
-    // It cannot be parsed from the entry link — the link's last segment is
-    // the bid (base62-encoded like "RlfOxksyS"), and passing it to
-    // statuses/show?id= returns an error, silently disabling the HD upgrade.
-    let mid = fetcher::entry_id(entry);
-    if mid.is_empty() || !mid.chars().all(|c| c.is_ascii_digit()) {
+    // The status id must be the post that actually owns this video (main post
+    // or retweeted post), not always the entry id: a retweeted video queried
+    // with the main id can be replaced by the main post's video. The native
+    // fetcher embeds data-weibo-mid on each <video>; legacy bodies without it
+    // keep the original (low-quality) stream instead of risking a wrong swap.
+    let Some(mid) = owner_mid.filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit())) else {
         return url.to_string();
-    }
+    };
+    let mid = mid.to_string();
 
     let user_cookies = state.get_cookie("weibo").await.unwrap_or_default();
 
@@ -686,14 +691,20 @@ fn absolutize_media_url(entry: &Entry, raw: &str) -> String {
 
 /// Extract candidate media URLs from an entry: media objects/enclosures first,
 /// then <img>/<video>/<source> tags inside the body HTML.
-/// Returns (url, kind, mime, is_retweet) — is_retweet is true for images
-/// listed in EntryMeta.retweet_images (weibo [view image] links, group-C
-/// sidecar).
-pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMeta>) -> Vec<(String, MediaKind, String, bool)> {
-    let mut out: Vec<(String, MediaKind, String, bool)> = Vec::new();
-    let mut push = |url: String, mime: String, is_rt: bool| {
+/// Returns (url, kind, mime, is_retweet, owner_mid). is_retweet is true for
+/// images listed in EntryMeta.retweet_images (weibo [view image] links,
+/// group-C sidecar); owner_mid is the Weibo status id embedded on a <video>
+/// tag, used to resolve HD playback from the correct post.
+pub fn extract_media_urls(
+    entry: &Entry,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> Vec<(String, MediaKind, String, bool, Option<String>)> {
+    let mut out: Vec<(String, MediaKind, String, bool, Option<String>)> = Vec::new();
+    let mut push = |url: String, mime: String, is_rt: bool, owner_mid: Option<String>| {
         let url = absolutize_media_url(entry, &url);
-        if url.is_empty() || out.iter().any(|(u, _, _, _)| *u == url) || out.len() >= MAX_MEDIA_PER_ENTRY
+        if url.is_empty()
+            || out.iter().any(|(u, _, _, _, _)| *u == url)
+            || out.len() >= MAX_MEDIA_PER_ENTRY
         {
             return;
         }
@@ -702,7 +713,7 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
             return;
         }
         let kind = MediaKind::from_mime_or_ext(&mime, &url);
-        out.push((url, kind, mime, is_rt));
+        out.push((url, kind, mime, is_rt, owner_mid));
     };
 
     for media in &entry.media {
@@ -713,7 +724,7 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
                     .as_ref()
                     .map(|t| t.to_string())
                     .unwrap_or_default();
-                push(u.to_string(), mime, false);
+                push(u.to_string(), mime, false, None);
             }
         }
     }
@@ -733,12 +744,15 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
         //    <video src="..."> tag instead of using <source> children.
         for caps in RE_VIDEO_BLOCK.captures_iter(&body) {
             let block = caps.get(0).unwrap().as_str();
+            let owner_mid = RE_VIDEO_OWNER_MID
+                .captures(block)
+                .map(|c| c[1].to_string());
             if let Some(src_caps) = RE_SOURCE_SRC.captures(block) {
                 let url = crate::htmltext::unescape_html(&src_caps[1]);
-                push(url, "video/unknown".to_string(), false);
+                push(url, "video/unknown".to_string(), false, owner_mid.clone());
             } else if let Some(tag_caps) = RE_VIDEO_SRC.captures(block) {
                 let url = crate::htmltext::unescape_html(&tag_caps[1]);
-                push(url, "video/unknown".to_string(), false);
+                push(url, "video/unknown".to_string(), false, owner_mid);
             }
         }
         // Remove <video> blocks so <img> regex doesn't pick up poster images.
@@ -768,7 +782,7 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
             let tag = caps.get(0).unwrap().as_str();
             let Some(src_caps) = RE_IMG_SRC.captures(tag) else { continue };
             let url = crate::htmltext::unescape_html(&src_caps[1]);
-            push(url, "image/unknown".to_string(), false);
+            push(url, "image/unknown".to_string(), false, None);
         }
     }
 
@@ -778,7 +792,7 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
     // time.
     if let Some(m) = meta {
         for url in &m.retweet_images {
-            push(url.clone(), "image/unknown".to_string(), true);
+            push(url.clone(), "image/unknown".to_string(), true, None);
         }
         // Truncation detection: the push closure silently drops URLs once
         // out reaches MAX_MEDIA_PER_ENTRY.
@@ -789,7 +803,7 @@ pub fn extract_media_urls(entry: &Entry, meta: Option<&crate::entrymeta::EntryMe
         let dropped = m
             .retweet_images
             .iter()
-            .filter(|u| !out.iter().any(|(o, _, _, _)| o == *u))
+            .filter(|u| !out.iter().any(|(o, _, _, _, _)| o == *u))
             .count();
         if dropped > 0 {
             warn!(
@@ -932,7 +946,7 @@ pub async fn prepare_entry_media(
         }
     };
 
-    for (raw_url, kind, mime, is_retweet) in candidates {
+    for (raw_url, kind, mime, is_retweet, owner_mid) in candidates {
         // title_summary single-media mode: skip candidates that can never be
         // sent (audio/documents, detectable GIFs) so they are neither fetched
         // nor reported as a misleading "media download failed".
@@ -944,7 +958,7 @@ pub async fn prepare_entry_media(
         let mut url = upgrade_weibo_size(&raw_url);
         // Weibo-specific: resolve HD video stream via status API.
         if kind == MediaKind::Video {
-            url = upgrade_weibo_video_hd(state, entry, &url).await;
+            url = upgrade_weibo_video_hd(state, owner_mid.as_deref(), &url).await;
         }
         // Keep the direct URL from before the relay rewrite, for a fallback
         // retry when the relay fails.
@@ -1321,6 +1335,21 @@ async fn download_one(
 /// are converted to sendDocument to preserve the original. Large images with
 /// normal aspect ratios (16:9 etc.) are usually acceptable after compression
 /// and still go through sendPhoto.
+/// Whether the local image is encoded in a format Telegram reliably accepts
+/// via sendPhoto (JPEG/PNG). Other formats (WebP/AVIF/SVG/BMP/HEIC/TIFF, and
+/// unknown extensions) are routed to sendDocument instead: sendPhoto rejects
+/// them with a deterministic 400, which would otherwise degrade the entry to
+/// text. GIFs are excluded by the caller because they use sendAnimation.
+pub fn photo_format_compatible(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg") | Some("jpeg") | Some("png")
+    )
+}
+
 pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f64) -> bool {
     if size > MAX_PHOTO_BYTES {
         return true;
@@ -1518,6 +1547,36 @@ mod tests {
     }
 
     #[test]
+    fn photo_format_compatibility_is_conservative() {
+        assert!(photo_format_compatible(std::path::Path::new("a.jpg")));
+        assert!(photo_format_compatible(std::path::Path::new("a.JPEG")));
+        assert!(photo_format_compatible(std::path::Path::new("a.png")));
+        // GIFs use sendAnimation and are excluded by the caller; other
+        // formats are handled as documents.
+        assert!(!photo_format_compatible(std::path::Path::new("a.gif")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.webp")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.avif")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.svg")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.bmp")));
+        assert!(!photo_format_compatible(std::path::Path::new("a")));
+    }
+
+    #[test]
+    fn video_owner_mid_is_extracted() {
+        let body = r#"<video src="https://f.video.weibocdn.com/a.mp4" data-weibo-mid="1234567890"></video>"#;
+        let entry = entry_with_body(body);
+        let urls = extract_media_urls(&entry, None);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].4.as_deref(), Some("1234567890"));
+        // A legacy body without the attribute leaves the owner unknown: the
+        // HD helper must keep the original stream instead of querying the
+        // main entry id.
+        let entry = entry_with_body(r#"<video src="https://f.video.weibocdn.com/b.mp4"></video>"#);
+        let urls = extract_media_urls(&entry, None);
+        assert!(urls[0].4.is_none());
+    }
+
+    #[test]
     fn retweet_inline_image_flagged() {
         // Group C: retweet inline images are passed in via
         // EntryMeta.retweet_images and flagged with is_retweet.
@@ -1531,9 +1590,9 @@ mod tests {
         let urls = extract_media_urls(&entry, Some(&meta));
         assert_eq!(urls.len(), 2);
         // Normal images inside the body are not flagged
-        assert!(!urls.iter().any(|(u, _, _, rt)| u.contains("tvax1") && *rt), "normal image should not be flagged");
+        assert!(!urls.iter().any(|(u, _, _, rt, _)| u.contains("tvax1") && *rt), "normal image should not be flagged");
         // Retweet images from meta are flagged
-        assert!(urls.iter().any(|(u, _, _, rt)| u.contains("wx2") && *rt), "retweet image should be flagged");
+        assert!(urls.iter().any(|(u, _, _, rt, _)| u.contains("wx2") && *rt), "retweet image should be flagged");
     }
 
     #[test]
@@ -1682,7 +1741,7 @@ mod tests {
         let feed = feed_rs::parser::parse(xml.as_bytes()).expect("feed should parse");
         let urls = extract_media_urls(&feed.entries[0], None);
         assert!(
-            urls.iter().any(|(u, _, _, _)| u == "https://example.com/a.jpg"),
+            urls.iter().any(|(u, _, _, _, _)| u == "https://example.com/a.jpg"),
             "urls: {urls:?}"
         );
     }

@@ -719,7 +719,8 @@ pub async fn send_entry_with_media(
         // Retweet inline images: go through the same oversized/long-image/GIF
         // classification; anything over the limits is merged into docs.
         if m.is_retweet && m.kind == MediaKind::Image {
-            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) {
+            let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
+            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) || format_doc {
                 docs.push(m);
             } else if m.is_gif {
                 gifs.push(m);
@@ -730,9 +731,16 @@ pub async fn send_entry_with_media(
         }
         match m.kind {
             MediaKind::Image => {
-                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) {
+                let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
+                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) || format_doc {
                     docs.push(m);
-                    tracing::debug!(size = m.size, w = m.width, h = m.height, "image -> document (oversized/long/w+h)");
+                    tracing::debug!(
+                        size = m.size,
+                        w = m.width,
+                        h = m.height,
+                        format_doc = format_doc,
+                        "image -> document (oversized/long/w+h/format)"
+                    );
                 } else if m.is_gif {
                     // GIFs go through sendAnimation; the photo API does not
                     // play animated images

@@ -94,17 +94,6 @@ static RE_SINAURL_MD: LazyLock<regex::Regex> =
 /// guarantees this premise holds.
 static RE_SINAURL_HTML: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["'](https://weibo\.cn/sinaurl\?u=[^"']+)["'][^>]*>(.*?)</a>"#).unwrap());
-/// Anchor tokens for the balanced card-link scan. The Rust regex crate has no
-/// lookahead, so the previous `.*?url-icon.*?</a>` card patterns could cross
-/// an earlier `</a>` and delete the body text between two anchors. The scan
-/// below matches anchors by nesting depth instead.
-static RE_ANCHOR_OPEN_ANY: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>").unwrap());
-static RE_ANCHOR_CLOSE_ANY: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is)</a\s*>").unwrap());
-static RE_ANCHOR_HREF: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)href\s*=\s*["']([^"']*)["']"#).unwrap());
-
 /// True when the feed URL is a weibo user homepage that should be fetched
 /// natively: https://weibo.com/u/<uid> (also m.weibo.cn / www variants).
 pub fn is_weibo_url(url: &str) -> bool {
@@ -265,7 +254,6 @@ pub async fn fetch_weibo_user(
             tracing::debug!(
                 mid = %mblog_id,
                 is_vote = ?mblog["is_vote"].as_i64(),
-                has_card_link = has_card_anchor(text, |href| href.contains("t.cn/")),
                 has_tcn = text.contains("t.cn/"),
                 page_info_type = ?mblog["page_info"]["type"].as_str(),
                 text_len = text.len(),
@@ -649,9 +637,7 @@ fn img_tag(url: &str) -> String {
 /// getIndex omits the pics array), the page_info video stream, and the
 /// article (top-article) cover image page_info.page_pic when no pics exist.
 /// Shared by the main post and the retweeted status.
-/// Returns true if a video was actually attached (used to conditionally
-/// remove the video card link from the text).
-fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
+fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
     // Images: pics[].large.url (fallback to pics[].url)
     let mut has_pics = false;
     if let Some(pics) = mblog["pics"].as_array() {
@@ -704,7 +690,6 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
         .or_else(|| page_info["page_pic"].as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
-    let mut video_attached = false;
     if page_info["type"].as_str() == Some("video") {
         let media_info = &page_info["media_info"];
         let video_url = media_info["stream_url_hd"]
@@ -725,12 +710,29 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
             })
             .unwrap_or_default();
         if !video_url.is_empty() {
-            if !page_pic_url.is_empty() {
-                body.push_str(&format!("<video src=\"{}\" poster=\"{}\"></video>", crate::push::escape_attr(&video_url), crate::push::escape_attr(page_pic_url)));
+            // Persist the owning status id next to the URL: when the same
+            // body is parsed later (fetch or outbox), the HD upgrade must
+            // query the main post or the retweeted post, not always the main
+            // entry id.
+            let owner_attr = if owner_mid.is_empty() {
+                String::new()
             } else {
-                body.push_str(&format!("<video src=\"{}\"></video>", crate::push::escape_attr(&video_url)));
+                format!(" data-weibo-mid=\"{}\"", crate::push::escape_attr(owner_mid))
+            };
+            if !page_pic_url.is_empty() {
+                body.push_str(&format!(
+                    "<video src=\"{}\"{} poster=\"{}\"></video>",
+                    crate::push::escape_attr(&video_url),
+                    owner_attr,
+                    crate::push::escape_attr(page_pic_url)
+                ));
+            } else {
+                body.push_str(&format!(
+                    "<video src=\"{}\"{}></video>",
+                    crate::push::escape_attr(&video_url),
+                    owner_attr
+                ));
             }
-            video_attached = true;
         }
     } else if page_info["type"].as_str() == Some("live") {
         // Live posts: no video stream to push; extract the cover image
@@ -745,109 +747,6 @@ fn append_weibo_media(body: &mut String, mblog: &Value) -> bool {
             body.push_str(&img_tag(page_pic_url));
         }
     }
-    video_attached
-}
-
-/// Remove the video / vote card links from an HTML body, but only when the
-/// corresponding media/poll has actually been attached separately — the card
-/// link is redundant once the video was sent as media or the vote was
-/// converted to a TG native Poll, but must stay when that failed, so the user
-/// does not lose the only entry point (#1 fix).
-/// Live posts keep their wblive links (users need them to watch the stream;
-/// there is no media to send).
-/// Video and vote removal are independent conditions (not an else-if chain):
-/// a post can carry a video AND be a vote (is_vote==1), and both cards must
-/// be removed on such posts — the former else-if left a redundant t.cn vote
-/// card in the body.
-/// Returns the (possibly) cleaned body; callers assign it back.
-fn strip_pushed_card_links(mut body: String, page_type: &str, video_attached: bool, poll_attached: bool) -> String {
-    if page_type == "video" && video_attached {
-        body = strip_card_anchors(&body, |href| href.contains("video.weibo.com/show"));
-    }
-    if poll_attached {
-        // poll_attached is only true when the vote details were fetched and
-        // converted (see the fetch loop / main-post call site), so no need to
-        // re-check is_vote here.
-        body = strip_card_anchors(&body, |href| href.contains("t.cn/"));
-    }
-    body
-}
-
-/// Remove anchors whose href satisfies `is_card` AND whose inner HTML carries
-/// the `url-icon` card marker. Uses a balanced anchor scan: Rust's regex
-/// crate has no lookahead, so the old `.*?url-icon.*?</a>` pattern could span
-/// an earlier `</a>` and delete the body text between two anchors.
-/// Byte spans of anchors whose href satisfies `is_card` and whose inner HTML
-/// carries the `url-icon` card marker. Unbalanced trailing anchors are left
-/// out (the caller keeps them untouched).
-fn card_anchor_spans(html: &str, is_card: impl Fn(&str) -> bool) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut pos = 0usize;
-    while let Some(open) = RE_ANCHOR_OPEN_ANY.find(&html[pos..]) {
-        let start = pos + open.start();
-        let after_open = pos + open.end();
-        // Balanced scan for the matching </a>.
-        let mut depth = 1usize;
-        let mut cursor = after_open;
-        let mut close: Option<(usize, usize)> = None;
-        loop {
-            let next_open = RE_ANCHOR_OPEN_ANY.find(&html[cursor..]);
-            let next_close = RE_ANCHOR_CLOSE_ANY.find(&html[cursor..]);
-            match (next_open, next_close) {
-                (Some(o), Some(c)) if o.start() < c.start() => {
-                    depth += 1;
-                    cursor += o.end();
-                }
-                (_, Some(c)) => {
-                    depth -= 1;
-                    let close_start = cursor + c.start();
-                    let close_end = cursor + c.end();
-                    if depth == 0 {
-                        close = Some((close_start, close_end));
-                        break;
-                    }
-                    cursor = close_end;
-                }
-                (Some(o), None) => {
-                    cursor += o.end();
-                }
-                (None, None) => break,
-            }
-        }
-        let Some((close_start, close_end)) = close else {
-            break;
-        };
-        let href = RE_ANCHOR_HREF
-            .captures(&html[start..after_open])
-            .map(|c| c[1].to_string())
-            .unwrap_or_default();
-        let inner = &html[after_open..close_start];
-        if is_card(&href) && inner.to_lowercase().contains("url-icon") {
-            spans.push((start, close_end));
-        }
-        pos = close_end;
-    }
-    spans
-}
-
-/// Whether the body contains at least one card anchor (used for diagnostics).
-fn has_card_anchor(html: &str, is_card: impl Fn(&str) -> bool) -> bool {
-    !card_anchor_spans(html, is_card).is_empty()
-}
-
-fn strip_card_anchors(html: &str, is_card: impl Fn(&str) -> bool) -> String {
-    let spans = card_anchor_spans(html, is_card);
-    if spans.is_empty() {
-        return html.to_string();
-    }
-    let mut out = String::with_capacity(html.len());
-    let mut pos = 0usize;
-    for (start, end) in spans {
-        out.push_str(&html[pos..start]);
-        pos = end;
-    }
-    out.push_str(&html[pos..]);
-    out
 }
 
 /// Convert one mblog JSON object into a feed-rs Entry + structured metadata.
@@ -903,13 +802,12 @@ fn mblog_to_entry(
     let mut body = text.clone();
 
     // Images + video (shared helper, also used for retweets below).
-    // Returns true if a video was actually attached.
-    let video_attached = append_weibo_media(&mut body, mblog);
-
-    // Remove video/vote card links (see strip_pushed_card_links: cards are
-    // removed only when the media/poll was actually attached).
-    let page_type = mblog["page_info"]["type"].as_str().unwrap_or("");
-    body = strip_pushed_card_links(body, page_type, video_attached, vote_obj.is_some());
+    // Video cards are dropped later by html_to_telegram_html's media-href
+    // filter, so no fetch-time removal is needed. Vote cards are deliberately
+    // kept: the native poll may fail to send, and removing the t.cn fallback
+    // at fetch time cannot be undone. The cost is one extra card link next to
+    // a successfully sent poll; keeping the entry point is the safer trade.
+    append_weibo_media(&mut body, mblog, &id);
 
     // Retweeted status → blockquote (RSSHub style). The blockquote wraps the
     // entire retweet: header line + original text + original media, so the
@@ -920,6 +818,7 @@ fn mblog_to_entry(
     // the retweet pics would be pushed twice (dedup ran too early).
     let rt = &mblog["retweeted_status"];
     if !rt.is_null() {
+        let rt_mid = status_id_str(rt).unwrap_or_default();
         let rt_user = rt["user"]["screen_name"].as_str().unwrap_or("已注销");
         // Hyperlink the retweeted user's name to the original weibo itself
         // (https://weibo.com/<uid>/<bid>); fall back to the user homepage
@@ -954,15 +853,7 @@ fn mblog_to_entry(
         };
         // Retweet media (pics[] / video / article cover).
         let mut rt_body = rt_text.clone();
-        let rt_video_attached = append_weibo_media(&mut rt_body, rt);
-        // Same card-link cleanup as the main post: when the original is a
-        // video post, append_weibo_media already sent the video, so the
-        // video.weibo.com/show card link must be removed from rt_body too,
-        // otherwise the blockquote keeps a dead link. Vote cards are handled
-        // via the poll sidecar only for the main post, so poll_attached is
-        // false for the retweet (no retweet poll is converted).
-        let rt_page_type = rt["page_info"]["type"].as_str().unwrap_or("");
-        rt_body = strip_pushed_card_links(rt_body, rt_page_type, rt_video_attached, false);
+        append_weibo_media(&mut rt_body, rt, &rt_mid);
         // Header + retweet body in ONE blockquote, single line:
         // "Retweeted @user: original post content" (the template below starts
         // with the Chinese word for "Retweeted").
@@ -970,10 +861,15 @@ fn mblog_to_entry(
         // (visually one line break); split_html recognises original text
         // stuck right before a quote block and handles it separately, so the
         // original text is not wrapped into the quote block.
-        body.push_str(&format!(
-            "\n<blockquote>转发 {}: {}</blockquote>",
-            rt_user_html, rt_body
-        ));
+        // Deleted/unavailable retweets can arrive as a non-null object with
+        // no text and no media. Rendering those produced an empty
+        // "转发 @已注销: " quote; skip the block entirely.
+        if !rt_body.trim().is_empty() {
+            body.push_str(&format!(
+                "\n<blockquote>转发 {}: {}</blockquote>",
+                rt_user_html, rt_body
+            ));
+        }
     }
 
     // Collect main-post inline images (from [View image] links) into sidecar.
@@ -2154,19 +2050,4 @@ mod tests {
         assert!(!out.contains("<b>comment</b>"), "out: {}", out);
     }
 
-    #[test]
-    fn card_anchor_scan_does_not_delete_between_anchors() {
-        // A bare video link followed by an unrelated card anchor: the old
-        // `.*?url-icon.*?</a>` pattern spanned from the first anchor to the
-        // second anchor's close and deleted the text between them.
-        let html = r#"<a href="https://video.weibo.com/show?fid=1">bare</a> KEEP <a href="https://video.weibo.com/show?fid=2"><span class="url-icon"></span>card</a>"#;
-        let out = strip_card_anchors(html, |href| href.contains("video.weibo.com/show"));
-        assert!(out.contains("bare"), "out: {}", out);
-        assert!(out.contains("KEEP"), "out: {}", out);
-        assert!(!out.contains("card"), "out: {}", out);
-        assert!(has_card_anchor(
-            r#"<a href="https://video.weibo.com/show?fid=1"><span class="url-icon"></span>视频</a>"#,
-            |href| href.contains("video.weibo.com/show")
-        ));
-    }
 }
