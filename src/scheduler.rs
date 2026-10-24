@@ -1321,7 +1321,7 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
 
     // Unified format: title + detailed error wrapped in a blockquote.
     // Whether it is folded is decided by the unified rule inside
-    // notify_user_html (fold when >110 characters).
+    // notify_user_html (fold when >200 characters).
     notify_admins_html(bot, state, |lang| {
         i18n::t(lang, "notif_platform_down")
             .replacen("{}", label, 1)
@@ -1379,7 +1379,7 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
 /// Send an HTML notification to a single user (falls back to plain text
 /// when HTML parsing fails, so the notice is never lost).
 pub async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
-    // Unified blockquote folding rule (fold when >110 characters), consistent
+    // Unified blockquote folding rule (fold when >200 characters), consistent
     // with message pushing.
     let html_msg = crate::push::normalize_blockquote_fold(html_msg);
     // Notifications uniformly disable link previews: they often contain
