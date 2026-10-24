@@ -520,17 +520,29 @@ fn format_caption(
 /// - Local Bot API + translatable path → `InputFile::file` (server reads its
 ///   own mount: zero copy, no RAM, 2GB cap).
 /// - Otherwise → memory upload (official API or untranslatable path).
+///
+/// Storage-suffixed paths (`.tgsr`) are uploaded under their logical name
+/// (suffix stripped), so Telegram sees the original extension and document
+/// names stay clean. Old paths without the suffix keep the previous filename
+/// behavior.
 async fn path_input(
     path: &std::path::Path,
     transport: &crate::media::MediaTransport,
 ) -> anyhow::Result<InputFile> {
-    if let Some(bp) = transport.bot_path(path) {
-        Ok(InputFile::file(std::path::PathBuf::from(bp)))
+    let logical_name = crate::media::logical_file_name(path);
+    let physical_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let input = if let Some(bp) = transport.bot_path(path) {
+        InputFile::file(std::path::PathBuf::from(bp))
     } else {
         // Reading a media file can be tens of MB; use async IO instead of
         // blocking a tokio worker while the bytes are loaded.
-        Ok(InputFile::memory(tokio::fs::read(path).await?))
-    }
+        InputFile::memory(tokio::fs::read(path).await?)
+    };
+    Ok(if logical_name.as_str() != physical_name {
+        input.file_name(logical_name)
+    } else {
+        input
+    })
 }
 
 /// Cache-aware input construction: first look up the file_id cache by

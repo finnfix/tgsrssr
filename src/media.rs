@@ -89,6 +89,11 @@ pub const MAX_VIDEO_MEMORY_BYTES: u64 = 49 * 1024 * 1024;
 /// Download cap when the local Bot API reads files directly (file:// path).
 pub const MAX_VIDEO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MEDIA_PER_ENTRY: usize = 30; // At most 3 groups (≤10 each, Telegram mediaGroup cap)
+/// On-disk suffix appended to every downloaded media/thumbnail file. It keeps
+/// extension-based media indexers away from the outbound directory; the
+/// upload layer strips it from the multipart filename, so Telegram still sees
+/// the original extension. Old files without the suffix remain valid.
+const STORAGE_SUFFIX: &str = ".tgsr";
 
 /// How media reaches the Bot API server.
 ///
@@ -1289,7 +1294,9 @@ async fn download_one(
     };
 
     let ext = kind.ext(mime, url);
-    let name = format!("{}_{}.{}", chrono::Utc::now().format("%H%M%S%f"), uuid::Uuid::new_v4(), ext);
+    // Keep the original extension and append the storage-only suffix, e.g.
+    // `123456_uuid.jpg.tgsr`. path_input() strips it when uploading.
+    let name = format!("{}_{}.{}{}", chrono::Utc::now().format("%H%M%S%f"), uuid::Uuid::new_v4(), ext, STORAGE_SUFFIX);
     let path = outbound.join(&name);
     std::fs::rename(&tmp_path, &path)?;
 
@@ -1328,6 +1335,36 @@ async fn download_one(
     }))
 }
 
+/// File name as Telegram should see it: the on-disk storage suffix is removed
+/// when present. Older files (downloaded before the suffix was introduced)
+/// pass through unchanged. Strip exactly one trailing suffix, so a source file
+/// that already ended in `.tgsr` (stored as `.tgsr.tgsr`) is restored to its
+/// original name.
+pub fn logical_file_name(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    name.strip_suffix(STORAGE_SUFFIX).unwrap_or(name).to_string()
+}
+
+/// Original extension of a local media file, ignoring the storage suffix.
+fn logical_extension(path: &Path) -> Option<String> {
+    let name = logical_file_name(path);
+    Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+/// Whether the local image is encoded in a format Telegram reliably accepts
+/// via sendPhoto (JPEG/PNG). Other formats (WebP/AVIF/SVG/BMP/HEIC/TIFF, and
+/// unknown extensions) are routed to sendDocument instead: sendPhoto rejects
+/// them with a deterministic 400, which would otherwise degrade the entry to
+/// text. GIFs are excluded by the caller because they use sendAnimation.
+/// Local paths may carry the `.tgsr` storage suffix; classification always
+/// uses the original extension.
+pub fn photo_format_compatible(path: &std::path::Path) -> bool {
+    matches!(logical_extension(path).as_deref(), Some("jpg") | Some("jpeg") | Some("png"))
+}
+
 /// Determine whether an image will be sent as a document (>10MB / long image
 /// / w+h>10000 / compression risk).
 /// The classification stage in push.rs reuses this function (single source of
@@ -1340,21 +1377,6 @@ async fn download_one(
 /// are converted to sendDocument to preserve the original. Large images with
 /// normal aspect ratios (16:9 etc.) are usually acceptable after compression
 /// and still go through sendPhoto.
-/// Whether the local image is encoded in a format Telegram reliably accepts
-/// via sendPhoto (JPEG/PNG). Other formats (WebP/AVIF/SVG/BMP/HEIC/TIFF, and
-/// unknown extensions) are routed to sendDocument instead: sendPhoto rejects
-/// them with a deterministic 400, which would otherwise degrade the entry to
-/// text. GIFs are excluded by the caller because they use sendAnimation.
-pub fn photo_format_compatible(path: &std::path::Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("jpg") | Some("jpeg") | Some("png")
-    )
-}
-
 pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f64) -> bool {
     if size > MAX_PHOTO_BYTES {
         return true;
@@ -1404,11 +1426,24 @@ async fn run_tool_with_timeout(tool: &str, mut cmd: tokio::process::Command) -> 
     }
 }
 
+/// Final on-disk path for a generated thumbnail. The logical name keeps a
+/// `.jpg` extension (Telegram thumbnails must be JPEG) and the storage suffix
+/// is appended on top. Works for media paths both with and without the
+/// storage suffix, so old outbox rows keep sending correctly.
+fn stored_thumb_path(path: &Path) -> PathBuf {
+    let thumb = path.with_extension("thumb.jpg");
+    let mut name = thumb.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(STORAGE_SUFFIX);
+    thumb.with_file_name(name)
+}
+
 /// Shared ffmpeg frame-grab thumbnail implementation: grab 1 frame from
 /// `path`, fit it inside a 320x320 box (Telegram rejects thumbnails whose
-/// width OR height exceeds 320) and write a JPEG to `thumb`. `ss` is the
-/// start second (None = no seek). Returns true on success when the output is
-/// non-empty and under the 200KB thumbnail limit (with a small margin).
+/// width OR height exceeds 320) and write JPEG bytes to `thumb`. The output
+/// format is forced (`-f image2 -c:v mjpeg`) so `thumb` may carry the `.tgsr`
+/// storage suffix instead of a `.jpg` extension. `ss` is the start second
+/// (None = no seek). Returns true on success when the output is non-empty and
+/// under the 200KB thumbnail limit (with a small margin).
 async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path::Path) -> bool {
     // Telegram: thumbnail must be JPEG, <= 200 KB, width and height <= 320.
     const MAX_THUMB_BYTES: u64 = 190 * 1024;
@@ -1427,6 +1462,7 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
         cmd.arg("-i")
             .arg(path)
             .args(["-frames:v", "1", "-q:v", quality, "-vf", scale])
+            .args(["-f", "image2", "-c:v", "mjpeg"])
             .arg(thumb);
         let ok = run_tool_with_timeout("ffmpeg", cmd)
             .await
@@ -1449,7 +1485,7 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
 /// Grab one frame from an image and scale it to a JPEG thumbnail (for the
 /// document-send preview). Silently returns None on failure.
 async fn make_image_thumb(path: &std::path::Path) -> Option<PathBuf> {
-    let thumb = path.with_extension("thumb.jpg");
+    let thumb = stored_thumb_path(path);
     if grab_thumb(path, None, &thumb).await {
         Some(thumb)
     } else {
@@ -1480,7 +1516,7 @@ async fn probe_video_meta(path: &std::path::Path) -> (Option<PathBuf>, Option<u3
 
     // Thumbnail: prefer the frame at the 1st second; if unavailable (short
     // video), take the first frame
-    let thumb = path.with_extension("thumb.jpg");
+    let thumb = stored_thumb_path(path);
     let mut made = false;
     for ss in ["1", "0"] {
         if grab_thumb(path, Some(ss), &thumb).await {
@@ -1573,6 +1609,54 @@ mod tests {
         assert!(!photo_format_compatible(std::path::Path::new("a.svg")));
         assert!(!photo_format_compatible(std::path::Path::new("a.bmp")));
         assert!(!photo_format_compatible(std::path::Path::new("a")));
+        // Storage-suffixed files are classified by their original extension.
+        assert!(photo_format_compatible(std::path::Path::new("a.jpg.tgsr")));
+        assert!(photo_format_compatible(std::path::Path::new("a.JPEG.tgsr")));
+        assert!(photo_format_compatible(std::path::Path::new("a.png.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.gif.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.webp.tgsr")));
+    }
+
+    #[test]
+    fn logical_file_name_strips_storage_suffix_once() {
+        assert_eq!(logical_file_name(std::path::Path::new("a.jpg.tgsr")), "a.jpg");
+        // Old files downloaded before the suffix existed are unchanged.
+        assert_eq!(logical_file_name(std::path::Path::new("a.jpg")), "a.jpg");
+        // A source file that already ended in `.tgsr` gets a second suffix
+        // on disk; stripping exactly one restores the original name.
+        assert_eq!(logical_file_name(std::path::Path::new("a.tgsr.tgsr")), "a.tgsr");
+        assert_eq!(logical_file_name(std::path::Path::new("a")), "a");
+    }
+
+    #[test]
+    fn stored_thumb_path_keeps_logical_jpeg_name() {
+        assert_eq!(
+            stored_thumb_path(std::path::Path::new("/m/a.jpg.tgsr")),
+            std::path::PathBuf::from("/m/a.jpg.thumb.jpg.tgsr")
+        );
+        assert_eq!(
+            stored_thumb_path(std::path::Path::new("/m/a.jpg")),
+            std::path::PathBuf::from("/m/a.thumb.jpg.tgsr")
+        );
+    }
+
+    #[test]
+    fn image_size_reads_storage_suffixed_files() {
+        // Minimal 1x1 PNG. Dimension detection is content-based, so the
+        // `.tgsr` suffix must not affect the long/oversized image rules.
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+            0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04,
+            0x00, 0x00, 0x00, 0xB5, 0x1C, 0x0C, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44,
+            0x41, 0x54, 0x78, 0xDA, 0x63, 0xFC, 0xFF, 0x1F, 0x00, 0x02, 0xEB, 0x01, 0xF5,
+            0x8F, 0x59, 0x97, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        let path = std::env::temp_dir().join(format!("tgsrssr_size_{}.png.tgsr", uuid::Uuid::new_v4()));
+        std::fs::write(&path, PNG_1X1).unwrap();
+        let size = imagesize::size(&path).expect("imagesize should read content regardless of suffix");
+        assert_eq!((size.width, size.height), (1, 1));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
