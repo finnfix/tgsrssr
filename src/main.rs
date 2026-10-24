@@ -6,6 +6,7 @@ mod db;
 mod entrymeta;
 mod errors;
 mod fetcher;
+mod htmlentities;
 mod htmltext;
 mod i18n;
 mod logging;

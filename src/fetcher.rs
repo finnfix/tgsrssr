@@ -38,6 +38,16 @@ static RE_WEIBO_VIDEO_CARD_TEXT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[\w\u4e00-\u9fff]+的微博视频").unwrap());
 pub static RE_BR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)<br\s*/?>").unwrap());
+/// Block-level closing tags whose boundaries must survive tag stripping.
+/// Without this, `<li>a</li><li>b</li>` flattens to `ab` and table rows run
+/// together. `<blockquote>`/`<pre>` are intentionally excluded: they have
+/// their own sentinel/atomic handling.
+pub static RE_BLOCK_CLOSE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)</(?:p|div|li|tr|td|th|h[1-6]|table|thead|tbody|ul|ol|section|article|header|footer|figure|figcaption)\s*>",
+    )
+    .unwrap()
+});
 static RE_BLOCKQUOTE_OPEN: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap());
 static RE_BLOCKQUOTE_CLOSE: LazyLock<regex::Regex> =
@@ -493,8 +503,14 @@ fn collapse_blank_lines(s: &str) -> String {
 /// Strip HTML tags, unescape entities, and trim. Produces plain text
 /// suitable for titles and summaries.
 pub fn html_to_plain(html: &str) -> String {
-    let s = strip_tags(html);
-    let s = unescape_html(&s);
+    // Visible-text decoder, not the URL decoder: titles, author names and
+    // document labels must decode named entities like `&nbsp;`/`&mdash;` too.
+    // Block boundaries become spaces, otherwise list items/table cells would
+    // concatenate ("firstsecond").
+    let s = RE_BR.replace_all(html, " ");
+    let s = RE_BLOCK_CLOSE.replace_all(&s, " ");
+    let s = strip_tags(&s);
+    let s = crate::htmltext::decode_entities(&s);
     s.trim().to_string()
 }
 
@@ -561,9 +577,12 @@ pub fn html_to_telegram_html(html: &str) -> String {
     // block wasn't caught by is_media_href (e.g. unusual href format).
     s = RE_WEIBO_VIDEO_CARD_TEXT.replace_all(&s, "").to_string();
 
-    // 2) Line breaks.
+    // 2) Line breaks and block boundaries. Other block closers (</li>, </tr>,
+    //    headings, ...) also become newlines; otherwise their text runs
+    //    together after tag stripping.
     s = RE_BR.replace_all(&s, "\n").to_string();
-    s = s.replace("</p>", "\n").replace("</div>", "\n").replace("</br>", "\n");
+    s = RE_BLOCK_CLOSE.replace_all(&s, "\n").to_string();
+    s = s.replace("</br>", "\n");
 
     // 2.5) Preserve <blockquote> boundaries (RSSHub wraps retweeted content in
     //      <blockquote>). Replace with sentinel tokens that survive strip_tags
@@ -598,11 +617,12 @@ pub fn html_to_telegram_html(html: &str) -> String {
     buf.push_str(&s[last..]);
 
     // 4) Flatten remaining markup, decode entities, escape for Telegram.
-    //    `decode_entities` is the visible-text decoder: it maps named
-    //    entities like `&nbsp;` to real characters and decodes `&amp;` last
-    //    (single pass, no over-decoding). The URL decoder `unescape_html`
-    //    leaves `&nbsp;` literal, and the following `escape_html` would then
-    //    re-escape the `&` into a visible `&amp;nbsp;` leak.
+    //    `decode_entities` is the visible-text decoder: it maps HTML 4.01
+    //    named entities like `&nbsp;`/`&mdash;` and numeric references in a
+    //    single pass (so `&amp;lt;` decodes once, not twice). The URL decoder
+    //    `unescape_html` leaves named entities literal, and the following
+    //    `escape_html` would then re-escape the `&` into a visible
+    //    `&amp;nbsp;` leak.
     let plain = crate::htmltext::decode_entities(&strip_tags(&buf));
     let mut out = crate::htmltext::escape_html(&collapse_blank_lines(&plain));
 
@@ -680,6 +700,22 @@ mod tests {
     fn plain_text_escaped_and_br_to_newline() {
         let out = html_to_telegram_html("a &lt;b&gt;<br>c");
         assert_eq!(out, "a &lt;b&gt;\nc");
+    }
+
+    #[test]
+    fn block_elements_are_separated_not_concatenated() {
+        let out = html_to_telegram_html("<ul><li>first</li><li>second</li></ul>");
+        assert!(out.contains("first\nsecond"), "list items concatenated: {out:?}");
+        let title = html_to_plain("<h1>Head</h1><p>Body</p>");
+        assert_eq!(title, "Head Body");
+        let cells = html_to_plain("<table><tr><td>A</td><td>B</td></tr></table>");
+        assert_eq!(cells, "A B");
+    }
+
+    #[test]
+    fn html_to_plain_uses_visible_text_decoder() {
+        assert_eq!(html_to_plain("A&nbsp;B &mdash; C&hellip;"), "A B — C…");
+        assert_eq!(html_to_plain("<b>x</b>&amp;lt;"), "x&lt;");
     }
 
     #[test]

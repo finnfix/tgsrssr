@@ -250,37 +250,70 @@ pub fn format_chat_title_html(title: &str, chat_id: &str) -> String {
     }
 }
 
-/// Decode HTML entities (common named entities + numeric references
-/// &#NNN; / &#xHH;).
-/// Shared uniformly by the plain-text degradation paths (strip_html_tags).
-/// Edge handling: invalid code points (surrogate range / beyond u32) keep
-/// the original text; control characters (including NUL decoded from &#0;)
-/// are dropped rather than injected into messages. &amp; is decoded last to
-/// avoid double decoding (&amp;lt; → &lt;).
+/// Decode HTML entities for visible text: HTML 4.01 named references plus
+/// numeric references `&#NNN;` / `&#xHHH;`. The scan is single-pass, so an
+/// encoded entity (`&amp;lt;`) decodes exactly once instead of being re-read
+/// as a new entity.
+///
+/// Edge handling: unknown/invalid references stay literal; encodings of
+/// non-whitespace control characters (including NUL) are dropped rather than
+/// injected into messages; numeric newline/tab are preserved because feeds
+/// use them as real line breaks. The named table is in
+/// [`crate::htmlentities`].
 pub fn decode_entities(s: &str) -> String {
-    let text = s
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ");
-    static RE_NUM: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"&#([xX][0-9a-fA-F]+|\d+);").unwrap());
-    let text = RE_NUM.replace_all(&text, |caps: &regex::Captures| {
-        let raw = &caps[1];
-        let code = if let Some(hex) = raw.strip_prefix('x').or_else(|| raw.strip_prefix('X')) {
-            u32::from_str_radix(hex, 16).ok()
-        } else {
-            raw.parse::<u32>().ok()
+    const MAX_ENTITY_BODY: usize = 32;
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        let candidate = &after[1..];
+        let Some(semi) = candidate.find(';') else {
+            // No terminator: copy the rest verbatim (no further entity can
+            // start in it without an ampersand we would have found).
+            out.push_str(after);
+            return out;
         };
-        match code.and_then(char::from_u32) {
-            Some(c) if !c.is_control() => c.to_string(),
-            Some(_) => String::new(), // Control char (incl. NUL): drop
-            None => caps[0].to_string(), // Invalid code point: keep original
+        if semi == 0 || semi > MAX_ENTITY_BODY {
+            // Bare "&" or an implausibly long name: keep it literal and let
+            // the scanner continue after this ampersand.
+            out.push('&');
+            rest = candidate;
+            continue;
         }
-    }).to_string();
-    text.replace("&amp;", "&")
+        let body = &candidate[..semi];
+        let decoded = if let Some(num) = body.strip_prefix('#') {
+            let code = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                num.parse::<u32>().ok()
+            };
+            code.and_then(char::from_u32).map(|c| {
+                if c == '\u{a0}' {
+                    " ".to_string()
+                } else if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                    String::new()
+                } else {
+                    c.to_string()
+                }
+            })
+        } else {
+            crate::htmlentities::named(body).map(str::to_string)
+        };
+        match decoded {
+            Some(value) => {
+                out.push_str(&value);
+                rest = &candidate[semi + 1..];
+            }
+            None => {
+                // Unknown name / invalid code point: keep the original `&`.
+                out.push('&');
+                rest = candidate;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Strip all HTML tags for plain-text fallback (tags are deleted outright;
@@ -293,9 +326,10 @@ pub fn strip_html_tags(s: &str) -> String {
 /// Feeds embed `&amp;` etc. in src/href; using them raw corrupts signed
 /// query strings (weibo CDN returns 403). Mirrors rsstt's html.unescape step.
 /// Semantically different from decode_entities: this function targets URL
-/// attribute decoding (numeric references first, no characters dropped),
-/// while decode_entities targets visible text (&amp; decoded last to prevent
-/// double decoding, control characters dropped).
+/// attribute decoding (numeric references first, no characters dropped, only
+/// the markup-critical names), while decode_entities targets visible text
+/// (HTML 4.01 names in a single pass, whitespace control characters kept,
+/// other control characters dropped).
 pub fn unescape_html(s: &str) -> String {
     static RE_ENTITY_NUM: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"&#(\d+);").unwrap());
@@ -1072,6 +1106,29 @@ mod tests {
         assert_eq!(take_utf16_prefix("😎abc", 3), "😎a");
         // Limit sufficient: the whole string is returned.
         assert_eq!(take_utf16_prefix("abc", 10), "abc");
+    }
+
+    // ===== decode_entities =====
+
+    #[test]
+    fn decodes_html4_named_entities() {
+        assert_eq!(
+            decode_entities("A &mdash; B &hellip; C &rsquo;"),
+            "A — B … C ’"
+        );
+        assert_eq!(decode_entities("x&nbsp;y &copy;"), "x y ©");
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;", "entity must decode exactly once");
+    }
+
+    #[test]
+    fn decodes_numeric_entities_and_keeps_whitespace_controls() {
+        assert_eq!(decode_entities("a&#10;b&#9;c"), "a\nb\tc");
+        assert_eq!(decode_entities("a&#x4E2D;b"), "a中b");
+        assert_eq!(decode_entities("a&#160;b"), "a b", "numeric nbsp becomes a plain space");
+        // NUL and other non-whitespace controls are dropped.
+        assert_eq!(decode_entities("a&#0;b&#7;c"), "abc");
+        // Invalid references stay literal.
+        assert_eq!(decode_entities("&unknown; &#x110000;"), "&unknown; &#x110000;");
     }
 
     // ===== visible_len =====

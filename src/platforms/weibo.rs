@@ -1813,7 +1813,8 @@ mod tests {
 
     #[test]
     fn strip_tags_works() {
-        assert_eq!(crate::fetcher::html_to_plain("<a href=\"x\">hello</a><br/>world"), "helloworld");
+        // A line break must not concatenate words in a title/label.
+        assert_eq!(crate::fetcher::html_to_plain("<a href=\"x\">hello</a><br/>world"), "hello world");
     }
 
     #[test]
