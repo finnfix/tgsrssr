@@ -23,6 +23,7 @@ use feed_rs::model::Entry;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::i18n::{self, Lang};
 use crate::state::AppState;
 // Set-Cookie value extraction is a pure text helper; it lives in htmltext
 // and is shared with media.rs (two drifting private copies previously).
@@ -113,10 +114,11 @@ pub async fn fetch_by_url(
     state: &AppState,
     url: String,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let screen_name = parse_screen_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid X user profile URL: {}", url))?;
-    fetch_x_user(state, &screen_name, known_sent).await
+    fetch_x_user(state, &screen_name, known_sent, lang).await
 }
 
 /// Fetch an X user's timeline and convert to FetchResult.
@@ -124,6 +126,7 @@ pub async fn fetch_x_user(
     state: &AppState,
     screen_name: &str,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let auth_token = match state.get_cookie("x").await {
         Some(c) if !c.trim().is_empty() => c,
@@ -136,7 +139,7 @@ pub async fn fetch_x_user(
     // The cached ct0 may have expired (403): clear the cache, re-fetch ct0 and
     // retry the whole flow once. Only a second 403 means the auth_token cookie
     // itself is dead.
-    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent).await;
+    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await;
     let result = match result {
         Err(e) if e.downcast_ref::<StaleCt0Error>().is_some() => {
             tracing::info!(screen_name = screen_name, "X ct0 looks stale; refreshing and retrying once");
@@ -149,7 +152,7 @@ pub async fn fetch_x_user(
                     fetched_at: Instant::now(),
                 });
             }
-            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent).await
+            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await
         }
         other => other,
     };
@@ -168,6 +171,7 @@ async fn fetch_x_user_with_ct0(
     ct0: &str,
     screen_name: &str,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     // Step 2: resolve screen_name → rest_id + display name.
     let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;
@@ -188,7 +192,7 @@ async fn fetch_x_user_with_ct0(
     let mut dropped = 0usize;
     let mut skipped_replies = 0usize;
     for tweet in &tweets {
-        match tweet_to_entry(tweet, screen_name, &display_name) {
+        match tweet_to_entry(tweet, screen_name, &display_name, lang) {
             ConvertOutcome::Ok(e) => {
                 if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
                     entries.push(*e);
@@ -1291,7 +1295,7 @@ enum ConvertOutcome {
 }
 
 /// Convert a GraphQL tweet result object into a feed-rs Entry.
-fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> ConvertOutcome {
+fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str, lang: Lang) -> ConvertOutcome {
     // Handle TweetWithVisibilityResults wrapper (shared with collect_tweet_results).
     let tweet = unwrap_tweet_result(tweet);
 
@@ -1356,7 +1360,7 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str) -> Conve
     let published = parse_twitter_time(legacy["created_at"].as_str().unwrap_or(""));
 
     // Title: first 50 chars of the CLEANED text (no t.co noise).
-    let title = crate::platforms::make_title(&text, "(推文)");
+    let title = crate::platforms::make_title(&text, i18n::t(lang, "x_tweet_title"));
 
     let link = format!("https://x.com/{}/status/{}", screen_name, id);
 
@@ -1631,13 +1635,13 @@ mod tests {
             }
         });
         assert!(matches!(
-            tweet_to_entry(&reply, "user", "User"),
+            tweet_to_entry(&reply, "user", "User", Lang::Zh),
             ConvertOutcome::SkippedReply
         ));
         // Missing legacy is a genuine structural failure.
         let broken = serde_json::json!({"rest_id": "6"});
         assert!(matches!(
-            tweet_to_entry(&broken, "user", "User"),
+            tweet_to_entry(&broken, "user", "User", Lang::Zh),
             ConvertOutcome::Failed
         ));
         let ok = serde_json::json!({
@@ -1645,9 +1649,17 @@ mod tests {
             "legacy": {"id_str": "7", "full_text": "hello"}
         });
         assert!(matches!(
-            tweet_to_entry(&ok, "user", "User"),
+            tweet_to_entry(&ok, "user", "User", Lang::Zh),
             ConvertOutcome::Ok(_)
         ));
+        let empty = serde_json::json!({
+            "rest_id": "8",
+            "legacy": {"id_str": "8", "full_text": ""}
+        });
+        let ConvertOutcome::Ok(entry) = tweet_to_entry(&empty, "user", "User", Lang::En) else {
+            panic!("empty tweet should still convert");
+        };
+        assert_eq!(entry.title.as_ref().unwrap().content, "(Tweet)");
     }
 
     #[test]

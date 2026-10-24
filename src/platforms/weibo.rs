@@ -22,6 +22,7 @@ use feed_rs::model::Entry;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
 // Weibo uses the mobile UA (state::MOBILE_BROWSER_UA, iPhone Safari).
@@ -133,10 +134,11 @@ pub async fn fetch_by_url(
     state: &AppState,
     url: String,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let uid = parse_uid(&url)
         .ok_or_else(|| anyhow::anyhow!("invalid weibo user homepage URL: {}", url))?;
-    fetch_weibo_user(state, &uid, known_sent).await
+    fetch_weibo_user(state, &uid, known_sent, lang).await
 }
 
 /// Fetch a weibo user timeline and convert to FetchResult.
@@ -144,6 +146,7 @@ pub async fn fetch_weibo_user(
     state: &AppState,
     uid: &str,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let cookies = match state.get_cookie("weibo").await {
         Some(c) if !c.trim().is_empty() => c,
@@ -314,7 +317,7 @@ pub async fn fetch_weibo_user(
             None
         };
 
-        match mblog_to_entry(&mblog, uid, &screen_name, full_text.as_deref(), rt_full_text.as_deref(), vote_obj.as_ref()) {
+        match mblog_to_entry(&mblog, uid, &screen_name, full_text.as_deref(), rt_full_text.as_deref(), vote_obj.as_ref(), lang) {
             Some((e, meta)) => {
                 if !meta.is_empty() {
                     metas.insert(e.id.clone(), meta);
@@ -590,7 +593,7 @@ fn is_image_url(url: &str) -> bool {
 /// - cleaned_text: the original link is preserved as an `<a>` hyperlink so it
 ///   remains clickable in the Telegram message.
 /// - image_urls: decoded real image URLs (sinaimg.cn large) for media download.
-fn extract_inline_images(text: &str) -> (String, Vec<String>) {
+fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
     let mut urls: Vec<String> = Vec::new();
 
     // HTML form: <a href="https://weibo.cn/sinaurl?u=...">…label…</a>
@@ -604,7 +607,7 @@ fn extract_inline_images(text: &str) -> (String, Vec<String>) {
             // Keep the original link as a clickable hyperlink.
             // Extract visible label from inner content (strip tags).
             let label = crate::fetcher::html_to_plain(&caps[2]);
-            let label = if label.trim().is_empty() { "查看图片".to_string() } else { label.trim().to_string() };
+            let label = if label.trim().is_empty() { i18n::t(lang, "weibo_image_label").to_string() } else { label.trim().to_string() };
             format!("<a href=\"{}\">{}</a>", crate::push::escape_attr(sinaurl), crate::push::escape_html(&label))
         })
         .to_string();
@@ -759,6 +762,7 @@ fn mblog_to_entry(
     full_text: Option<&str>,
     rt_full_text: Option<&str>,
     vote_obj: Option<&Value>,
+    lang: Lang,
 ) -> Option<(Entry, crate::entrymeta::EntryMeta)> {
     // Read the id tolerantly (string or numeric); a missing/empty id still
     // returns None here, which the caller logs as a warn (not silent).
@@ -783,7 +787,7 @@ fn mblog_to_entry(
     // EntryMeta.retweet_images so the media pipeline sends them as a
     // separate message after the main one (group C sidecar, replacing the
     // former data-rt injection).
-    let (text, main_inline_imgs) = extract_inline_images(&text);
+    let (text, main_inline_imgs) = extract_inline_images(&text, lang);
 
     // Markdown rendering: md_render_mark == 1 indicates the post was authored
     // with weibo's markdown editor (desktop web). The text field contains
@@ -819,7 +823,7 @@ fn mblog_to_entry(
     let rt = &mblog["retweeted_status"];
     if !rt.is_null() {
         let rt_mid = status_id_str(rt).unwrap_or_default();
-        let rt_user = rt["user"]["screen_name"].as_str().unwrap_or("已注销");
+        let rt_user = rt["user"]["screen_name"].as_str().unwrap_or_else(|| i18n::t(lang, "weibo_deleted_user"));
         // Hyperlink the retweeted user's name to the original weibo itself
         // (https://weibo.com/<uid>/<bid>); fall back to the user homepage
         // when bid is missing, and to plain text when uid is missing too.
@@ -922,7 +926,7 @@ fn mblog_to_entry(
 
     // Title: first 50 visible chars of text (strip tags)
     let plain = crate::fetcher::html_to_plain(&text);
-    let title = crate::platforms::make_title(&plain, "(微博)");
+    let title = crate::platforms::make_title(&plain, i18n::t(lang, "weibo_title_fallback"));
 
     let link = format!("https://weibo.com/{}/{}", uid, bid);
 
@@ -1741,11 +1745,20 @@ mod tests {
     fn extract_inline_images_html_plain_form() {
         // Simple form: <a href="sinaurl">label</a>
         let html = r#"前文<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg">查看图片</a>后文"#;
-        let (text, urls) = extract_inline_images(html);
+        let (text, urls) = extract_inline_images(html, Lang::Zh);
         assert_eq!(urls, vec!["https://wx2.sinaimg.cn/large/abc.jpg"]);
         assert!(text.contains(r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg">查看图片</a>"#), "text: {}", text);
         assert!(text.starts_with("前文"));
         assert!(text.ends_with("后文"));
+    }
+
+    #[test]
+    fn extract_inline_images_empty_label_is_localized() {
+        let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg"></a>"#;
+        let (zh, _) = extract_inline_images(html, Lang::Zh);
+        assert!(zh.contains(">查看图片</a>"), "zh: {}", zh);
+        let (en, _) = extract_inline_images(html, Lang::En);
+        assert!(en.contains(">View image</a>"), "en: {}", en);
     }
 
     #[test]
@@ -1755,7 +1768,7 @@ mod tests {
         // empty span) plus a surl-text span holding the label.
         // The label is not fixed: "View image" (2026-10-06) / "Comment image" (2026-10-13).
         let html = r#"就是抖包袱！ <a  href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2F53899d01ly1ihrm04xdknj219a19a1ky.jpg" data-hide=""><span class='url-icon'></span><span class="surl-text">查看图片</span></a>"#;
-        let (text, urls) = extract_inline_images(html);
+        let (text, urls) = extract_inline_images(html, Lang::Zh);
         assert_eq!(urls, vec!["https://wx2.sinaimg.cn/large/53899d01ly1ihrm04xdknj219a19a1ky.jpg"]);
         assert!(text.starts_with("就是抖包袱！ "), "text: {}", text);
         assert!(text.contains("查看图片</a>"), "text: {}", text);
@@ -1764,7 +1777,7 @@ mod tests {
 
         // "Comment image" label: same structure, different surl-text.
         let html2 = r#"转发下？ <a  href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx4.sinaimg.cn%2Flarge%2Fbaf3936fgy1ii0h79kjtej20u02run9s.jpg" data-hide=""><span class='url-icon'></span><span class="surl-text">评论配图</span></a>"#;
-        let (text2, urls2) = extract_inline_images(html2);
+        let (text2, urls2) = extract_inline_images(html2, Lang::Zh);
         assert_eq!(urls2, vec!["https://wx4.sinaimg.cn/large/baf3936fgy1ii0h79kjtej20u02run9s.jpg"]);
         assert!(text2.contains("评论配图</a>"), "text: {}", text2);
         assert!(!text2.contains("url-icon"), "text: {}", text2);
@@ -1773,7 +1786,7 @@ mod tests {
     #[test]
     fn extract_inline_images_markdown_form() {
         let md = "看这里 [查看图片](https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx1.sinaimg.cn%2Flarge%2Fdef.jpg) 完";
-        let (text, urls) = extract_inline_images(md);
+        let (text, urls) = extract_inline_images(md, Lang::Zh);
         assert_eq!(urls, vec!["https://wx1.sinaimg.cn/large/def.jpg"]);
         assert!(text.contains("查看图片</a>"), "text: {}", text);
     }
@@ -1782,7 +1795,7 @@ mod tests {
     fn extract_inline_images_non_http_u_ignored() {
         // u param that is not an http(s) URL must not be extracted.
         let html = r#"<a href="https://weibo.cn/sinaurl?u=javascript%3Aalert(1)">查看图片</a>"#;
-        let (_text, urls) = extract_inline_images(html);
+        let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty(), "urls: {:?}", urls);
     }
 
@@ -1792,7 +1805,7 @@ mod tests {
         // like peopleapp.com) must NOT be extracted as media.  The link is
         // still preserved as a clickable hyperlink.
         let html = r#"正文<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwww.peopleapp.com%2Farticle%2F12345">网页链接</a>结尾"#;
-        let (text, urls) = extract_inline_images(html);
+        let (text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty(), "non-image URL must be filtered, got: {:?}", urls);
         // The hyperlink is still preserved in the text.
         assert!(text.contains("网页链接</a>"), "text: {}", text);
@@ -1803,7 +1816,7 @@ mod tests {
         // sinaimg.cn URLs without a file extension are still accepted
         // (weibo CDN sometimes serves extensionless image URLs).
         let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx1.sinaimg.cn%2Flarge%2F006Xdasfly1abc">查看图片</a>"#;
-        let (_text, urls) = extract_inline_images(html);
+        let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert_eq!(urls, vec!["https://wx1.sinaimg.cn/large/006Xdasfly1abc"]);
     }
 
@@ -1811,7 +1824,7 @@ mod tests {
     fn extract_inline_images_non_sinaimg_with_image_ext_accepted() {
         // Non-sinaimg hosts with a recognised image extension are accepted.
         let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fphoto.png">查看图片</a>"#;
-        let (_text, urls) = extract_inline_images(html);
+        let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert_eq!(urls, vec!["https://example.com/photo.png"]);
     }
 
@@ -1819,7 +1832,7 @@ mod tests {
     fn extract_inline_images_non_sinaimg_no_ext_filtered() {
         // Non-sinaimg hosts without an image extension are filtered.
         let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fpage">网页链接</a>"#;
-        let (_text, urls) = extract_inline_images(html);
+        let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty(), "urls: {:?}", urls);
     }
 
@@ -1847,7 +1860,7 @@ mod tests {
     fn extract_inline_images_video_card_not_matched() {
         // video.weibo.com cards carry no sinaurl?u= and must not match.
         let html = r#"<a  href="https://video.weibo.com/show?fid=1034:123" data-hide=""><span class='url-icon'></span><span class="surl-text">某某的微博视频</span></a>"#;
-        let (text, urls) = extract_inline_images(html);
+        let (text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty());
         assert_eq!(text, html);
     }

@@ -510,6 +510,7 @@ async fn process_feed(
         sub.http_etag.as_deref(),
         sub.http_last_modified.as_deref(),
         Some(&known_sent_snapshot),
+        lang,
     )
     .await;
     let result = match result {
@@ -534,6 +535,7 @@ async fn process_feed(
                 sub.http_etag.as_deref(),
                 sub.http_last_modified.as_deref(),
                 Some(&known_sent_snapshot),
+                lang,
             )
             .await
         }
@@ -591,6 +593,7 @@ async fn process_feed(
                 mode: ContentMode::from_str(&cfg.content_mode),
                 source: push::SourceDisplay::from_str(&cfg.source_display),
                 link_preview: cfg.link_preview,
+                lang,
             };
             let chat_id: i64 = match cfg.chat_id.parse() {
                 Ok(id) => id,
@@ -698,7 +701,7 @@ async fn process_feed(
                 // as sent directly (never pushed), avoiding repeated checks
                 // every round eating into the fetch window.
                 if !filter_cfg
-                    .allows_title_with_keywords(&fetcher::entry_title(entry), &filter_keywords)
+                    .allows_title_with_keywords(&fetcher::entry_title(entry, lang), &filter_keywords)
                 {
                     db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                     continue;
@@ -1753,10 +1756,16 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         // Reconstruct render opts BEFORE the MediaOnly check: content_mode is
         // a legacy-tolerant string (`MediaOnly`/`mediaonly`), so a raw string
         // compare here would bypass the abandon guard for older rows.
+        // Owner language drives user-visible fallbacks (missing title).
+        let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
+            Ok(Some(owner)) => owner_lang(state, owner).await,
+            _ => Lang::En,
+        };
         let opts = push::RenderOpts {
             mode: ContentMode::from_str(&row.content_mode),
             source: push::SourceDisplay::from_str(&row.source_display),
             link_preview: row.link_preview,
+            lang,
         };
 
         // MediaOnly mode with no sendable media left (files cleaned up, or a

@@ -7,6 +7,7 @@ use teloxide::types::{
 
 use crate::db::{self, Db};
 use crate::fetcher;
+use crate::i18n::Lang;
 use crate::htmltext::{
     merge_adjacent_blockquotes, split_html, strip_html_tags, truncate_html_keep_links,
 };
@@ -345,6 +346,8 @@ pub struct RenderOpts {
     pub mode: ContentMode,
     pub source: SourceDisplay,
     pub link_preview: bool,
+    /// Owner language for user-visible fallbacks (missing title, etc.).
+    pub lang: Lang,
 }
 
 /// Source footer line, or empty string.
@@ -434,7 +437,7 @@ fn render_parts(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> Option<RenderedParts> {
-    let title = fetcher::entry_title(entry);
+    let title = fetcher::entry_title(entry, opts.lang);
     let link = fetcher::entry_link(entry);
     let head = |linked: bool| -> String {
         match (&link, linked) {

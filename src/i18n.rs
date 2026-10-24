@@ -493,6 +493,22 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Zh, "label_source") => "源",
         (Lang::En, "label_source") => "Source",
 
+        // ===== Entry / platform fallbacks =====
+        (Lang::Zh, "title_untitled") => "(无标题)",
+        (Lang::En, "title_untitled") => "(Untitled)",
+        (Lang::Zh, "weibo_image_label") => "查看图片",
+        (Lang::En, "weibo_image_label") => "View image",
+        (Lang::Zh, "weibo_deleted_user") => "已注销",
+        (Lang::En, "weibo_deleted_user") => "Deleted user",
+        (Lang::Zh, "weibo_repost") => "转发",
+        (Lang::En, "weibo_repost") => "Repost",
+        (Lang::Zh, "weibo_title_fallback") => "(微博)",
+        (Lang::En, "weibo_title_fallback") => "(Weibo)",
+        (Lang::Zh, "telegram_media_title") => "(媒体消息)",
+        (Lang::En, "telegram_media_title") => "(Media message)",
+        (Lang::Zh, "x_tweet_title") => "(推文)",
+        (Lang::En, "x_tweet_title") => "(Tweet)",
+
         // ===== Media warnings =====
         (Lang::Zh, "media_image") => "图片",
         (Lang::En, "media_image") => "image",

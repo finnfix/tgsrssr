@@ -396,7 +396,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // NOT added. Otherwise the title falls back to the URL and, worse, the
         // "mark existing entries as read" step is skipped — the first successful
         // cycle would then dump the whole feed history into the channel.
-        let fetch_result = fetcher::fetch_feed(state, url_str, None, None, None).await;
+        let fetch_result = fetcher::fetch_feed(state, url_str, None, None, None, lang).await;
         let fr = match fetch_result {
             Ok(fr) => fr,
             Err(e) => {
@@ -583,7 +583,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         .await?;
     let progress_id = progress_msg.id;
 
-    let fr = match fetcher::fetch_feed(state, &feed_url, None, None, None).await {
+    let fr = match fetcher::fetch_feed(state, &feed_url, None, None, None, lang).await {
         Ok(fr) => fr,
         Err(e) => {
             tracing::warn!(feed_url = %feed_url, error = %e, "/test: fetch failed");
@@ -640,11 +640,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             mode: ContentMode::from_str(&e.content_mode),
             source: push::SourceDisplay::from_str(&e.source_display),
             link_preview: e.link_preview,
+            lang,
         },
         None => push::RenderOpts {
             mode: ContentMode::TitleLink,
             source: push::SourceDisplay::Source,
             link_preview: true,
+            lang,
         },
     };
 

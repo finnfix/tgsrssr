@@ -16,6 +16,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use feed_rs::model::Entry;
 
+use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -195,16 +196,18 @@ pub async fn fetch_by_url(
     state: &AppState,
     url: String,
     _known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let channel = parse_channel_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid Telegram channel URL: {}", url))?;
-    fetch_telegram_channel(state, &channel).await
+    fetch_telegram_channel(state, &channel, lang).await
 }
 
 /// Fetch a Telegram public channel's web preview and convert to FetchResult.
 pub async fn fetch_telegram_channel(
     state: &AppState,
     channel: &str,
+    lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let url = format!("https://t.me/s/{}", channel);
     let client = state.client_for_url(&url);
@@ -254,7 +257,7 @@ pub async fn fetch_telegram_channel(
     let mut entries: Vec<Entry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (post, block) in &blocks {
-        if let Some(e) = message_to_entry(post, block, &feed_title) {
+        if let Some(e) = message_to_entry(post, block, &feed_title, lang) {
             // Dedup by entry id within the batch, matching the Weibo/X
             // convention (fix for #8)
             if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
@@ -333,7 +336,7 @@ fn extract_channel_title(html: &str) -> Option<String> {
 
 /// Convert one message block into a feed-rs Entry.
 /// `data_post` has the form `<channel>/<msg_id>`.
-fn message_to_entry(data_post: &str, block: &str, feed_title: &str) -> Option<Entry> {
+fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) -> Option<Entry> {
     // data_post must be in channel/msgid form.
     if !data_post.contains('/') {
         return None;
@@ -397,7 +400,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str) -> Option<En
 
     // Title: plain-text first 50 visible chars (strip tags for display).
     let plain = crate::fetcher::html_to_plain(&main_html);
-    let title = crate::platforms::make_title(&plain, "(媒体消息)");
+    let title = crate::platforms::make_title(&plain, i18n::t(lang, "telegram_media_title"));
 
 
 
@@ -791,19 +794,23 @@ mod tests {
         // Polls/documents/audio/stickers have no text container; they must
         // become a link-only entry instead of being dropped silently.
         let poll = r#"<div class="tgme_widget_message_poll"><div class="tgme_widget_message_poll_question">Q?</div></div>"#;
-        let entry = message_to_entry("chan/1", poll, "Chan").expect("poll entry");
+        let entry = message_to_entry("chan/1", poll, "Chan", Lang::Zh).expect("poll entry");
+        assert_eq!(entry.title.as_ref().unwrap().content, "(媒体消息)");
         let body = entry.content.unwrap().body.unwrap();
         assert!(body.contains("https://t.me/chan/1"));
         assert!(body.contains('🗳'));
 
+        let en = message_to_entry("chan/1", poll, "Chan", Lang::En).expect("poll entry");
+        assert_eq!(en.title.as_ref().unwrap().content, "(Media message)");
+
         let doc = r#"<div class="tgme_widget_message_document_wrap"><span class="tgme_widget_message_document_title">report.pdf</span></div>"#;
-        let entry = message_to_entry("chan/2", doc, "Chan").expect("document entry");
+        let entry = message_to_entry("chan/2", doc, "Chan", Lang::Zh).expect("document entry");
         let body = entry.content.unwrap().body.unwrap();
         assert!(body.contains("https://t.me/chan/2"));
         assert!(body.contains("report.pdf"));
 
         // Genuine service messages are still skipped.
         let service = r#"<div class="tgme_widget_message_service">joined the channel</div>"#;
-        assert!(message_to_entry("chan/3", service, "Chan").is_none());
+        assert!(message_to_entry("chan/3", service, "Chan", Lang::Zh).is_none());
     }
 }

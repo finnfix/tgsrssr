@@ -5,6 +5,7 @@ use feed_rs::model::Entry;
 use url::Url;
 
 use crate::htmltext::{unescape_html, RE_TAG};
+use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
 /// Static regexes: the HTML→Telegram-HTML conversion runs on every entry,
@@ -162,13 +163,15 @@ pub async fn fetch_feed(
     etag: Option<&str>,
     last_modified: Option<&str>,
     known_sent: Option<&std::collections::HashSet<String>>,
+    lang: Lang,
 ) -> anyhow::Result<FetchResult> {
     // Native platform fetch (weibo / X / Telegram): bypass the RSS/HTTP
     // pipeline entirely. Registry-driven — new platforms route automatically.
     // `known_sent` lets platform fetchers skip enrichment requests for entries
     // the scheduler already pushed (Weibo long-text/vote detail, X pagination).
+    // `lang` selects the owner's language for user-visible fallback labels.
     if let Some(p) = crate::platforms::platform_for_url(feed_url) {
-        return (p.fetch)(state, feed_url.to_string(), known_sent).await;
+        return (p.fetch)(state, feed_url.to_string(), known_sent, lang).await;
     }
 
     let _permit = state.fetch_semaphore.acquire().await
@@ -386,13 +389,13 @@ pub fn entry_link(entry: &Entry) -> Option<String> {
 }
 
 /// Extract entry title.
-pub fn entry_title(entry: &Entry) -> String {
+pub fn entry_title(entry: &Entry, lang: Lang) -> String {
     entry
         .title
         .as_ref()
         .map(|t| t.content.clone())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(无标题)".to_string())
+        .unwrap_or_else(|| i18n::t(lang, "title_untitled").to_string())
 }
 
 /// Extract entry author name (first author), if any.
@@ -808,5 +811,20 @@ mod tests {
         assert!(out.contains("普通文本"), "out: {}", out);
         assert!(out.contains("第二行"), "out: {}", out);
         assert!(!out.contains("img.example.com"), "img leaked: {}", out);
+    }
+
+    #[test]
+    fn entry_title_fallback_is_localized() {
+        let entry = crate::platforms::make_entry(
+            "id".to_string(),
+            String::new(),
+            "author".to_string(),
+            String::new(),
+            "text/html",
+            "https://example.com/1".to_string(),
+            None,
+        );
+        assert_eq!(entry_title(&entry, Lang::Zh), "(无标题)");
+        assert_eq!(entry_title(&entry, Lang::En), "(Untitled)");
     }
 }
