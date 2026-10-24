@@ -13,11 +13,14 @@ use crate::state::AppState;
 
 /// Shows current values with a ✓ and lets the owner switch them in place.
 /// Settings main page: three second-level entries + link-preview toggle.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn render_settings_page(
     bot: &Bot,
     target: PageTarget<'_>,
     chat_id: &str,
     state: &AppState,
+    ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
@@ -36,15 +39,16 @@ pub(super) async fn render_settings_page(
         .replacen("{}", sd_label, 1)
         .replacen("{}", lp_label, 1);
 
+    let pages = format!("|{}|{}", ch_page, chlist_page);
     let buttons = vec![
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_interval"), format!("c|cfgi|{}", chat_id))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_mode"), format!("c|cfgm|{}", chat_id))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_source"), format!("c|cfgs|{}", chat_id))],
+        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_interval"), format!("c|cfgi|{}{}", chat_id, pages))],
+        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_mode"), format!("c|cfgm|{}{}", chat_id, pages))],
+        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_source"), format!("c|cfgs|{}{}", chat_id, pages))],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_lp").replacen("{}", lp_label, 1),
-            format!("c|cfglp|{}", chat_id),
+            format!("c|cfglp|{}{}", chat_id, pages),
         )],
-        back_close_row(lang, "back", format!("c|ch|{}", chat_id)),
+        back_close_row(lang, "back", format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page)),
     ];
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -118,6 +122,8 @@ pub(super) async fn render_settings_interval(
     target: PageTarget<'_>,
     chat_id: &str,
     state: &AppState,
+    ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
@@ -132,8 +138,8 @@ pub(super) async fn render_settings_interval(
         require_override_for_mark: false,
         cb_prefix: "c|cfgiv",
         id_seg: chat_id.to_string(),
-        cb_suffix: String::new(),
-        back_cb: format!("c|cfg|{}", chat_id),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -145,6 +151,8 @@ pub(super) async fn render_settings_mode(
     target: PageTarget<'_>,
     chat_id: &str,
     state: &AppState,
+    ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
@@ -163,8 +171,8 @@ pub(super) async fn render_settings_mode(
         require_override_for_mark: false,
         cb_prefix: "c|cfgmv",
         id_seg: chat_id.to_string(),
-        cb_suffix: String::new(),
-        back_cb: format!("c|cfg|{}", chat_id),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -176,6 +184,8 @@ pub(super) async fn render_settings_source(
     target: PageTarget<'_>,
     chat_id: &str,
     state: &AppState,
+    ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
@@ -191,8 +201,8 @@ pub(super) async fn render_settings_source(
         require_override_for_mark: false,
         cb_prefix: "c|cfgsv",
         id_seg: chat_id.to_string(),
-        cb_suffix: String::new(),
-        back_cb: format!("c|cfg|{}", chat_id),
+        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
+        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -397,17 +407,19 @@ pub(super) async fn render_feed_source(
 
 /// Second-level page: content filter settings for a feed.
 ///
-/// Public entry point kept for the command path (filter-keyword reply refresh)
-/// which has no channel-list context (a PendingOp stores ch_page only).
+/// Public entry point kept for the command path (filter-keyword reply refresh).
+/// PendingOp stores both page positions now, so the refresh preserves the
+/// channel-list page instead of resetting it.
 pub async fn render_feed_filter(
     bot: &Bot,
     target: PageTarget<'_>,
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
-    render_feed_filter_impl(bot, target, sub_id, state, ch_page, 0, lang).await
+    render_feed_filter_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
 }
 
 /// Internal filter renderer carrying `chlist_page` through every button.

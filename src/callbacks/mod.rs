@@ -460,29 +460,39 @@ pub async fn handle_callback(
             }
         }
         Some("cfg") => {
-            // c|cfg|<chat_id> — open channel settings page
+            // c|cfg|<chat_id>|<ch_page>|<chlist_page> — open settings page
             if let Some(cid) = parts.get(2) {
-                render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
             }
         }
         Some("cfgi") => {
             if let Some(cid) = parts.get(2) {
-                render_settings_interval(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                render_settings_interval(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
             }
         }
         Some("cfgm") => {
             if let Some(cid) = parts.get(2) {
-                render_settings_mode(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                render_settings_mode(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
             }
         }
         Some("cfgs") => {
             if let Some(cid) = parts.get(2) {
-                render_settings_source(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                render_settings_source(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
             }
         }
         Some("cfglp") => {
             // Toggle link preview (chat-level only)
             if let Some(cid) = parts.get(2) {
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 // Strict baseline read: a transient DB error aborts the toggle
                 // with a toast instead of flipping from a wrong default and
                 // persisting a contradictory override.
@@ -497,7 +507,7 @@ pub async fn handle_callback(
                 let next = if cfg.link_preview != 0 { "0" } else { "1" };
                 match db::set_chat_config_field(&state.db, cid, "link_preview", next).await {
                     Ok(_) => {
-                        render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                        render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
                         bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
@@ -528,8 +538,10 @@ pub async fn handle_callback(
             }
         }
         Some("cfgiv") | Some("cfgmv") | Some("cfgsv") => {
-            // c|cfgiv|<chat_id>|<minutes> / c|cfgmv|<chat_id>|<mode> / c|cfgsv|<chat_id>|<value>
+            // c|cfgiv|<chat_id>|<value>|<ch_page>|<chlist_page>
             if let (Some(cid), Some(val)) = (parts.get(2), parts.get(3)) {
+                let ch_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let field = match parts[1] {
                     "cfgiv" => "interval_minutes",
                     "cfgmv" => "content_mode",
@@ -550,7 +562,7 @@ pub async fn handle_callback(
                 match db::set_chat_config_field(&state.db, cid, field, val).await {
                     Ok(_) => {
                         info!(chat_id = %cid, field = field, value = %val, "chat config updated");
-                        render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, lang).await?;
+                        render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
                         bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
@@ -587,15 +599,12 @@ pub async fn handle_callback(
             }
         }
         Some("srcrename") => {
-            // Ask for a new name via plain text prompt; the reply is handled in commands.
-            // NOTE: the callback data may carry a chlist_page (segment 5), but the
-            // PendingOp variant in state.rs stores only ch_page; we cannot extend
-            // it here (state.rs is off-limits to this change). The eventual
-            // rename-reply refresh renders the feed page with chlist_page=0, so
-            // "back to channel" after rename lands on page 0 of the channel list.
-            // Feed-page state itself (ch_page) is preserved.
+            // Ask for a new name via plain text prompt; the reply is handled in
+            // commands. Both page positions are stored so the post-rename
+            // refresh keeps the channel-list page too.
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
                     let chat = q.message.as_ref().map(|m| m.chat().id);
                     // The feed page this button lives on; refreshed in place
@@ -612,6 +621,7 @@ pub async fn handle_callback(
                                 prompt_msg_id,
                                 panel_msg_id,
                                 ch_page,
+                                chlist_page,
                                 created_at: std::time::Instant::now(),
                             }
                         }).await?;
@@ -746,6 +756,7 @@ pub async fn handle_callback(
             // Open keyword-input flow (plain text prompt; reply handled in commands)
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
                     let chat = q.message.as_ref().map(|m| m.chat().id);
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
@@ -778,6 +789,7 @@ pub async fn handle_callback(
                                 prompt_msg_id,
                                 panel_msg_id,
                                 ch_page,
+                                chlist_page,
                                 created_at: std::time::Instant::now(),
                             }
                         }).await?;
@@ -1208,7 +1220,10 @@ pub async fn render_channel_page(
     }
 
     buttons.push(vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "chpage_settings"), format!("c|cfg|{}", chat_id)),
+        InlineKeyboardButton::callback(
+            i18n::t(lang, "chpage_settings"),
+            format!("c|cfg|{}|{}|{}", chat_id, page, chlist_page),
+        ),
         InlineKeyboardButton::callback(i18n::t(lang, "chpage_unsub"), format!("c|unsubpg|{}|0|{}|{}", chat_id, page, chlist_page)),
     ]);
     // When paused sources exist, offer a one-click enable-all (reset error counts and resume fetching immediately)
@@ -1255,19 +1270,19 @@ async fn load_sub_or_deliver(
 /// Render the per-source (feed) page: status, effective config with override
 /// markers, and management buttons (pause/resume, rename, feed-level overrides).
 ///
-/// Public entry point kept for the command path (rename-reply refresh), which
-/// has no channel-list page context (a PendingOp stores ch_page only). The
-/// callback dispatch uses `render_feed_page_impl` to carry the real
-/// `chlist_page` so "back to channel" restores the original channel-list page.
+/// Public entry point kept for the command path (rename-reply refresh).
+/// PendingOp stores both page positions now, so the refresh preserves the
+/// channel-list page instead of resetting it.
 pub async fn render_feed_page(
     bot: &Bot,
     target: PageTarget<'_>,
     sub_id: i64,
     state: &AppState,
     ch_page: usize,
+    chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
-    render_feed_page_impl(bot, target, sub_id, state, ch_page, 0, lang).await
+    render_feed_page_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
 }
 
 /// Internal feed page renderer carrying `chlist_page` (the channel-list page the

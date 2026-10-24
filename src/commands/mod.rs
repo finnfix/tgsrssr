@@ -184,7 +184,7 @@ async fn handle_set(
     } else {
         // Direct channel page
         let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, args, user_id, lang).await);
-        try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(bot, state, &chat_id, user_id).await);
+        try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
         crate::callbacks::render_channel_page(
             bot,
             crate::callbacks::PageTarget::Send(msg.chat.id),
@@ -212,7 +212,7 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     };
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &target, user_id, lang).await);
-    try_register_chat(bot, state, &chat_id, user_id).await;
+    try_register_chat(state, &chat_id).await;
     let subs = try_or_reply!(bot, msg.chat.id, lang, db::get_subscriptions(&state.db, &chat_id).await);
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
@@ -332,7 +332,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
 
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
-    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(bot, state, &chat_id, user_id).await);
+    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
     try_or_reply!(bot, msg.chat.id, lang, db::ensure_chat_config(&state.db, &chat_id).await);
 
     let mut results: Vec<String> = Vec::new();
@@ -527,7 +527,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
-    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(bot, state, &chat_id, user_id).await);
+    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
 
     // Second token is the full feed URL.
     let feed_url = rest[0].to_string();
@@ -825,10 +825,19 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
                 if let Ok(bare) = chat_ref.parse::<i64>() {
                     // t.me/c/<bare>/<msg>: real chat_id = -100<bare>
                     let cid = format!("-100{}", bare);
-                    // Ownership check: only channels owned by the caller may be queried.
-                    if !db::can_manage_chat(&state.db, user_id, &cid).await.unwrap_or(false) {
-                        bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
-                        return Ok(());
+                    // Ownership check: only channels owned by the caller may be
+                    // queried. Distinguish a DB error from "not yours" so a
+                    // transient failure does not look like a permission denial.
+                    match db::can_manage_chat(&state.db, user_id, &cid).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
+                            return Ok(());
+                        }
                     }
                     Some((cid, message_id))
                 } else {
@@ -869,10 +878,18 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
         match msg.forward_origin() {
             Some(teloxide::types::MessageOrigin::Channel { chat, message_id, .. }) => {
                 let cid = chat.id.0.to_string();
-                // Ownership check: only channels owned by the caller may be queried.
-                if !db::can_manage_chat(&state.db, user_id, &cid).await.unwrap_or(false) {
-                    bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
-                    return Ok(());
+                // Ownership check: only channels owned by the caller may be
+                // queried; a DB error is reported as a query failure.
+                match db::can_manage_chat(&state.db, user_id, &cid).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
+                        return Ok(());
+                    }
                 }
                 Some((cid, message_id.0 as i64))
             }
@@ -982,9 +999,22 @@ async fn load_sub_owned(
         retire_prompt(bot, chat, prompt_msg_id, i18n::t(lang, "load_sub_gone")).await;
         return None;
     };
-    if !db::can_manage_chat(&state.db, user_id, &sub.chat_id).await.unwrap_or(false) {
-        retire_prompt(bot, chat, prompt_msg_id, i18n::t(lang, "load_sub_no_perm")).await;
-        return None;
+    match db::can_manage_chat(&state.db, user_id, &sub.chat_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            retire_prompt(bot, chat, prompt_msg_id, i18n::t(lang, "load_sub_no_perm")).await;
+            return None;
+        }
+        Err(e) => {
+            retire_prompt(
+                bot,
+                chat,
+                prompt_msg_id,
+                &i18n::t(lang, "load_sub_db_err").replace("{:#}", &format!("{:#}", e)),
+            )
+            .await;
+            return None;
+        }
     }
     Some(sub)
 }
@@ -1010,7 +1040,7 @@ pub async fn handle_pending_op(
     tracing::debug!(op = op_name, user_id = user_id, empty = text.is_empty(), "consuming pending op");
 
     match op {
-        crate::state::PendingOp::RenameSub { sub_id, prompt_msg_id, panel_msg_id, ch_page, .. } => {
+        crate::state::PendingOp::RenameSub { sub_id, prompt_msg_id, panel_msg_id, ch_page, chlist_page, .. } => {
             if text.is_empty() || text.chars().count() > 100 {
                 retire_prompt(bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "rename_invalid")).await;
                 return Ok(());
@@ -1034,6 +1064,7 @@ pub async fn handle_pending_op(
                         sub_id,
                         state,
                         ch_page,
+                        chlist_page,
                         lang,
                     ).await?;
                 }
@@ -1082,7 +1113,7 @@ pub async fn handle_pending_op(
                 }
             }
         }
-        crate::state::PendingOp::SetFilterKeywords { sub_id, prompt_msg_id, panel_msg_id, ch_page, .. } => {
+        crate::state::PendingOp::SetFilterKeywords { sub_id, prompt_msg_id, panel_msg_id, ch_page, chlist_page, .. } => {
             // Empty input (including non-text messages with text="") cancels, consistent with
             // RenameSub/SetCookie. Otherwise stickers/voice messages etc. would silently clear
             // the keywords and turn filtering off.
@@ -1128,6 +1159,7 @@ pub async fn handle_pending_op(
                         sub_id,
                         state,
                         ch_page,
+                        chlist_page,
                         lang,
                     ).await?;
                 }
@@ -1166,8 +1198,8 @@ fn resolve_target_input(msg: &Message, args: &str) -> Option<String> {
 /// Best-effort chat registration: try getChat, but never fail the command.
 /// Used by /list so that orphan subscriptions (chat no longer registered /
 /// bot removed) can still be listed and managed.
-async fn try_register_chat(bot: &Bot, state: &AppState, chat_id: &str, user_id: i64) {
-    if let Err(e) = ensure_chat_registered(bot, state, chat_id, user_id).await {
+async fn try_register_chat(state: &AppState, chat_id: &str) {
+    if let Err(e) = ensure_chat_registered(state, chat_id).await {
         tracing::debug!(chat_id = %chat_id, error = %e, "soft registration skipped");
     }
 }
@@ -1225,12 +1257,7 @@ async fn resolve_chat_id(state: &AppState, input: &str, user_id: i64, lang: Lang
 /// and has been removed (~30 lines of dead code). Only a defensive existence check remains
 /// here: if a registration is genuinely missing due to an anomaly, leave a warn instead of
 /// staying silent.
-async fn ensure_chat_registered(
-    _bot: &Bot,
-    state: &AppState,
-    chat_id: &str,
-    _user_id: i64,
-) -> anyhow::Result<()> {
+async fn ensure_chat_registered(state: &AppState, chat_id: &str) -> anyhow::Result<()> {
     let existing = db::get_chat(&state.db, chat_id).await?;
     if existing.is_none() {
         tracing::warn!(chat_id = %chat_id, "chat not registered (unexpected under current ownership model)");

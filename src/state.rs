@@ -38,9 +38,10 @@ pub enum PendingOp {
         /// The feed (source) page the user came from; refreshed in place
         /// after a successful rename instead of sending a new panel.
         panel_msg_id: i32,
-        /// The channel-list page the user was on before entering the feed
-        /// page; restored when returning to the channel page.
+        /// The source-list page on the channel page; restored when returning.
         ch_page: usize,
+        /// The channel-list page; also restored on the return path.
+        chlist_page: usize,
         /// When the flow started; used to auto-expire stale prompts.
         created_at: std::time::Instant,
     },
@@ -61,6 +62,8 @@ pub enum PendingOp {
         /// The filter sub-page panel; refreshed in place after save.
         panel_msg_id: i32,
         ch_page: usize,
+        /// Channel-list page to restore on the return path.
+        chlist_page: usize,
         created_at: std::time::Instant,
     },
 }
