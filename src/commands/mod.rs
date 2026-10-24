@@ -697,6 +697,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                             delivered_tg_link: push::tg_message_link(&m),
                             entry_link: fetcher::entry_link(entry),
                             media_failed: poll_failed,
+                            text_only: true,
                             ..Default::default()
                         })
                     }

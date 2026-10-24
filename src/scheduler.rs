@@ -820,7 +820,7 @@ async fn process_feed(
                     // mode, entry not pushed).
                     let entry_link = fetcher::entry_link(entry).unwrap_or_default();
                     for ov in &oversized {
-                        notify_oversized_video(bot, lang, owner_id, &chat_title, &entry_link, None, ov).await;
+                        notify_oversized_video(bot, lang, owner_id, &chat_title, &entry_link, None, false, ov).await;
                     }
                     // Download failures: notify immediately.
                     if !download_warnings.is_empty() {
@@ -1002,13 +1002,14 @@ async fn process_feed(
                         }
                         // Oversized videos: notify immediately.
                         for ov in &oversized {
-                            notify_oversized_video(
+                                notify_oversized_video(
                                 bot,
                                 lang,
                                 owner_id,
                                 &chat_title,
                                 &entry_link,
                                 send_outcome.delivered_tg_link.as_deref(),
+                                send_outcome.text_only,
                                 ov,
                             )
                             .await;
@@ -1138,6 +1139,7 @@ async fn process_feed(
                                         &chat_title,
                                         &entry_link,
                                         None,
+                                        false,
                                         ov,
                                     )
                                     .await;
@@ -1462,9 +1464,12 @@ fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &str) {
 }
 
 /// Oversized-video notification (build + send).
-/// When `delivered_tg_link` is Some, the entry was delivered as pure text
-/// (with the message link attached); when None, the entry was not pushed in
-/// media-only mode.
+/// `delivered_as_text` is true only when the entry's main message is the
+/// plain-text fallback. `delivered_tg_link` can be Some for a media message
+/// too (the entry was sent with other media), so it must not be used to
+/// decide the copy. When the link is None the entry was not pushed
+/// (media-only mode / still queued).
+#[allow(clippy::too_many_arguments)]
 async fn notify_oversized_video(
     bot: &Bot,
     lang: Lang,
@@ -1472,6 +1477,7 @@ async fn notify_oversized_video(
     chat_title: &str,
     entry_link: &str,
     delivered_tg_link: Option<&str>,
+    delivered_as_text: bool,
     ov: &crate::media::OversizedVideo,
 ) {
     let Some(owner) = owner_id else { return };
@@ -1482,13 +1488,16 @@ async fn notify_oversized_video(
         .size
         .map(|s| i18n::t(lang, "notif_video_size").replacen("{}", &(s / (1024 * 1024)).to_string(), 1))
         .unwrap_or_default();
-    let mut msg = match delivered_tg_link {
-        Some(_) => i18n::t(lang, "notif_video_oversized")
+    let mut msg = if delivered_as_text {
+        i18n::t(lang, "notif_video_oversized")
             .replacen("{}", &size_part, 1)
-            .replacen("{}", &push::escape_html(chat_title), 1),
-        None => i18n::t(lang, "notif_video_oversized_no_text")
+            .replacen("{}", &push::escape_html(chat_title), 1)
+    } else {
+        // Either not delivered yet, or delivered with other media; in both
+        // cases "text message sent" would be wrong.
+        i18n::t(lang, "notif_video_oversized_no_text")
             .replacen("{}", &size_part, 1)
-            .replacen("{}", &push::escape_html(chat_title), 1),
+            .replacen("{}", &push::escape_html(chat_title), 1)
     };
     if let Some(tg) = delivered_tg_link {
         push_line(&mut msg, lang, "label_message", tg);

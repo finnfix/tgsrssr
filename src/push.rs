@@ -97,6 +97,11 @@ pub struct SendOutcome {
     pub entry_link: Option<String>,
     pub delivered_tg_link: Option<String>,
     pub delivered_message_id: Option<i64>,
+    /// The entry's main message is the plain-text fallback (including the
+    /// text-only path and "all media failed -> send full text"). Used by the
+    /// oversized-video notice so it does not claim a text message when the
+    /// entry was actually delivered with other media.
+    pub text_only: bool,
 }
 
 /// Extract Weibo poll data from EntryMeta (group-C sidecar explicit protocol,
@@ -256,6 +261,7 @@ pub async fn send_text_only(
         entry_link: fetcher::entry_link(entry),
         delivered_tg_link: tg_message_link(&m),
         delivered_message_id: Some(m.id.0 as i64),
+        text_only: true,
     })
 }
 
@@ -764,7 +770,7 @@ pub async fn send_entry_with_media(
                 anchor = first_msg;
                 caption_delivered = true;
             }
-            Err((sent, e)) => {
+            Err((sent, delivered, e)) => {
                 tracing::warn!(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
@@ -774,9 +780,13 @@ pub async fn send_entry_with_media(
                     "media send failed, falling back to text"
                 );
                 // Fall back to text so the entry is never lost, and capture the
-                // fallback message's link for the owner notice.
-                let mut delivered_tg_link = None;
-                let mut fallback_msg_id: Option<teloxide::types::MessageId> = None;
+                // delivered message's link for the owner notice. `delivered`
+                // is the first op's message when sent > 0; a later retry may
+                // have resumed after it, but the helper keeps the original
+                // first message across attempts.
+                let mut delivered_tg_link = delivered.as_ref().and_then(|m| tg_message_link(m));
+                let mut fallback_msg_id: Option<teloxide::types::MessageId> =
+                    delivered.as_ref().map(|m| m.id);
                 let mut text_delivered = false;
                 if sent > 0 {
                     // The first op (which carries the caption) was delivered
@@ -785,7 +795,7 @@ pub async fn send_entry_with_media(
                     // caption overflow is sent as follow-up messages.
                     text_delivered = true;
                     for chunk in &overflow_chunks {
-                        if let Err(te) = send_chunk_with_retry(bot, chat_id, chunk, false, None).await {
+                        if let Err(te) = send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await {
                             tracing::warn!(
                                 chat_id = chat_id,
                                 entry_id = %fetcher::entry_id(entry),
@@ -846,7 +856,7 @@ pub async fn send_entry_with_media(
                 // the fallback body message.
                 if !rt_photos.is_empty() {
                     let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-                    if let Err((_, re)) = send_rich_ops(bot, db, chat_id, "", false, &rt_ops, transport, 0, fallback_msg_id).await {
+                    if let Err((_, _, re)) = send_rich_ops(bot, db, chat_id, "", false, &rt_ops, transport, 0, fallback_msg_id).await {
                         tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %re, "retweet images send failed after text fallback");
                     }
                 }
@@ -861,6 +871,9 @@ pub async fn send_entry_with_media(
                     entry_link: fetcher::entry_link(entry),
                     delivered_tg_link,
                     delivered_message_id: fallback_msg_id.map(|m| m.0 as i64),
+                    // sent > 0: the first media op (caption) was delivered;
+                    // sent == 0: the full text fallback carries the entry.
+                    text_only: sent == 0,
                 });
             }
         }
@@ -953,9 +966,29 @@ pub async fn send_entry_with_media(
                     }
                 }
             }
-            Err((_, e)) => {
-                tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "retweet inline images send failed");
+            Err((sent, delivered, e)) => {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    failed_op = sent,
+                    total_ops = rt_ops.len(),
+                    error = %e,
+                    "retweet inline images send failed"
+                );
                 media_failed = true;
+                // A non-zero `sent` means op 0 completed. When these rt
+                // images are the sole caption carrier, the caption was
+                // delivered even though a later group failed; marking it
+                // undelivered here would enqueue the entry for outbox retry
+                // and re-send the already delivered group every backoff
+                // until the 72h abandon. Keep the delivered message so
+                // overflow/poll can quote it and /find records a usable id.
+                if rt_is_sole_carrier && sent > 0 {
+                    caption_delivered = true;
+                    if anchor.is_none() {
+                        anchor = delivered.map(|m| *m);
+                    }
+                }
             }
         }
     }
@@ -973,7 +1006,10 @@ pub async fn send_entry_with_media(
         .as_ref()
         .or(first_doc_msg.as_ref())
         .map(|m| m.id);
-    let already_delivered = anchor.is_some() || first_doc_msg.is_some();
+    // `caption_delivered` also covers a partial rt/rich send whose message
+    // object is unavailable: an overflow failure must not trigger a whole
+    // entry replay and duplicate the caption.
+    let already_delivered = caption_delivered || anchor.is_some() || first_doc_msg.is_some();
     for chunk in &overflow_chunks {
         if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await {
             if already_delivered {
@@ -1037,6 +1073,7 @@ pub async fn send_entry_with_media(
         entry_link: fetcher::entry_link(entry),
         delivered_tg_link,
         delivered_message_id,
+        text_only: false,
     })
 }
 
@@ -1318,6 +1355,12 @@ async fn send_doc_msg(
     Ok(m)
 }
 
+/// Failure of a rich-op send: (failed op index, first delivered message,
+/// error). The message is boxed because teloxide's `Message` is large and
+/// clippy rejects a ~2KB Err variant; it is needed to keep the caption
+/// carrier's link/id after a partial send across retries.
+type RichSendFailure = (usize, Option<Box<Message>>, anyhow::Error);
+
 /// Execute ops starting at `resume`. Returns total op count on success, or
 /// (ops completed, error) on failure so the caller can resume.
 /// On success returns the first sent message (for document messages to quote
@@ -1341,7 +1384,7 @@ async fn send_rich_ops(
     // When set, the FIRST op replies to this message (used by retweet
     // inline images to quote the main entry message).
     reply_first_to: Option<teloxide::types::MessageId>,
-) -> Result<(usize, Option<Message>), (usize, anyhow::Error)> {
+) -> Result<(usize, Option<Message>), RichSendFailure> {
     let mut first_msg: Option<Message> = None;
     for (i, op) in ops.iter().enumerate().skip(resume) {
         // Queue centrally per channel to keep parallel sources from hitting
@@ -1356,7 +1399,7 @@ async fn send_rich_ops(
             reply_first_to
         };
         match send_op(bot, db, chat_id, op_caption, caption_above, op, transport, reply_to).await {
-            Err(e) => return Err((i, anyhow::anyhow!("{:#}", e))),
+            Err(e) => return Err((i, first_msg.map(Box::new), anyhow::anyhow!("{:#}", e))),
             Ok(msgs) => {
                 if first_msg.is_none() {
                     first_msg = msgs.into_iter().next();
@@ -1383,19 +1426,34 @@ async fn send_rich_ops_with_retry(
     transport: &crate::media::MediaTransport,
     reply_first_to: Option<teloxide::types::MessageId>,
     ctx: &str,
-) -> Result<(usize, Option<Message>), (usize, anyhow::Error)> {
+) -> Result<(usize, Option<Message>), RichSendFailure> {
+    let mut first_delivered: Option<Box<Message>> = None;
     let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, transport, 0, reply_first_to).await;
+    if let Err((_, first, _)) = &res {
+        first_delivered = first.clone();
+    }
     for backoff in SEND_BACKOFF_SECS {
-        let retry_from = match res {
-            Err((sent, ref e)) if sent < ops.len() && is_retryable_error(&e.to_string()) => Some(sent),
+        let retry_from = match &res {
+            Err((sent, _, e)) if *sent < ops.len() && is_retryable_error(&e.to_string()) => Some(*sent),
             _ => None,
         };
         let Some(sent) = retry_from else { break };
         tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = backoff, "rich send network error, backing off before retry");
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, transport, sent, reply_first_to).await;
+        if first_delivered.is_none() {
+            if let Err((_, first, _)) = &res {
+                first_delivered = first.clone();
+            }
+        }
     }
-    res
+    match res {
+        // Keep the message from the first attempt: a resumed successful call
+        // only returns the first message of the resumed slice, not the true
+        // caption/first-op message delivered before the failure.
+        Ok((total, first)) => Ok((total, first_delivered.map(|m| *m).or(first))),
+        Err((sent, first, e)) => Err((sent, first_delivered.or(first), e)),
+    }
 }
 
 /// Send a single op (granularity = one Telegram API call), with built-in
