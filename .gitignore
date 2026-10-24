@@ -2,7 +2,7 @@
 /data
 /media
 /logs
-# compose.yaml 含密钥（token），模板见 compose.example.yaml
+# compose.yaml holds secrets (token); see compose.example.yaml for the template
 compose.yaml
 *.db
 *.db-wal
