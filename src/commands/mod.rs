@@ -713,25 +713,24 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 match push::send_entry_msg(bot, target_chat, &body, &footer, opts.link_preview).await {
                     Ok(m) => {
                         tracing::info!(msg_id = m.id.0, "/test: text sent");
-                        // Poll: consistent with the plain-text branch of send_entry_with_media
-                        let mut poll_failed = false;
-                        match push::extract_poll(meta) {
-                            Some((question, options, is_multi)) => {
-                                tracing::info!(
-                                    question = %question, options = options.len(),
-                                    is_multi = is_multi,
-                                    "/test: poll extracted, sending"
-                                );
-                                if let Err(e) = push::send_poll(bot, target_chat, &question, &options, is_multi, Some(m.id)).await {
-                                    tracing::warn!(chat_id = target_chat, error = %e, "/test: poll send FAILED");
-                                    poll_failed = true;
-                                } else {
-                                    tracing::info!("/test: poll sent ok");
-                                }
-                            }
-                            None => {
-                                tracing::info!("/test: no poll in entry");
-                            }
+                        // Poll: reuse the shared follow-up helper (the same one
+                        // used by the scheduled plain-text path) while keeping
+                        // /test's detailed diagnostics.
+                        let poll = push::extract_poll(meta);
+                        if let Some((question, options, is_multi)) = &poll {
+                            tracing::info!(
+                                question = %question, options = options.len(),
+                                is_multi = is_multi,
+                                "/test: poll extracted, sending"
+                            );
+                        } else {
+                            tracing::info!("/test: no poll in entry");
+                        }
+                        let poll_failed = push::try_send_poll(bot, target_chat, Some(m.id), meta).await;
+                        if poll_failed {
+                            tracing::warn!(chat_id = target_chat, "/test: poll send FAILED");
+                        } else if poll.is_some() {
+                            tracing::info!("/test: poll sent ok");
                         }
                         Ok(push::SendOutcome {
                             delivered_tg_link: push::tg_message_link(&m),

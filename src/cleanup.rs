@@ -130,16 +130,23 @@ pub async fn enforce_media_quota(
         return Ok(0);
     }
 
-    let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
-    for entry in WalkDir::new(&config.media_dir).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
+    // The recursive walk is blocking filesystem IO; keep it off the async
+    // worker (multi-GB media trees can take seconds).
+    let media_dir = config.media_dir.clone();
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        for entry in WalkDir::new(&media_dir).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                files.push((entry.path().to_path_buf(), mtime, meta.len()));
+            }
         }
-        if let Ok(meta) = entry.metadata() {
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            files.push((entry.path().to_path_buf(), mtime, meta.len()));
-        }
-    }
+        files
+    })
+    .await?;
     files.sort_by_key(|(_, t, _)| *t);
 
     // outbox_protected (paths referenced by pending retries) is passed in by
@@ -251,6 +258,9 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
     // normal success/abandon paths delete them; this sweep catches rows
     // removed outside those paths.
     let r5 = db::cleanup_stale_settings(db_pool, "outbox_media_lost:", 7).await?;
+    // sent_messages is capped by row count; trim here instead of on every
+    // delivered message (the old per-insert COUNT was a full scan).
+    let r6 = db::trim_sent_messages(db_pool, config.sent_messages_max_rows).await?;
     // Note: teloxide_dialogues table has no timestamp column.
     // Dialogue cleanup is handled via chat purge events instead.
     info!(
@@ -259,6 +269,7 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
         stale_settings_deleted = r3,
         stale_zero_deleted = r4,
         outbox_media_lost_deleted = r5,
+        sent_messages_trimmed = r6,
         "database cleanup done"
     );
     Ok(())

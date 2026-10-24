@@ -224,23 +224,17 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         .into_iter()
         .partition(|(sub, _)| platform_of_url(&sub.feed_url).is_some());
 
-    // Plain RSS sources: per-source parallelism (cap taken from the
-    // FETCH_CONCURRENCY config, default 8).
-    // H3 fix: the previous hardcoded 3 made the FETCH_CONCURRENCY env var
-    // ineffective (the outer layer limited to 3 first, so the inner
-    // fetch_semaphore never reached its cap). Now the config value is used
-    // uniformly and the env var actually takes effect.
-    // The permit is acquired inside the spawned task: the main loop is not
-    // blocked, so the serial platform-source loop can progress in parallel
-    // with the RSS sources.
-    let feed_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(state.config.fetch_concurrency));
+    // Plain RSS sources: per-source parallelism is enforced by
+    // `state.fetch_semaphore` inside fetcher::fetch_feed (same
+    // FETCH_CONCURRENCY cap, and it also covers /sub and /test). Keeping a
+    // second scheduler-local semaphore with the same capacity only acquired
+    // another permit without changing effective concurrency.
     // Each handle is paired with a copy of the feed_url: once sub is moved
     // into the spawn closure, the source identifier can no longer be obtained
     // at the join site and failure logs would lose their locator info
     // (added in v1.10.7).
     let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<FeedStatus>>)> = Vec::new();
     for (idx, (sub, cfg)) in rss_subs.into_iter().enumerate() {
-        let sem = feed_sem.clone();
         let state = state.clone();
         let bot = bot.clone();
         let stats = stats.clone();
@@ -253,13 +247,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(600 * idx as u64)).await;
             }
-            let permit = match sem.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return Ok(FeedStatus::Failed),
-            };
-            let res = process_feed(&state, &bot, sub, cfg, &stats).await;
-            drop(permit);
-            res
+            process_feed(&state, &bot, sub, cfg, &stats).await
         })));
     }
 
@@ -1029,7 +1017,6 @@ async fn process_feed(
                                 &cfg.feed_url,
                                 &eid,
                                 send_outcome.entry_link.as_deref(),
-                                state.config.sent_messages_max_rows,
                             )
                             .await
                             .ok();
@@ -1905,7 +1892,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                         &row.feed_url,
                         &row.entry_id,
                         send_outcome.entry_link.as_deref(),
-                        state.config.sent_messages_max_rows,
                     )
                     .await
                     .ok();

@@ -132,11 +132,8 @@ pub struct ChatConfigRow {
 }
 
 /// Effective config for a subscription (after COALESCE).
-// cp_overridden (the caption_above_media override flag) currently has no UI
-// display slot; kept in case a per-feed override switch for caption position
-// is added later. The other overridden flags drive the ✏️/🔗 display.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct EffectiveConfig {
     pub chat_id: String,
     pub feed_url: String,
@@ -148,7 +145,6 @@ pub struct EffectiveConfig {
     pub iv_overridden: bool,
     pub cm_overridden: bool,
     pub sd_overridden: bool,
-    pub cp_overridden: bool,
     pub lp_overridden: bool,
 }
 
@@ -649,7 +645,6 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
                   f.interval_minutes IS NOT NULL AS iv_overridden,
                   f.content_mode IS NOT NULL AS cm_overridden,
                   f.source_display IS NOT NULL AS sd_overridden,
-                  f.caption_above_media IS NOT NULL AS cp_overridden,
                   f.link_preview IS NOT NULL AS lp_overridden
            FROM (SELECT 1) AS base
            LEFT JOIN chat_configs c ON c.chat_id = ?1
@@ -673,7 +668,6 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
             iv_overridden: false,
             cm_overridden: false,
             sd_overridden: false,
-            cp_overridden: false,
             lp_overridden: false,
         });
     };
@@ -688,7 +682,6 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
         iv_overridden: row.get::<i64, _>("iv_overridden") != 0,
         cm_overridden: row.get::<i64, _>("cm_overridden") != 0,
         sd_overridden: row.get::<i64, _>("sd_overridden") != 0,
-        cp_overridden: row.get::<i64, _>("cp_overridden") != 0,
         lp_overridden: row.get::<i64, _>("lp_overridden") != 0,
     })
 }
@@ -826,30 +819,10 @@ pub async fn reset_error_count(db: &Db, sub_id: i64) -> anyhow::Result<()> {
 /// `get_due_subscriptions` (avoids manual per-column `row.get` mapping).
 #[derive(Debug, sqlx::FromRow)]
 struct DueRow {
-    id: i64,
-    chat_id: String,
-    feed_url: String,
-    feed_title: Option<String>,
-    title_overridden: i64,
-    original_title: Option<String>,
-    active: i64,
-    error_count: i64,
-    last_fetch_at: Option<String>,
-    last_error: Option<String>,
-    http_etag: Option<String>,
-    http_last_modified: Option<String>,
-    auto_disabled: i64,
-    disabled_at: Option<String>,
-    interval_minutes: i64,
-    content_mode: String,
-    source_display: String,
-    caption_above_media: i64,
-    link_preview: i64,
-    iv_overridden: i64,
-    cm_overridden: i64,
-    sd_overridden: i64,
-    cp_overridden: i64,
-    lp_overridden: i64,
+    #[sqlx(flatten)]
+    sub: SubRow,
+    #[sqlx(flatten)]
+    cfg: EffectiveConfig,
 }
 
 /// Get all active subscriptions that are due for fetching.
@@ -867,7 +840,6 @@ pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, Effec
                   f.interval_minutes IS NOT NULL AS iv_overridden,
                   f.content_mode IS NOT NULL AS cm_overridden,
                   f.source_display IS NOT NULL AS sd_overridden,
-                  f.caption_above_media IS NOT NULL AS cp_overridden,
                   f.link_preview IS NOT NULL AS lp_overridden
            FROM subscriptions s
            LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
@@ -879,42 +851,7 @@ pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, Effec
     .fetch_all(db)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let sub = SubRow {
-                id: r.id,
-                chat_id: r.chat_id.clone(),
-                feed_url: r.feed_url.clone(),
-                feed_title: r.feed_title,
-                title_overridden: r.title_overridden,
-                original_title: r.original_title,
-                active: r.active,
-                error_count: r.error_count,
-                last_fetch_at: r.last_fetch_at,
-                last_error: r.last_error,
-                http_etag: r.http_etag,
-                http_last_modified: r.http_last_modified,
-                auto_disabled: r.auto_disabled,
-                disabled_at: r.disabled_at,
-            };
-            let cfg = EffectiveConfig {
-                chat_id: r.chat_id,
-                feed_url: r.feed_url,
-                interval_minutes: r.interval_minutes,
-                content_mode: r.content_mode,
-                source_display: r.source_display,
-                caption_above_media: r.caption_above_media != 0,
-                link_preview: r.link_preview != 0,
-                iv_overridden: r.iv_overridden != 0,
-                cm_overridden: r.cm_overridden != 0,
-                sd_overridden: r.sd_overridden != 0,
-                cp_overridden: r.cp_overridden != 0,
-                lp_overridden: r.lp_overridden != 0,
-            };
-            (sub, cfg)
-        })
-        .collect())
+    Ok(rows.into_iter().map(|r| (r.sub, r.cfg)).collect())
 }
 
 /// Save the HTTP negotiation headers (ETag / Last-Modified) of this fetch
@@ -1169,9 +1106,9 @@ pub async fn cleanup_stale_settings(db: &Db, prefix: &str, retention_days: i64) 
 
 // ===== Sent messages registry (/find reverse lookup) =====
 
-/// Register one sent message: TG message → RSS feed entry.
-/// After insertion, if the total row count exceeds the limit, delete the
-/// oldest rows (FIFO trimming).
+/// Register one sent message: TG message → RSS feed entry. Row-count
+/// trimming is done by the periodic cleanup job, not on every insert: the
+/// previous COUNT(*) ran once per delivered message.
 pub async fn record_sent_message(
     db: &Db,
     chat_id: &str,
@@ -1179,7 +1116,6 @@ pub async fn record_sent_message(
     feed_url: &str,
     entry_id: &str,
     entry_link: Option<&str>,
-    max_rows: i64,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT INTO sent_messages (chat_id, message_id, feed_url, entry_id, entry_link)
@@ -1197,26 +1133,29 @@ pub async fn record_sent_message(
     .bind(entry_link)
     .execute(db)
     .await?;
-
-    if max_rows > 0 {
-        // Only trim when the row count exceeds the limit (previously every
-        // insert triggered a full-table scan, O(n) per entry).
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sent_messages")
-            .fetch_one(db)
-            .await?;
-        if count > max_rows {
-            // Keep only the newest max_rows rows (id is monotonically
-            // increasing, so the oldest = smallest id)
-            sqlx::query(
-                r#"DELETE FROM sent_messages
-                   WHERE id NOT IN (SELECT id FROM sent_messages ORDER BY id DESC LIMIT ?)"#,
-            )
-            .bind(max_rows)
-            .execute(db)
-            .await?;
-        }
-    }
     Ok(())
+}
+
+/// Enforce the sent-messages row cap (called from the periodic cleanup job).
+/// Returns the number of rows removed.
+pub async fn trim_sent_messages(db: &Db, max_rows: i64) -> anyhow::Result<u64> {
+    if max_rows <= 0 {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sent_messages")
+        .fetch_one(db)
+        .await?;
+    if count <= max_rows {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        r#"DELETE FROM sent_messages
+           WHERE id NOT IN (SELECT id FROM sent_messages ORDER BY id DESC LIMIT ?)"#,
+    )
+    .bind(max_rows)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// /find reverse lookup: find the RSS entry for a channel + message id.
@@ -1575,6 +1514,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn due_subscriptions_flatten_effective_config() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO chats (chat_id, chat_type, enabled) VALUES ('1', 'channel', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (chat_id, feed_url) VALUES ('1', 'https://example.com/feed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_configs (chat_id, feed_url, interval_minutes, content_mode) VALUES ('1', 'https://example.com/feed', 5, 'content_only')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let due = get_due_subscriptions(&pool).await.unwrap();
+        assert_eq!(due.len(), 1);
+        let (sub, cfg) = &due[0];
+        assert_eq!(sub.chat_id, "1");
+        assert_eq!(cfg.feed_url, "https://example.com/feed");
+        assert_eq!(cfg.interval_minutes, 5);
+        assert_eq!(cfg.content_mode, "content_only");
+        assert!(cfg.iv_overridden);
+        assert!(cfg.cm_overridden);
+        assert!(cfg.link_preview);
+    }
+
+    #[tokio::test]
     async fn set_chat_config_field_creates_row_with_defaults() {
         let pool = test_pool().await;
         set_chat_config_field(&pool, "1", "content_mode", "content_only")
@@ -1583,6 +1552,22 @@ mod tests {
         let cfg = get_chat_config(&pool, "1").await.unwrap().expect("row created");
         assert_eq!(cfg.interval_minutes, DEFAULT_INTERVAL_MINUTES);
         assert_eq!(cfg.content_mode, "content_only");
+    }
+
+    #[tokio::test]
+    async fn trim_sent_messages_keeps_newest_rows() {
+        let pool = test_pool().await;
+        for mid in 1..=3 {
+            record_sent_message(&pool, "1", mid, "https://example.com/feed", &format!("e{mid}"), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(trim_sent_messages(&pool, 2).await.unwrap(), 1);
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT message_id FROM sent_messages ORDER BY message_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![2, 3]);
     }
 
     #[tokio::test]
