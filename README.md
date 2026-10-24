@@ -221,6 +221,14 @@ services:
 - SQLite 表结构见 [`migrations/`](migrations/)；CI 在 tag push 时构建 linux/amd64 + linux/arm64 镜像，并上传带 `.sha256` 的静态二进制。
 - Docker 部署推荐 Linux；macOS/Windows Docker Desktop 需改用 bridge 网络。
 
+## 致谢
+
+- **参考项目与数据来源**：[RSSHub](https://github.com/DIYgod/RSSHub)、[RSS-to-Telegram-Bot](https://github.com/Rongronggg9/RSS-to-Telegram-Bot)、[yt-dlp](https://github.com/yt-dlp/yt-dlp)、[TwitterInternalAPIDocument](https://github.com/fa0311/TwitterInternalAPIDocument)、[CPython](https://github.com/python/cpython)
+- **运行时依赖**：[teloxide](https://github.com/teloxide/teloxide)、[feed-rs](https://github.com/feed-rs/feed-rs)、[reqwest](https://github.com/seanmonstar/reqwest)、[SQLx](https://github.com/launchbadge/sqlx)、[SQLite](https://www.sqlite.org/)、[Tokio](https://github.com/tokio-rs/tokio)、[Serde](https://github.com/serde-rs/serde)、[tracing](https://github.com/tokio-rs/tracing)
+- **部署与工具**：[telegram-bot-api](https://github.com/aiogram/telegram-bot-api)、[FFmpeg](https://ffmpeg.org/)、[proxychains-ng](https://github.com/rofl0r/proxychains-ng)、[cross](https://github.com/cross-rs/cross)
+
+其余依赖见 [Cargo.toml](Cargo.toml)。感谢所有直接与间接依赖的维护者。
+
 ## 许可
 
 基于 MIT 许可发布，见 [LICENSE](LICENSE)。
@@ -449,6 +457,14 @@ services:
 - Rust 1.96+; `cargo build --release --locked`; output at `target/release/tgsrssr`.
 - SQLite schema lives in [`migrations/`](migrations/); CI builds linux/amd64 + linux/arm64 images and uploads static binaries with `.sha256` files on tag push.
 - Docker deployment is recommended on Linux; macOS/Windows Docker Desktop requires bridge networking.
+
+## Acknowledgements
+
+- **References and data sources**: [RSSHub](https://github.com/DIYgod/RSSHub), [RSS-to-Telegram-Bot](https://github.com/Rongronggg9/RSS-to-Telegram-Bot), [yt-dlp](https://github.com/yt-dlp/yt-dlp), [TwitterInternalAPIDocument](https://github.com/fa0311/TwitterInternalAPIDocument), [CPython](https://github.com/python/cpython)
+- **Runtime dependencies**: [teloxide](https://github.com/teloxide/teloxide), [feed-rs](https://github.com/feed-rs/feed-rs), [reqwest](https://github.com/seanmonstar/reqwest), [SQLx](https://github.com/launchbadge/sqlx), [SQLite](https://www.sqlite.org/), [Tokio](https://github.com/tokio-rs/tokio), [Serde](https://github.com/serde-rs/serde), [tracing](https://github.com/tokio-rs/tracing)
+- **Deployment and tooling**: [telegram-bot-api](https://github.com/aiogram/telegram-bot-api), [FFmpeg](https://ffmpeg.org/), [proxychains-ng](https://github.com/rofl0r/proxychains-ng), [cross](https://github.com/cross-rs/cross)
+
+See [Cargo.toml](Cargo.toml) for the remaining dependencies. Thanks also to all maintainers of direct and transitive dependencies.
 
 ## License
 
