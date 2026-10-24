@@ -440,12 +440,23 @@ fn extract_reply_blockquote(block: &str) -> String {
     }
 
     // Format: "<a href>author</a>:\ntext" inside a blockquote (TG-style reply at top).
+    // The author is metadata decoded by html_to_plain, not body markup: escape
+    // it before splicing into the anchor/text (a display name containing
+    // `<`/`&` would otherwise corrupt the reply block).
     let quoted = if author.is_empty() {
         text
     } else if href.is_empty() {
-        format!("{}:\n{}", author, text)
+        format!("{}:\n{}", crate::push::escape_html(&author), text)
     } else {
-        format!("<a href=\"{}\">{}</a>:\n{}", href, author, text)
+        // `href` comes from an HTML attribute and is already entity-encoded
+        // (`&amp;`); the downstream anchor extraction unescapes it once, so
+        // escaping it again here would turn `&` into a literal `&amp;`.
+        format!(
+            "<a href=\"{}\">{}</a>:\n{}",
+            href,
+            crate::push::escape_html(&author),
+            text
+        )
     };
     format!("<blockquote>{}</blockquote>", quoted)
 }
