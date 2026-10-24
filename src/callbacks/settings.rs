@@ -8,6 +8,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use super::{back_close_row, deliver, deliver_error_page, load_sub_or_deliver, PageTarget};
 use crate::db;
 use crate::i18n::{self, Lang};
+use crate::push::{ContentMode, SourceDisplay};
 use crate::state::AppState;
 
 /// Shows current values with a ✓ and lets the owner switch them in place.
@@ -157,7 +158,7 @@ pub(super) async fn render_settings_mode(
             vec![(i18n::t(lang, "mode_content_only"), "content_only".into())],
             vec![(i18n::t(lang, "mode_media_only"), "media_only".into())],
         ],
-        current: cfg.content_mode.clone(),
+        current: content_mode_value(&cfg.content_mode).to_string(),
         overridden: false,
         require_override_for_mark: false,
         cb_prefix: "c|cfgmv",
@@ -185,7 +186,7 @@ pub(super) async fn render_settings_source(
             vec![(i18n::t(lang, "src_author"), "author".into())],
             vec![(i18n::t(lang, "src_none"), "none".into())],
         ],
-        current: cfg.source_display.clone(),
+        current: source_display_value(&cfg.source_display).to_string(),
         overridden: false,
         require_override_for_mark: false,
         cb_prefix: "c|cfgsv",
@@ -247,21 +248,43 @@ pub(super) fn fmt_interval(lang: Lang, min: i64) -> String {
 }
 
 pub(super) fn fmt_content_mode(lang: Lang, m: &str) -> &'static str {
-    match m {
-        "title_summary" => i18n::t(lang, "mode_title_summary"),
-        "title_content" => i18n::t(lang, "mode_title_content"),
-        "title_only" => i18n::t(lang, "mode_title_only"),
-        "content_only" => i18n::t(lang, "mode_content_only"),
-        "media_only" => i18n::t(lang, "mode_media_only"),
-        _ => i18n::t(lang, "mode_title_link"),
+    // Normalize through the same legacy-tolerant parser used by rendering, so
+    // an old `TitleSummary`/`MediaOnly` value does not display as Title+Link.
+    match ContentMode::from_str(m) {
+        ContentMode::TitleSummary => i18n::t(lang, "mode_title_summary"),
+        ContentMode::TitleContent => i18n::t(lang, "mode_title_content"),
+        ContentMode::TitleOnly => i18n::t(lang, "mode_title_only"),
+        ContentMode::ContentOnly => i18n::t(lang, "mode_content_only"),
+        ContentMode::MediaOnly => i18n::t(lang, "mode_media_only"),
+        ContentMode::TitleLink => i18n::t(lang, "mode_title_link"),
+    }
+}
+
+/// Canonical stored value for the option page's ✓ comparison.
+fn content_mode_value(m: &str) -> &'static str {
+    match ContentMode::from_str(m) {
+        ContentMode::TitleSummary => "title_summary",
+        ContentMode::TitleContent => "title_content",
+        ContentMode::TitleOnly => "title_only",
+        ContentMode::ContentOnly => "content_only",
+        ContentMode::MediaOnly => "media_only",
+        ContentMode::TitleLink => "title_link",
     }
 }
 
 pub(super) fn fmt_source_display(lang: Lang, s: &str) -> &'static str {
-    match s {
-        "author" => i18n::t(lang, "src_author"),
-        "none" => i18n::t(lang, "src_none"),
-        _ => i18n::t(lang, "src_title"),
+    match SourceDisplay::from_str(s) {
+        SourceDisplay::Author => i18n::t(lang, "src_author"),
+        SourceDisplay::None => i18n::t(lang, "src_none"),
+        SourceDisplay::Source => i18n::t(lang, "src_title"),
+    }
+}
+
+fn source_display_value(s: &str) -> &'static str {
+    match SourceDisplay::from_str(s) {
+        SourceDisplay::Author => "author",
+        SourceDisplay::None => "none",
+        SourceDisplay::Source => "source",
     }
 }
 
@@ -326,7 +349,7 @@ pub(super) async fn render_feed_mode(
             vec![(i18n::t(lang, "mode_content_only"), "content_only".into())],
             vec![(i18n::t(lang, "mode_media_only"), "media_only".into())],
         ],
-        current: cfg.content_mode.clone(),
+        current: content_mode_value(&cfg.content_mode).to_string(),
         overridden: cfg.cm_overridden,
         require_override_for_mark: true,
         cb_prefix: "c|srcfm",
@@ -360,7 +383,7 @@ pub(super) async fn render_feed_source(
             vec![(i18n::t(lang, "src_author"), "author".into())],
             vec![(i18n::t(lang, "src_none"), "none".into())],
         ],
-        current: cfg.source_display.clone(),
+        current: source_display_value(&cfg.source_display).to_string(),
         overridden: cfg.sd_overridden,
         require_override_for_mark: true,
         cb_prefix: "c|srcfs",

@@ -329,7 +329,9 @@ pub enum SourceDisplay {
 
 impl SourceDisplay {
     pub fn from_str(s: &str) -> Self {
-        match s {
+        // Accept legacy camel-case spellings from old schema defaults, same
+        // tolerance as ContentMode::from_str.
+        match s.to_ascii_lowercase().as_str() {
             "author" => Self::Author,
             "none" => Self::None,
             _ => Self::Source,
