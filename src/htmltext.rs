@@ -22,6 +22,56 @@ static RE_ANCHOR_CLOSE: LazyLock<regex::Regex> =
 static RE_ENTITY_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#[1-9][0-9]{0,6}|#[xX][0-9a-fA-F]{1,6});").unwrap()
 });
+/// Blockquote open/close tags used by the splitter. Kept module-level so the
+/// balanced-close scan and the re-wrap branch use the same patterns.
+static RE_BQ_OPEN_TAG: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap());
+static RE_BQ_CLOSE_TAG: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)</blockquote\s*>").unwrap());
+static RE_PRE_CLOSE_TAG: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)</pre\s*>").unwrap());
+
+/// Find the matching close tag for a block opened just before `open_end`,
+/// counting nested opens. Returns the close tag's (start, end); None when the
+/// region never closes.
+fn find_balanced_close(
+    text: &str,
+    open_end: usize,
+    open_re: &regex::Regex,
+    close_re: &regex::Regex,
+) -> Option<(usize, usize)> {
+    let mut depth = 1usize;
+    let mut cursor = open_end;
+    loop {
+        let next_open = open_re
+            .find(&text[cursor..])
+            .map(|m| (cursor + m.start(), cursor + m.end()));
+        let next_close = close_re
+            .find(&text[cursor..])
+            .map(|m| (cursor + m.start(), cursor + m.end()));
+        let (span, is_open) = match (next_open, next_close) {
+            (Some(o), Some(c)) => {
+                if o.0 <= c.0 {
+                    (o, true)
+                } else {
+                    (c, false)
+                }
+            }
+            (Some(o), None) => (o, true),
+            (None, Some(c)) => (c, false),
+            (None, None) => return None,
+        };
+        if is_open {
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                return Some(span);
+            }
+        }
+        cursor = span.1;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Length measurement (Telegram counts in UTF-16 code units)
@@ -562,20 +612,34 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                         regex::Regex::new(r"(?s)<pre\b[^>]*>").unwrap()
                     });
                 let code_match = RE_PRE_OPEN.find(para.as_str());
+                let bare_match = RE_PRE_BARE.find(para.as_str());
+                let open_match = code_match.as_ref().or(bare_match.as_ref());
                 let (open_tag, close_tag) = if let Some(m) = code_match.as_ref() {
                     (m.as_str().to_string(), "</code></pre>".to_string())
-                } else if let Some(m) = RE_PRE_BARE.find(para.as_str()) {
+                } else if let Some(m) = bare_match.as_ref() {
                     (m.as_str().to_string(), "</pre>".to_string())
                 } else {
                     ("<pre><code>".to_string(), "</code></pre>".to_string())
                 };
-                let pre_start = para.find("<pre").unwrap_or(0);
+                let pre_start = open_match.map(|m| m.start()).unwrap_or(0);
+                let pre_open_end = open_match.map(|m| m.end()).unwrap_or(pre_start);
+                let close_span = RE_PRE_CLOSE_TAG
+                    .find(&para[pre_open_end..])
+                    .map(|m| (pre_open_end + m.start(), pre_open_end + m.end()));
+                // Text after </pre> in the same paragraph must stay outside
+                // the re-wrapped code block. Without this, "…</pre> trailing"
+                // renders trailing prose as code.
+                let (block_end, suffix) = match close_span {
+                    Some((_, end)) => (end, &para[end..]),
+                    None => (para.len(), ""),
+                };
                 let prefix = para[..pre_start].trim_end_matches('\n').to_string();
+                let block = &para[pre_start..block_end];
                 let inner = {
                     let stripped = if code_match.is_some() {
-                        RE_PRE_OPEN.replace_all(&para[pre_start..], "").to_string()
+                        RE_PRE_OPEN.replace_all(block, "").to_string()
                     } else {
-                        RE_PRE_BARE.replace_all(&para[pre_start..], "").to_string()
+                        RE_PRE_BARE.replace_all(block, "").to_string()
                     };
                     stripped.replace(&close_tag, "")
                 };
@@ -647,18 +711,15 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 for c in &code_chunks {
                     chunks.push(format!("{}{}{}", open_tag, c, close_tag));
                 }
-            } else if para.contains("<blockquote") {
+                if !suffix.trim().is_empty() {
+                    // Same paragraph after the </pre>: keep it outside the
+                    // code block and split it normally (it may contain another
+                    // block element).
+                    chunks.extend(split_html(suffix, limit));
+                }
+            } else if RE_BQ_OPEN_TAG.is_match(&para) {
                 const BQ_OPEN: &str = "<blockquote expandable>";
                 const BQ_CLOSE: &str = "</blockquote>";
-                // When stripping the opening tag, both <blockquote> and
-                // <blockquote expandable> forms must be matched (Weibo
-                // retweets produce plain <blockquote>); otherwise a leftover
-                // opening tag in inner would get wrapped again, forming a
-                // nested blockquote.
-                static RE_BQ_OPEN_ANY: std::sync::LazyLock<regex::Regex> =
-                    std::sync::LazyLock::new(|| {
-                        regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap()
-                    });
 
                 // Strip the original-text prefix stuck in front of the quote
                 // block (Weibo retweet: the original text and the quote
@@ -666,13 +727,20 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 // splits on \n\n, so both belong to the same paragraph).
                 // The prefix must stay outside the quote block; otherwise,
                 // when splitting for the limit, the original text would get
-                // wrapped inside the quote block.
-                let bq_start = para.find("<blockquote").unwrap_or(0);
+                // wrapped inside the quote block. Find the balanced outer
+                // close (nested quotes are counted) and keep any suffix after
+                // it outside as well.
+                let open_match = RE_BQ_OPEN_TAG.find(para.as_str());
+                let bq_start = open_match.map(|m| m.start()).unwrap_or(0);
+                let open_end = open_match.map(|m| m.end()).unwrap_or(bq_start);
+                let close_span =
+                    find_balanced_close(&para, open_end, &RE_BQ_OPEN_TAG, &RE_BQ_CLOSE_TAG);
+                let (inner_end, suffix) = match close_span {
+                    Some((close_start, close_end)) => (close_start, &para[close_end..]),
+                    None => (para.len(), ""),
+                };
                 let prefix = para[..bq_start].trim_end_matches('\n').to_string();
-                let bq_part = &para[bq_start..];
-                let inner = RE_BQ_OPEN_ANY
-                    .replace_all(bq_part, "")
-                    .replace(BQ_CLOSE, "");
+                let inner = &para[open_end..inner_end];
                 let inner_limit = limit.saturating_sub(
                     BQ_OPEN.chars().count() + BQ_CLOSE.chars().count(),
                 );
@@ -694,9 +762,9 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                     && budget >= 100;
 
                 let subs = if merge_first {
-                    split_html(&inner, budget)
+                    split_html(inner, budget)
                 } else {
-                    split_html(&inner, inner_limit)
+                    split_html(inner, inner_limit)
                 };
 
                 if prefix.is_empty() {
@@ -732,6 +800,12 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                     for sub in &subs {
                         chunks.push(format!("{}{}{}", BQ_OPEN, sub, BQ_CLOSE));
                     }
+                }
+                if !suffix.trim().is_empty() {
+                    // Content after the matching </blockquote> belongs outside
+                    // the quote; re-split it normally in case it is oversized
+                    // or contains another block element.
+                    chunks.extend(split_html(suffix, limit));
                 }
             } else {
                 // Non-blockquote oversized segment.
@@ -1261,6 +1335,28 @@ mod tests {
         assert!(joined.contains(&line1), "out: {:?}", out);
         assert!(joined.contains(&line2), "out: {:?}", out);
         assert!(joined.contains(&line3), "out: {:?}", out);
+    }
+
+    #[test]
+    fn split_html_keeps_text_after_oversized_blockquote_outside() {
+        let quote = "引".repeat(200);
+        let text = format!("<blockquote>{quote}</blockquote>AFTER");
+        let out = split_html(&text, 80);
+        let tail = out.last().expect("at least one chunk");
+        assert!(tail.contains("AFTER"), "suffix lost: {:?}", out);
+        assert!(!tail.contains("<blockquote"), "suffix wrapped into quote: {tail:?}");
+        assert!(out.iter().any(|c| c.contains("引")), "quote content lost: {:?}", out);
+    }
+
+    #[test]
+    fn split_html_keeps_text_after_oversized_pre_outside() {
+        let code = "line\n".repeat(80);
+        let text = format!("<pre>{code}</pre>AFTER");
+        let out = split_html(&text, 60);
+        let tail = out.last().expect("at least one chunk");
+        assert!(tail.contains("AFTER"), "suffix lost: {:?}", out);
+        assert!(!tail.contains("<pre"), "suffix wrapped into pre: {tail:?}");
+        assert!(out.iter().any(|c| c.contains("line")), "code content lost: {:?}", out);
     }
 
     #[test]
