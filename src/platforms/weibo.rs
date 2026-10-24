@@ -1138,24 +1138,25 @@ fn parse_weibo_time_at(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 /// records the count and the lost URLs, so a vanished link leaves a trace
 /// (v1.11.2 audit).
 fn render_md_inline(text: &str) -> String {
-    // 1) Extract markdown links [text](url) → placeholders
-    let mut links: Vec<(String, String)> = Vec::new();
-    let s = RE_MD_LINK
-        .replace_all(text, |caps: &regex::Captures| {
-            let idx = links.len();
-            links.push((caps[1].to_string(), caps[2].to_string()));
-            format!("\u{FFFE}L{}\u{FFFE}", idx)
-        })
-        .to_string();
-
-    // 2) Extract inline code `code` → placeholders (code content gets no
-    // further formatting)
+    // 1) Extract inline code `code` → placeholders BEFORE markdown links.
+    // Code spans are literal: `[x](url)` inside backticks must stay code, not
+    // become a real anchor with the source text lost.
     let mut codes: Vec<String> = Vec::new();
     let s = RE_MD_INLINE_CODE
-        .replace_all(&s, |caps: &regex::Captures| {
+        .replace_all(text, |caps: &regex::Captures| {
             let idx = codes.len();
             codes.push(caps[1].to_string());
             format!("\u{FFFE}C{}\u{FFFE}", idx)
+        })
+        .to_string();
+
+    // 2) Extract markdown links [text](url) → placeholders.
+    let mut links: Vec<(String, String)> = Vec::new();
+    let s = RE_MD_LINK
+        .replace_all(&s, |caps: &regex::Captures| {
+            let idx = links.len();
+            links.push((caps[1].to_string(), caps[2].to_string()));
+            format!("\u{FFFE}L{}\u{FFFE}", idx)
         })
         .to_string();
 
@@ -1165,9 +1166,9 @@ fn render_md_inline(text: &str) -> String {
     // weibo markdown editor stores visible `&` / `<` / `>` / non-breaking
     // spaces as `&amp;` / `&lt;` / `&gt;` / `&nbsp;`. Escaping them as-is would
     // render them literally as `&amp;amp;` etc. decode_entities is the visible
-    // text decoder (it decodes `&amp;` last so a single pass cannot under- or
-    // over-decode), and leaves bare `&`/`<` untouched, so the round trip is
-    // idempotent for already-escaped input and correct for literal input.
+    // text decoder (single pass, no re-decoding), and leaves bare `&`/`<`
+    // untouched, so the round trip is idempotent for already-escaped input and
+    // correct for literal input.
     let s = crate::push::escape_html(&crate::htmltext::decode_entities(&s));
 
     // 4) Bold **...** (before italic, to avoid ** being split into two *)
@@ -1983,6 +1984,16 @@ mod tests {
         let input = "看[这里](https://example.com)了解";
         let out = render_weibo_markdown(input);
         assert!(out.contains(r#"<a href="https://example.com">这里</a>"#), "out: {}", out);
+    }
+
+    #[test]
+    fn md_inline_code_wins_over_link_syntax() {
+        // Inline code is extracted before links; otherwise `[x](url)` inside
+        // backticks would become a real anchor and the literal code text
+        // would be lost.
+        let out = render_weibo_markdown("`[x](https://example.com)`");
+        assert!(out.contains("<code>[x](https://example.com)</code>"), "out: {out}");
+        assert!(!out.contains("<a href=\"https://example.com\">"), "link inside code: {out}");
     }
 
     #[test]
