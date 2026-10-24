@@ -247,6 +247,10 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
     // vanish with the unsubscribe cascade; this retention sweep only mops up
     // orphans left by subscriptions removed outside those paths.
     let r4 = db::cleanup_stale_settings(db_pool, "stale_zero:", 14).await?;
+    // outbox_media_lost: one-shot notice flags keyed by outbox row id. The
+    // normal success/abandon paths delete them; this sweep catches rows
+    // removed outside those paths.
+    let r5 = db::cleanup_stale_settings(db_pool, "outbox_media_lost:", 7).await?;
     // Note: teloxide_dialogues table has no timestamp column.
     // Dialogue cleanup is handled via chat purge events instead.
     info!(
@@ -254,6 +258,7 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
         file_id_cache_deleted = r2,
         stale_settings_deleted = r3,
         stale_zero_deleted = r4,
+        outbox_media_lost_deleted = r5,
         "database cleanup done"
     );
     Ok(())

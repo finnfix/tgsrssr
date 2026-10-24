@@ -1619,6 +1619,53 @@ async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, re
     if let Err(e) = db::outbox_delete(&state.db, row.id).await {
         warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete abandoned entry");
     }
+    db::delete_setting(&state.db, &db::setting_key::outbox_media_lost(row.id))
+        .await
+        .ok();
+}
+
+/// Notify the owner once when media files expired while an outbox row was
+/// waiting for retry. The flag is keyed by outbox row id: a persistent retry
+/// loop must not repeat this notice every backoff, and the row is deleted at
+/// 72h anyway. A DB read/write error skips/sends without dedup rather than
+/// hiding the loss; both paths leave a warn.
+async fn maybe_notify_outbox_media_lost(
+    bot: &Bot,
+    state: &AppState,
+    row: &db::OutboxRow,
+    original: usize,
+    remaining: usize,
+) {
+    let key = db::setting_key::outbox_media_lost(row.id);
+    match db::get_setting(&state.db, &key).await {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            warn!(entry_id = %row.entry_id, error = %e, "outbox media-lost flag read failed, skipping notice");
+            return;
+        }
+    }
+    let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
+        Ok(Some(owner)) => owner_lang(state, owner).await,
+        Ok(None) => {
+            warn!(chat_id = %row.chat_id, "cannot notify media loss: chat has no owner");
+            return;
+        }
+        Err(e) => {
+            warn!(chat_id = %row.chat_id, error = %e, "cannot notify media loss: owner lookup failed");
+            return;
+        }
+    };
+    let mut msg = i18n::t(lang, "notif_outbox_media_expired")
+        .replacen("{}", &original.to_string(), 1)
+        .replacen("{}", &remaining.to_string(), 1)
+        .replacen("{}", &push::escape_html(&row.feed_title), 1);
+    let entry_link = extract_entry_link_from_json(&row.entry_json);
+    push_line(&mut msg, lang, "label_source", entry_link.as_deref().unwrap_or(""));
+    notify_owner_html(bot, state, &row.chat_id, &msg).await;
+    if let Err(e) = db::set_setting(&state.db, &key, "1").await {
+        warn!(entry_id = %row.entry_id, error = %e, "outbox media-lost flag write failed, notice may repeat");
+    }
 }
 
 async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
@@ -1710,24 +1757,22 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             .into_iter()
             .filter(|m| m.path.exists())
             .collect();
-        // Some media files expired (not the MediaOnly all-gone scenario):
-        // degrade to sending the remaining media, log a warn and leave a trace
-        // (owner visibility is covered by the media_failed notification).
-        if had_media && media_items.len() < original_count && !media_items.is_empty() {
-            warn!(
-                entry_id = %row.entry_id,
-                feed = %row.feed_url,
-                original = original_count,
-                remaining = media_items.len(),
-                "outbox retry: some media files expired, sending with reduced media"
-            );
-        }
+        let media_lost = had_media && media_items.len() < original_count;
+
+        // Reconstruct render opts BEFORE the MediaOnly check: content_mode is
+        // a legacy-tolerant string (`MediaOnly`/`mediaonly`), so a raw string
+        // compare here would bypass the abandon guard for older rows.
+        let opts = push::RenderOpts {
+            mode: ContentMode::from_str(&row.content_mode),
+            source: push::SourceDisplay::from_str(&row.source_display),
+            link_preview: row.link_preview,
+        };
 
         // MediaOnly mode with no sendable media left (files cleaned up, or a
         // legacy/corrupt media_json): the text renderer returns None for this
         // mode, so send_text_only would report a silent success and the entry
         // would be marked sent without delivering anything. Abandon instead.
-        if row.content_mode == "media_only" && media_items.is_empty() {
+        if opts.mode == ContentMode::MediaOnly && media_items.is_empty() {
             let reason = if had_media {
                 "notif_media_expired"
             } else {
@@ -1742,12 +1787,37 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             continue;
         }
 
-        // Reconstruct render opts
-        let opts = push::RenderOpts {
-            mode: ContentMode::from_str(&row.content_mode),
-            source: push::SourceDisplay::from_str(&row.source_display),
-            link_preview: row.link_preview,
-        };
+        if media_lost {
+            if !media_items.is_empty() {
+                warn!(
+                    entry_id = %row.entry_id,
+                    feed = %row.feed_url,
+                    original = original_count,
+                    remaining = media_items.len(),
+                    "outbox retry: some media files expired, sending with reduced media"
+                );
+            } else {
+                warn!(
+                    entry_id = %row.entry_id,
+                    feed = %row.feed_url,
+                    original = original_count,
+                    "outbox retry: all media files expired, sending as text"
+                );
+            }
+            // The enqueue-time notice only covered the original send failure;
+            // losing files while queued is a separate degradation and must be
+            // visible to the owner. One-shot per outbox row (a retry loop can
+            // run for 72h); the flag is removed on success/abandon and swept
+            // by cleanup if the row is removed elsewhere.
+            maybe_notify_outbox_media_lost(
+                bot,
+                state,
+                &row,
+                original_count,
+                media_items.len(),
+            )
+            .await;
+        }
         let chat_id: i64 = match row.chat_id.parse() {
             Ok(id) => id,
             Err(_) => {
@@ -1843,6 +1913,9 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
+                db::delete_setting(&state.db, &db::setting_key::outbox_media_lost(row.id))
+                    .await
+                    .ok();
             }
             Err(e) => {
                 let attempts = row.attempts + 1;

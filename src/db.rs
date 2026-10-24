@@ -56,6 +56,12 @@ pub mod setting_key {
     pub fn stale_zero(chat_id: &str, feed_url: &str) -> String {
         format!("stale_zero:{}:{}", chat_id, feed_url)
     }
+    /// One-shot owner notice flag for media that expired while an outbox row
+    /// was waiting for retry: `outbox_media_lost:<outbox_id>`.
+    /// Deleted on success/abandon; cleanup_stale_settings removes orphans.
+    pub fn outbox_media_lost(outbox_id: i64) -> String {
+        format!("outbox_media_lost:{}", outbox_id)
+    }
 }
 
 /// Default config values (single source of truth on the Rust side).

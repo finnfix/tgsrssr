@@ -468,6 +468,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "notif_timeout_72h") => "Retry timeout (72h), entry abandoned.",
         (Lang::Zh, "notif_media_expired") => "仅媒体模式，但媒体文件已过期无法重试。",
         (Lang::En, "notif_media_expired") => "Media-only mode, but media files expired.",
+        (Lang::Zh, "notif_outbox_media_expired") => "重试队列中的条目有媒体文件已过期（原有 {} 个，剩余 {} 个），将按剩余媒体继续发送；若全部过期则按文本发送。\n[{}]",
+        (Lang::En, "notif_outbox_media_expired") => "Media files for a queued entry expired (original {}, remaining {}); sending with the remaining media, or as text if none remain.\n[{}]",
         (Lang::Zh, "notif_media_unreadable") => "仅媒体模式，但媒体记录为空或无法读取。",
         (Lang::En, "notif_media_unreadable") => "Media-only mode, but the media record is empty or unreadable.",
         (Lang::Zh, "notif_media_dl_fail") => "仅媒体模式，媒体下载连续失败 {} 次，条目已放弃。",
