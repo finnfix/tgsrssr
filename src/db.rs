@@ -630,28 +630,31 @@ pub async fn rename_subscription_auto(db: &Db, sub_id: i64, new_title: &str) -> 
 
 /// Effective config for one subscription (chat defaults + feed overrides).
 pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<EffectiveConfig> {
+    // Build from a one-row base so a missing chat_configs row does not hide
+    // feed_configs overrides. This is the same precedence as the due query
+    // below: feed override > channel config > DEFAULT_*.
     let row = sqlx::query(
-        r#"SELECT c.chat_id, ?2 AS feed_url,
-                  COALESCE(f.interval_minutes, c.interval_minutes) AS interval_minutes,
-                  COALESCE(f.content_mode, c.content_mode) AS content_mode,
-                  COALESCE(f.source_display, c.source_display) AS source_display,
-                  COALESCE(f.caption_above_media, c.caption_above_media) AS caption_above_media,
-                  COALESCE(f.link_preview, c.link_preview) AS link_preview,
+        r#"SELECT ?1 AS chat_id, ?2 AS feed_url,
+                  COALESCE(f.interval_minutes, c.interval_minutes, 30) AS interval_minutes,
+                  COALESCE(f.content_mode, c.content_mode, 'title_link') AS content_mode,
+                  COALESCE(f.source_display, c.source_display, 'source') AS source_display,
+                  COALESCE(f.caption_above_media, c.caption_above_media, 0) AS caption_above_media,
+                  COALESCE(f.link_preview, c.link_preview, 1) AS link_preview,
                   f.interval_minutes IS NOT NULL AS iv_overridden,
                   f.content_mode IS NOT NULL AS cm_overridden,
                   f.source_display IS NOT NULL AS sd_overridden,
                   f.caption_above_media IS NOT NULL AS cp_overridden,
                   f.link_preview IS NOT NULL AS lp_overridden
-           FROM chat_configs c
-           LEFT JOIN feed_configs f ON f.chat_id = c.chat_id AND f.feed_url = ?2
-           WHERE c.chat_id = ?1"#,
+           FROM (SELECT 1) AS base
+           LEFT JOIN chat_configs c ON c.chat_id = ?1
+           LEFT JOIN feed_configs f ON f.chat_id = ?1 AND f.feed_url = ?2"#,
     )
     .bind(chat_id)
     .bind(feed_url)
     .fetch_optional(db)
     .await?;
-    // When chat_configs has no row (legacy data / manually deleted row),
-    // return the default config instead of aborting the caller.
+    // Defensive: the base row means a row should always exist, but keep a
+    // defaults fallback if SQLite behavior changes.
     let Some(row) = row else {
         return Ok(EffectiveConfig {
             chat_id: chat_id.to_string(),
@@ -967,6 +970,11 @@ pub async fn set_chat_config_field(
     field: &str,
     value: &str,
 ) -> anyhow::Result<()> {
+    // Callers usually opened the settings page first, but do not rely on it:
+    // an UPDATE on a missing row affects zero rows and silently returns Ok,
+    // and the DDL default for a new interval is still 10. Create the row with
+    // the documented 30-minute default before updating the requested field.
+    ensure_chat_config(db, chat_id).await?;
     // The column name is a compile-time constant, so this does not violate
     // the no-dynamic-SQL convention.
     let sql = match field {
@@ -1456,6 +1464,23 @@ pub async fn set_feed_filter_keywords(db: &Db, chat_id: &str, feed_url: &str, ke
     set_feed_filter_field(db, chat_id, feed_url, "filter_keywords", keywords).await
 }
 
+/// Clear both keywords and the enable switch in one transaction. "Clear"
+/// in the UI means filtering is off; clearing only the keywords left
+/// `filter_enabled=1`, so the panel showed "off" while the button still
+/// offered "disable", and the next keyword entry silently re-enabled it.
+pub async fn clear_feed_filter(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "UPDATE feed_configs SET filter_keywords = '', filter_enabled = 0, updated_at = datetime('now') WHERE chat_id = ? AND feed_url = ?",
+    )
+    .bind(chat_id)
+    .bind(feed_url)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,10 +1497,24 @@ mod tests {
         assert_eq!(DEFAULT_SOURCE_DISPLAY, "source");
         assert_eq!(DEFAULT_CAPTION_ABOVE_MEDIA, 0);
         assert_eq!(DEFAULT_LINK_PREVIEW, 1);
+
+        // Ensure the SQL COALESCE fallbacks use the same literals. The old
+        // version only compared the constants with hardcoded numbers and
+        // could never catch SQL drift.
+        let src = include_str!("db.rs");
+        for (field, value) in [
+            ("interval_minutes", "30"),
+            ("content_mode", "'title_link'"),
+            ("source_display", "'source'"),
+            ("caption_above_media", "0"),
+            ("link_preview", "1"),
+        ] {
+            let needle = format!("COALESCE(f.{field}, c.{field}, {value})");
+            assert!(src.contains(&needle), "missing SQL fallback: {needle}");
+        }
     }
 
-    #[tokio::test]
-    async fn entry_dedup_state_reports_sent_and_queued() {
+    async fn test_pool() -> Db {
         // Single connection: every sqlite::memory: connection would otherwise
         // see its own empty database.
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1484,6 +1523,41 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn effective_config_keeps_feed_override_without_chat_row() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO feed_configs (chat_id, feed_url, content_mode) VALUES ('1', 'https://example.com/feed', 'content_only')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
+            .await
+            .unwrap();
+        assert_eq!(cfg.content_mode, "content_only");
+        assert!(cfg.cm_overridden);
+        assert_eq!(cfg.interval_minutes, DEFAULT_INTERVAL_MINUTES);
+        assert_eq!(cfg.source_display, DEFAULT_SOURCE_DISPLAY);
+    }
+
+    #[tokio::test]
+    async fn set_chat_config_field_creates_row_with_defaults() {
+        let pool = test_pool().await;
+        set_chat_config_field(&pool, "1", "content_mode", "content_only")
+            .await
+            .unwrap();
+        let cfg = get_chat_config(&pool, "1").await.unwrap().expect("row created");
+        assert_eq!(cfg.interval_minutes, DEFAULT_INTERVAL_MINUTES);
+        assert_eq!(cfg.content_mode, "content_only");
+    }
+
+    #[tokio::test]
+    async fn entry_dedup_state_reports_sent_and_queued() {
+        let pool = test_pool().await;
 
         mark_entry_sent(&pool, "1", "https://example.com/feed", "sent-entry")
             .await
