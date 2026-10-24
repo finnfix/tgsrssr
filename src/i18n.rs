@@ -313,6 +313,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // Link-preview label: shared by the channel settings page and the feed page.
         (Lang::Zh, "settings_lp") => "链接预览：{}",
         (Lang::En, "settings_lp") => "Link preview: {}",
+        (Lang::Zh, "settings_caption") => "说明文字在媒体上方：{}",
+        (Lang::En, "settings_caption") => "Caption above media: {}",
         (Lang::Zh, "follow_channel") => "↩️ 🔗 跟随频道",
         (Lang::En, "follow_channel") => "↩️ 🔗 Follow channel",
 

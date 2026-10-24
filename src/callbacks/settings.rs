@@ -45,6 +45,14 @@ pub(super) async fn render_settings_page(
         vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_mode"), format!("c|cfgm|{}{}", chat_id, pages))],
         vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_source"), format!("c|cfgs|{}{}", chat_id, pages))],
         vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "settings_caption").replacen(
+                "{}",
+                if cfg.caption_above_media != 0 { i18n::t(lang, "on") } else { i18n::t(lang, "off") },
+                1,
+            ),
+            format!("c|cfgcp|{}{}", chat_id, pages),
+        )],
+        vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_lp").replacen("{}", lp_label, 1),
             format!("c|cfglp|{}{}", chat_id, pages),
         )],

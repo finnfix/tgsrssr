@@ -228,7 +228,7 @@ enum GuardTarget {
 fn guard_target(op: &str) -> GuardTarget {
     match op {
         // chat level: parts[2] = chat_id
-        "ch" | "cfg" | "cfgi" | "cfgm" | "cfgs" | "cfglp" | "resumeall"
+        "ch" | "cfg" | "cfgi" | "cfgm" | "cfgs" | "cfglp" | "cfgcp" | "resumeall"
         | "cfgiv" | "cfgmv" | "cfgsv" | "unsubpg" | "unsuballask" | "unsuball" => GuardTarget::Chat,
         // sub level: parts[2] = sub_id
         "src" | "srcpause" | "srcresume" | "srcrename" | "srcfip" | "srcfmp"
@@ -506,6 +506,31 @@ pub async fn handle_callback(
                 };
                 let next = if cfg.link_preview != 0 { "0" } else { "1" };
                 match db::set_chat_config_field(&state.db, cid, "link_preview", next).await {
+                    Ok(_) => {
+                        render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
+                    }
+                    Err(e) => {
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                    }
+                }
+            }
+        }
+        Some("cfgcp") => {
+            // Toggle caption position (chat-level): Telegram's
+            // show_caption_above_media only applies to photo/video/animation.
+            if let Some(cid) = parts.get(2) {
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let cfg = match load_chat_config_checked(&state.db, cid).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(chat = %cid, error = %e, "cfgcp: config read failed, toggle aborted");
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                        return Ok(());
+                    }
+                };
+                let next = if cfg.caption_above_media != 0 { "0" } else { "1" };
+                match db::set_chat_config_field(&state.db, cid, "caption_above_media", next).await {
                     Ok(_) => {
                         render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
