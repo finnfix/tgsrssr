@@ -206,12 +206,17 @@ fn is_placeholder_image(url: &str) -> bool {
         || lower.contains("default_cover")
 }
 
-/// True for Weibo/Sina image hosts that enforce Referer-based hotlink protection.
+/// True for Weibo/Sina image hosts that enforce Referer-based hotlink
+/// protection. Exact host or a subdomain only: a substring check would also
+/// match unrelated domains such as `evilweibo.com`.
 fn is_weibo_host(host: &str) -> bool {
-    host.contains("sinaimg.cn")
-        || host.contains("weibocdn.com")
-        || host.contains("weibo.com")
-        || host.contains("weibo.cn")
+    fn domain_or_subdomain(host: &str, domain: &str) -> bool {
+        host == domain || host.ends_with(&format!(".{}", domain))
+    }
+    domain_or_subdomain(host, "sinaimg.cn")
+        || domain_or_subdomain(host, "weibocdn.com")
+        || domain_or_subdomain(host, "weibo.com")
+        || domain_or_subdomain(host, "weibo.cn")
 }
 
 /// Referer header value that satisfies Weibo/Sina hotlink checks.
@@ -1544,6 +1549,15 @@ mod tests {
         let urls = extract_media_urls(&entry, None);
         assert_eq!(urls.len(), 1, "expected the video, got: {:?}", urls);
         assert!(urls[0].0.contains("weibocdn.com"), "got: {:?}", urls);
+    }
+
+    #[test]
+    fn weibo_host_match_is_domain_bounded() {
+        assert!(is_weibo_host("weibo.com"));
+        assert!(is_weibo_host("wx1.sinaimg.cn"));
+        assert!(is_weibo_host("f.video.weibocdn.com"));
+        assert!(!is_weibo_host("evilweibo.com"));
+        assert!(!is_weibo_host("notsinaimg.cn"));
     }
 
     #[test]

@@ -517,14 +517,16 @@ fn format_caption(
 /// - Local Bot API + translatable path → `InputFile::file` (server reads its
 ///   own mount: zero copy, no RAM, 2GB cap).
 /// - Otherwise → memory upload (official API or untranslatable path).
-fn path_input(
+async fn path_input(
     path: &std::path::Path,
     transport: &crate::media::MediaTransport,
 ) -> anyhow::Result<InputFile> {
     if let Some(bp) = transport.bot_path(path) {
         Ok(InputFile::file(std::path::PathBuf::from(bp)))
     } else {
-        Ok(InputFile::memory(std::fs::read(path)?))
+        // Reading a media file can be tens of MB; use async IO instead of
+        // blocking a tokio worker while the bytes are loaded.
+        Ok(InputFile::memory(tokio::fs::read(path).await?))
     }
 }
 
@@ -548,7 +550,7 @@ async fn resolve_input(
             return Ok(InputFile::file_id(teloxide::types::FileId(fid)));
         }
     }
-    path_input(&item.path, transport)
+    path_input(&item.path, transport).await
 }
 
 /// Extract the media file_id from a sent message by send mode (used to write
@@ -1221,7 +1223,7 @@ async fn send_doc_group(
                 // Converted-to-document long/large images carry a thumbnail
                 if use_thumbs {
                     if let Some(tp) = &d.thumb_path {
-                        if let Ok(tin) = path_input(tp, transport) {
+                        if let Ok(tin) = path_input(tp, transport).await {
                             im.thumbnail = Some(tin);
                         }
                     }
@@ -1316,7 +1318,7 @@ async fn send_doc_msg(
         // retries so the document itself is still delivered.
         if attach_thumb {
             if let Some(tp) = &d.thumb_path {
-                if let Ok(tin) = path_input(tp, transport) {
+                if let Ok(tin) = path_input(tp, transport).await {
                     req = req.thumbnail(tin);
                 }
             }
@@ -1546,7 +1548,7 @@ async fn send_op(
                     req = req.duration(d);
                 }
                 if let Some(tp) = &v.thumb_path {
-                    if let Ok(tin) = path_input(tp, transport) {
+                    if let Ok(tin) = path_input(tp, transport).await {
                         req = req.thumbnail(tin);
                     }
                 }
@@ -1642,7 +1644,7 @@ async fn build_group_inputs(
                     im.duration = Some(d.min(65535) as u16);
                 }
                 if let Some(tp) = &m.thumb_path {
-                    if let Ok(tin) = path_input(tp, transport) {
+                    if let Ok(tin) = path_input(tp, transport).await {
                         im.thumbnail = Some(tin);
                     }
                 }
@@ -1753,17 +1755,7 @@ async fn send_single_html(
     const MAX_RETRIES: u32 = 2;
     // Unified blockquote folding rules (fold when >200 chars).
     let html_text = normalize_blockquote_fold(html_text);
-    let lpo = if link_preview {
-        None
-    } else {
-        Some(teloxide::types::LinkPreviewOptions {
-            is_disabled: true,
-            url: None,
-            prefer_small_media: false,
-            prefer_large_media: false,
-            show_above_text: false,
-        })
-    };
+    let lpo = if link_preview { None } else { Some(no_preview()) };
 
     for attempt in 0..=MAX_RETRIES {
         // Queue centrally per channel (including flood retries) so parallel

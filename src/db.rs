@@ -1403,12 +1403,15 @@ impl FilterConfig {
     }
 
     /// Whether an entry title passes the filter (true = should be pushed).
-    pub fn allows_title(&self, title: &str) -> bool {
+    /// The scheduler runs
+    /// this once per entry; re-splitting/lowercasing the same string for a
+    /// large feed is pure overhead.
+    pub fn allows_title_with_keywords(&self, title: &str, keywords: &[String]) -> bool {
         if !self.is_active() {
             return true;
         }
         let lower = title.to_lowercase();
-        let matched = self.keyword_list().iter().any(|kw| lower.contains(kw));
+        let matched = keywords.iter().any(|kw| lower.contains(kw));
         match self.mode.as_str() {
             "whitelist" => matched,
             _ => !matched, // blacklist: exclude matches
@@ -1518,6 +1521,27 @@ mod tests {
             let needle = format!("COALESCE(f.{field}, c.{field}, {value})");
             assert!(src.contains(&needle), "missing SQL fallback: {needle}");
         }
+    }
+
+    #[test]
+    fn filter_keywords_preparsed_match_single_shot() {
+        let blacklist = FilterConfig {
+            enabled: true,
+            mode: "blacklist".into(),
+            keywords: "foo, Bar".into(),
+        };
+        let kws = blacklist.keyword_list();
+        assert!(!blacklist.allows_title_with_keywords("a FOO b", &kws));
+        assert!(blacklist.allows_title_with_keywords("baz", &kws));
+        let whitelist = FilterConfig {
+            enabled: true,
+            mode: "whitelist".into(),
+            keywords: "foo".into(),
+        };
+        let kws = whitelist.keyword_list();
+        assert!(whitelist.allows_title_with_keywords("foo", &kws));
+        assert!(!whitelist.allows_title_with_keywords("bar", &kws));
+        assert!(FilterConfig::default().allows_title_with_keywords("anything", &[]));
     }
 
     async fn test_pool() -> Db {

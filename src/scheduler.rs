@@ -637,6 +637,8 @@ async fn process_feed(
                     Default::default()
                 }
             };
+            // Parse the keyword list once per feed, not once per entry.
+            let filter_keywords = filter_cfg.keyword_list();
 
             // First filter out unsent entries, then push in ascending order of
             // publish time (old → new). RSS feeds are mostly "newest first";
@@ -707,7 +709,9 @@ async fn process_feed(
                 // Content filter: entries whose title matches a rule are marked
                 // as sent directly (never pushed), avoiding repeated checks
                 // every round eating into the fetch window.
-                if !filter_cfg.allows_title(&fetcher::entry_title(entry)) {
+                if !filter_cfg
+                    .allows_title_with_keywords(&fetcher::entry_title(entry), &filter_keywords)
+                {
                     db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                     continue;
                 }

@@ -339,11 +339,9 @@ pub fn resolve_url(state: &AppState, raw: &str) -> String {
     }
     if let Ok(u) = Url::parse(raw) {
         let host = u.host_str().unwrap_or_default().to_lowercase();
-        let hit = cfg.img_relay_domains.iter().any(|d| {
-            let d = d.trim().trim_start_matches('.');
-            host == d || host.ends_with(&format!(".{}", d))
-        });
-        if hit {
+        // Single host-matching implementation shared with proxy/insecure
+        // routing (trim leading dot, lowercase, exact-or-subdomain).
+        if crate::config::host_in_list(&host, &cfg.img_relay_domains) {
             return format!("{}/{}", cfg.img_relay_base_url.trim_end_matches('/'), raw);
         }
     }
