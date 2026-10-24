@@ -232,7 +232,7 @@ fn guard_target(op: &str) -> GuardTarget {
         | "cfgiv" | "cfgmv" | "cfgsv" | "unsubpg" | "unsuballask" | "unsuball" => GuardTarget::Chat,
         // sub level: parts[2] = sub_id
         "src" | "srcpause" | "srcresume" | "srcrename" | "srcfip" | "srcfmp"
-        | "srcfsp" | "srcflp" | "srcfilter" | "srcftoggle" | "srcfmode" | "srcfkw"
+        | "srcfsp" | "srcfcp" | "srcflp" | "srcfilter" | "srcftoggle" | "srcfmode" | "srcfkw"
         | "srcfi" | "srcfm" | "srcfs" | "unsub" => GuardTarget::Sub,
         // no target channel involved
         _ => GuardTarget::None,
@@ -674,6 +674,39 @@ pub async fn handle_callback(
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 render_feed_source(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
+            }
+        }
+        Some("srcfcp") => {
+            // Toggle feed-level caption position directly (mirrors channel cfgcp).
+            // Approach A: when the toggled value equals the channel default, clear the override (marker goes back to 🔗).
+            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                if let Some(sub) = fetch_sub_or_toast(&state, &bot, qid.clone(), id, lang).await {
+                    let (cfg, chat_cfg) = match (
+                        db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
+                        load_chat_config_checked(&state.db, &sub.chat_id).await,
+                    ) {
+                        (Ok(cfg), Ok(chat_cfg)) => (cfg, chat_cfg),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::warn!(sub_id = id, error = %e, "srcfcp: config read failed, toggle aborted");
+                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                            return Ok(());
+                        }
+                    };
+                    let next = if cfg.caption_above_media { "0" } else { "1" };
+                    let channel_default = if chat_cfg.caption_above_media != 0 { "1" } else { "0" };
+                    let value: Option<&str> = if next == channel_default { None } else { Some(next) };
+                    match db::set_feed_config_field(&state.db, &sub.chat_id, &sub.feed_url, "caption_above_media", value).await {
+                        Ok(_) => {
+                            info!(sub_id = id, caption_above_media = next, "feed caption position toggled");
+                            render_feed_page_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
+                        }
+                        Err(e) => {
+                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        }
+                    }
+                }
             }
         }
         Some("srcflp") => {
@@ -1345,6 +1378,7 @@ async fn render_feed_page_impl(
         let iv_mark = if c.iv_overridden { "✏️" } else { "🔗" };
         let cm_mark = if c.cm_overridden { "✏️" } else { "🔗" };
         let sd_mark = if c.sd_overridden { "✏️" } else { "🔗" };
+        let cp_mark = if c.cp_overridden { "✏️" } else { "🔗" };
         let lp_mark = if c.lp_overridden { "✏️" } else { "🔗" };
         text.push_str(
             &i18n::t(lang, "feed_config")
@@ -1354,6 +1388,8 @@ async fn render_feed_page_impl(
                 .replacen("{}", cm_mark, 1)
                 .replacen("{}", fmt_source_display(lang, &c.source_display), 1)
                 .replacen("{}", sd_mark, 1)
+                .replacen("{}", if c.caption_above_media { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1)
+                .replacen("{}", cp_mark, 1)
                 .replacen("{}", if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1)
                 .replacen("{}", lp_mark, 1),
         );
@@ -1380,9 +1416,10 @@ async fn render_feed_page_impl(
     ]);
 
 
-    // Feed-level overrides: each option opens a second-level page (mirrors the
-    // channel settings layout). Labels show the effective value; override state
-    // is shown in the summary above.
+    // Feed-level overrides: interval/mode/source open second-level pages;
+    // caption/link preview toggle in place (mirrors the channel settings
+    // layout). Labels show the effective value; override state is shown in the
+    // summary above.
     if let Some(c) = &cfg {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_interval").replacen("{}", &fmt_interval(lang, c.interval_minutes), 1),
@@ -1395,6 +1432,10 @@ async fn render_feed_page_impl(
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_source").replacen("{}", fmt_source_display(lang, &c.source_display), 1),
             format!("c|srcfsp|{}|{}|{}", sub_id, ch_page, chlist_page),
+        )]);
+        buttons.push(vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "settings_caption").replacen("{}", if c.caption_above_media { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),
+            format!("c|srcfcp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_lp").replacen("{}", if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),

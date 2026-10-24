@@ -142,6 +142,7 @@ pub struct EffectiveConfig {
     pub source_display: String,
     pub caption_above_media: bool,
     pub link_preview: bool,
+    pub cp_overridden: bool,
     pub iv_overridden: bool,
     pub cm_overridden: bool,
     pub sd_overridden: bool,
@@ -645,6 +646,7 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
                   f.interval_minutes IS NOT NULL AS iv_overridden,
                   f.content_mode IS NOT NULL AS cm_overridden,
                   f.source_display IS NOT NULL AS sd_overridden,
+                  f.caption_above_media IS NOT NULL AS cp_overridden,
                   f.link_preview IS NOT NULL AS lp_overridden
            FROM (SELECT 1) AS base
            LEFT JOIN chat_configs c ON c.chat_id = ?1
@@ -665,6 +667,7 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
             source_display: DEFAULT_SOURCE_DISPLAY.to_string(),
             caption_above_media: DEFAULT_CAPTION_ABOVE_MEDIA != 0,
             link_preview: DEFAULT_LINK_PREVIEW != 0,
+            cp_overridden: false,
             iv_overridden: false,
             cm_overridden: false,
             sd_overridden: false,
@@ -679,6 +682,7 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
         source_display: row.get("source_display"),
         caption_above_media: row.get::<i64, _>("caption_above_media") != 0,
         link_preview: row.get::<i64, _>("link_preview") != 0,
+        cp_overridden: row.get::<i64, _>("cp_overridden") != 0,
         iv_overridden: row.get::<i64, _>("iv_overridden") != 0,
         cm_overridden: row.get::<i64, _>("cm_overridden") != 0,
         sd_overridden: row.get::<i64, _>("sd_overridden") != 0,
@@ -840,6 +844,7 @@ pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, Effec
                   f.interval_minutes IS NOT NULL AS iv_overridden,
                   f.content_mode IS NOT NULL AS cm_overridden,
                   f.source_display IS NOT NULL AS sd_overridden,
+                  f.caption_above_media IS NOT NULL AS cp_overridden,
                   f.link_preview IS NOT NULL AS lp_overridden
            FROM subscriptions s
            LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
@@ -1511,6 +1516,46 @@ mod tests {
         assert!(cfg.cm_overridden);
         assert_eq!(cfg.interval_minutes, DEFAULT_INTERVAL_MINUTES);
         assert_eq!(cfg.source_display, DEFAULT_SOURCE_DISPLAY);
+    }
+
+    #[tokio::test]
+    async fn effective_config_caption_override_and_clear() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO chat_configs (chat_id, caption_above_media) VALUES ('1', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_configs (chat_id, feed_url, caption_above_media) VALUES ('1', 'https://example.com/feed', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
+            .await
+            .unwrap();
+        assert!(cfg.caption_above_media);
+        assert!(cfg.cp_overridden);
+
+        // A false override must survive COALESCE instead of falling back to the channel value.
+        set_feed_config_field(&pool, "1", "https://example.com/feed", "caption_above_media", Some("0"))
+            .await
+            .unwrap();
+        let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
+            .await
+            .unwrap();
+        assert!(!cfg.caption_above_media);
+        assert!(cfg.cp_overridden);
+
+        set_feed_config_field(&pool, "1", "https://example.com/feed", "caption_above_media", None)
+            .await
+            .unwrap();
+        let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
+            .await
+            .unwrap();
+        assert!(!cfg.caption_above_media);
+        assert!(!cfg.cp_overridden);
     }
 
     #[tokio::test]
