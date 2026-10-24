@@ -237,6 +237,20 @@ fn referer_for(url: &str) -> Option<&'static str> {
     }
 }
 
+/// Browser-like Accept header for media downloads, per media kind.
+/// Some CDNs behind Cloudflare's managed challenge reject requests that do
+/// not advertise an image/video Accept with a 403 challenge page (e.g. the
+/// wechat2rss img-proxy), even when the User-Agent is browser-like.
+fn media_accept(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        MediaKind::Video => {
+            "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5"
+        }
+        MediaKind::Other => "*/*",
+    }
+}
+
 /// Weibo/Sina thumbnails embed a size segment in the path
 /// (thumbnail/square/bmiddle/mw690/bmw690/orj360/...). Upgrade to `large`
 /// so we always fetch the original instead of a cropped preview.
@@ -1175,7 +1189,8 @@ async fn download_one(
                 // The client has automatic redirects disabled; follow them
                 // manually here.
                 let mut req = client.get(&cur_url)
-                    .timeout(std::time::Duration::from_secs(300));
+                    .timeout(std::time::Duration::from_secs(300))
+                    .header(reqwest::header::ACCEPT, media_accept(*kind));
                 if let Some(referer) = referer_for(url) {
                     req = req.header("Referer", referer);
                 }
@@ -1594,6 +1609,19 @@ mod tests {
         assert!(is_weibo_host("f.video.weibocdn.com"));
         assert!(!is_weibo_host("evilweibo.com"));
         assert!(!is_weibo_host("notsinaimg.cn"));
+    }
+
+    #[test]
+    fn media_accept_is_browser_like_per_kind() {
+        // Cloudflare-fronted media proxies 403 on a missing Accept header even
+        // with a browser UA, so each kind must advertise its media type.
+        let img = media_accept(MediaKind::Image);
+        assert!(img.starts_with("image/"));
+        assert!(img.contains("image/*"));
+        let video = media_accept(MediaKind::Video);
+        assert!(video.starts_with("video/"));
+        assert!(video.contains("video/*"));
+        assert_eq!(media_accept(MediaKind::Other), "*/*");
     }
 
     #[test]
