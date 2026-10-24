@@ -391,7 +391,11 @@ async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
         .send()
         .await
         .ok()?;
-    let text = resp.text().await.ok()?;
+    // The response is a tiny JSONP body, but it still comes from an external
+    // endpoint: use the shared 20MB capped reader instead of an unbounded
+    // .text() buffering path.
+    let body = crate::fetcher::read_body_capped(resp, "weibo visitor genvisitor").await.ok()?;
+    let text = String::from_utf8_lossy(&body).into_owned();
 
     // The response is JSONP: gen_callback({...}); strip the wrapper to get
     // the JSON
