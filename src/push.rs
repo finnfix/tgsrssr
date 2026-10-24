@@ -1682,7 +1682,9 @@ pub async fn send_entry_msg(
     // If the footer itself exceeds SAFE_LIMIT it is truncated (cannot happen
     // in practice; purely defensive).
     let footer: String = if visible_len(footer) > SAFE_LIMIT - 2 {
-        take_utf16_prefix(footer, SAFE_LIMIT - 2).to_string()
+        // HTML-aware: a raw UTF-16 cut can split an <a>/<i> tag or entity.
+        let (cut, _) = truncate_html_keep_links(footer, SAFE_LIMIT - 3);
+        format!("{cut}…")
     } else {
         footer.to_string()
     };

@@ -263,7 +263,17 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         // Truncate when a single line itself exceeds the limit (very long title + URL),
         // so a send failure doesn't abort the remaining chunks.
         let line = if push::utf16_len(&line) > LIST_CHUNK_LIMIT {
-            format!("{}…", push::take_utf16_prefix(&line, LIST_CHUNK_LIMIT - 1))
+            // Truncating raw HTML can split a tag/entity and make the whole
+            // message unparsable. Truncate on the rendered HTML instead.
+            let (cut, truncated) = crate::htmltext::truncate_html_keep_links(
+                &line,
+                LIST_CHUNK_LIMIT.saturating_sub(1),
+            );
+            if truncated {
+                format!("{cut}…")
+            } else {
+                cut
+            }
         } else {
             line
         };
@@ -342,7 +352,19 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // Check whether it's already subscribed first: if active, skip the fetch and notify
         // directly, avoiding a pointless network request (for Weibo/X sources this also
         // helps with risk control).
-        let existing = try_or_reply!(bot, msg.chat.id, lang, db::get_subscription_by_url(&state.db, &chat_id, url_str).await);
+        // Do not use try_or_reply! here: a mid-batch DB error must not abort
+        // the whole command and discard the results already accumulated (the
+        // add path below intentionally behaves the same way).
+        let existing = match db::get_subscription_by_url(&state.db, &chat_id, url_str).await {
+            Ok(v) => v,
+            Err(e) => {
+                results.push(
+                    i18n::t(lang, "sub_check_failed")
+                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
+                );
+                continue;
+            }
+        };
         if let Some(ref sub) = existing {
             if sub.active == 1 {
                 let display_title = sub.feed_title.clone().unwrap_or_else(|| url_str.to_string());
@@ -436,13 +458,31 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
             .replacen("{}", &push::escape_html(&title), 1)
     };
     let text = format!("{}\n{}", header, results.join("\n"));
-    // Unified blockquote folding rule (fold at >110 chars), consistent with pushes/notifications.
+    // Unified blockquote folding rule, consistent with pushes/notifications.
     let text = push::normalize_blockquote_fold(&text);
 
-    bot.send_message(msg.chat.id, &text)
-        .parse_mode(ParseMode::Html)
-        .link_preview_options(no_preview())
-        .await?;
+    // A batch of URLs (and their titles/errors) can easily exceed Telegram's
+    // 4096 limit. Split the accumulated summary instead of failing the whole
+    // command after the subscriptions were already written.
+    let chunks = crate::htmltext::split_html(&text, 4000);
+    let chunks = if chunks.is_empty() { vec![text] } else { chunks };
+    let mut first_msg: Option<teloxide::types::MessageId> = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut req = bot
+            .send_message(msg.chat.id, chunk)
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(no_preview());
+        if let Some(first) = first_msg {
+            req = req.reply_parameters(teloxide::types::ReplyParameters::new(first));
+        }
+        let m = req.await?;
+        if first_msg.is_none() {
+            first_msg = Some(m.id);
+        }
+        if i + 1 < chunks.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+    }
     Ok(())
 }
 
@@ -798,7 +838,7 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
                     let chats = match db::list_chats(&state.db, user_id).await {
                         Ok(c) => c,
                         Err(e) => {
-                            bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{}", &format!("{:#}", e), 1)).await?;
+                            bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
                             return Ok(());
                         }
                     };
@@ -1064,7 +1104,12 @@ pub async fn handle_pending_op(
                 }
                 text.to_string()
             };
-            match db::set_feed_filter_keywords(&state.db, &sub.chat_id, &sub.feed_url, &keywords).await {
+            let save_res = if keywords.is_empty() {
+                db::clear_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
+            } else {
+                db::set_feed_filter_keywords(&state.db, &sub.chat_id, &sub.feed_url, &keywords).await
+            };
+            match save_res {
                 Ok(_) => {
                     tracing::info!(sub_id = sub_id, user_id = user_id, cleared = keywords.is_empty(), "filter keywords updated");
                     let status = if keywords.is_empty() {

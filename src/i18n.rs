@@ -114,6 +114,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "sub_usage") => "Usage: <code>/sub &lt;channel&gt; &lt;RSS URL&gt;</code>",
         (Lang::Zh, "sub_already") => "• <a href=\"{}\">{}</a>（已在订阅中）",
         (Lang::En, "sub_already") => "• <a href=\"{}\">{}</a> (already subscribed)",
+        (Lang::Zh, "sub_check_failed") => "• 检查订阅失败：\n<blockquote>{}</blockquote>",
+        (Lang::En, "sub_check_failed") => "• Subscription check failed:\n<blockquote>{}</blockquote>",
         (Lang::Zh, "sub_fetch_failed") => "• 抓取失败：\n<blockquote>{}</blockquote>",
         (Lang::En, "sub_fetch_failed") => "• Fetch failed:\n<blockquote>{}</blockquote>",
         (Lang::Zh, "sub_add_failed") => "• 添加失败：\n<blockquote>{}</blockquote>",
@@ -363,6 +365,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // ===== Filter page =====
         (Lang::Zh, "filter_on") => "已开启",
         (Lang::En, "filter_on") => "Enabled",
+        (Lang::Zh, "filter_on_no_keywords") => "已开启（未设置关键词，暂不生效）",
+        (Lang::En, "filter_on_no_keywords") => "Enabled (no keywords yet; not applied)",
         (Lang::Zh, "filter_off") => "已关闭",
         (Lang::En, "filter_off") => "Disabled",
         (Lang::Zh, "filter_wl_desc") => "白名单（仅推送含关键词的条目）",

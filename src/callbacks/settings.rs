@@ -402,7 +402,15 @@ pub(super) async fn render_feed_filter_impl(
     };
     let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
 
-    let status = if fc.is_active() { i18n::t(lang, "filter_on") } else { i18n::t(lang, "filter_off") };
+    let status = if fc.is_active() {
+        i18n::t(lang, "filter_on")
+    } else if fc.enabled {
+        // The switch is on but no keywords are configured: say so instead of
+        // claiming "off" while the toggle button says "disable".
+        i18n::t(lang, "filter_on_no_keywords")
+    } else {
+        i18n::t(lang, "filter_off")
+    };
     let mode_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_wl_desc") } else { i18n::t(lang, "filter_bl_desc") };
     let kw_display = if fc.keywords.is_empty() {
         i18n::t(lang, "none").to_string()
