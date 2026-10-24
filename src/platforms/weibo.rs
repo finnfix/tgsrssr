@@ -752,6 +752,65 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
     }
 }
 
+/// Append the topic-card cover for the main status when the whole entry has no
+/// other media. Weibo renders a compact cover next to a `#topic#` tag
+/// (`page_info.type == "search_topic"`); the field is present in both the
+/// getIndex timeline and statuses/show, so no extra request is needed.
+///
+/// Only the main status is handled on purpose: retweet media is rendered
+/// inside a blockquote, while extracted images are sent as ordinary entry
+/// media, so pulling a retweeted topic cover would lose its quoted context.
+///
+/// The platform falls back to a generic `topic_page*.png` icon for topics
+/// without an uploaded cover; those are filtered out to avoid attaching a
+/// platform placeholder instead of post content.
+fn append_weibo_topic_cover(body: &mut String, mblog: &Value, inline_images: &[String]) {
+    // Any extracted media (pics / video / live or article cover) or pending
+    // inline "view image" attachment means the entry is not media-less; do
+    // not add a topic cover on top of it.
+    if !inline_images.is_empty() || body.contains("<img") || body.contains("<video") {
+        return;
+    }
+    let page_info = &mblog["page_info"];
+    if page_info["type"].as_str() != Some("search_topic") {
+        return;
+    }
+    // pic_num > 0 means the post declares photos even if extraction failed
+    // (deleted / member-only / truncated); a topic cover must not mask that.
+    if mblog["pic_num"].as_u64().unwrap_or(0) > 0 {
+        return;
+    }
+    let rt = &mblog["retweeted_status"];
+    if !rt.is_null() {
+        if rt["pic_num"].as_u64().unwrap_or(0) > 0 {
+            return;
+        }
+        // A retweeted video/live/article without a usable stream or cover has
+        // no body media either; do not replace it with a topic cover.
+        if matches!(
+            rt["page_info"]["type"].as_str(),
+            Some("video") | Some("live") | Some("article")
+        ) {
+            return;
+        }
+    }
+    let url = page_info["page_pic"]["url"]
+        .as_str()
+        .or_else(|| page_info["page_pic"].as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    if url.is_empty() || is_placeholder_topic_cover(url) {
+        return;
+    }
+    body.push_str(&img_tag(url));
+}
+
+/// Weibo's generic fallback icon for topics without an uploaded cover.
+/// Example: https://n.sinaimg.cn/photo/5b5e52aa/20161115/topic_page_2x.png
+fn is_placeholder_topic_cover(url: &str) -> bool {
+    url.contains("n.sinaimg.cn/photo/") && url.contains("topic_page")
+}
+
 /// Convert one mblog JSON object into a feed-rs Entry + structured metadata.
 /// `full_text` (when Some) replaces the truncated list text for long weibos.
 /// `rt_full_text` (when Some) does the same for the retweeted status.
@@ -859,22 +918,30 @@ fn mblog_to_entry(
         let mut rt_body = rt_text.clone();
         append_weibo_media(&mut rt_body, rt, &rt_mid);
         // Header + retweet body in ONE blockquote, single line:
-        // "Retweeted @user: original post content" (the template below starts
-        // with the Chinese word for "Retweeted").
+        // "Repost @user: original post content" (the repost verb follows the
+        // owner language via i18n).
         // A single \n separates the original text from the quote block
         // (visually one line break); split_html recognises original text
         // stuck right before a quote block and handles it separately, so the
         // original text is not wrapped into the quote block.
         // Deleted/unavailable retweets can arrive as a non-null object with
         // no text and no media. Rendering those produced an empty
-        // "转发 @已注销: " quote; skip the block entirely.
+        // "@deleted-user: " quote; skip the block entirely.
         if !rt_body.trim().is_empty() {
             body.push_str(&format!(
-                "\n<blockquote>转发 {}: {}</blockquote>",
-                rt_user_html, rt_body
+                "\n<blockquote>{} {}: {}</blockquote>",
+                i18n::t(lang, "weibo_repost"),
+                rt_user_html,
+                rt_body
             ));
         }
     }
+
+    // Topic-card cover: a media-less entry whose main post carries a `#topic#`
+    // tag still has a cover image in getIndex/statuses/show. Run after the
+    // retweet blockquote so the "entry has media" check sees retweet pictures
+    // and videos too.
+    append_weibo_topic_cover(&mut body, mblog, &main_inline_imgs);
 
     // Collect main-post inline images (from [View image] links) into sidecar.
     // Group C: no longer inject <img data-rt="1"> into body; pass them via
@@ -2061,6 +2128,145 @@ mod tests {
         let out = render_weibo_markdown(input);
         assert!(out.contains("# comment"), "out: {}", out);
         assert!(!out.contains("<b>comment</b>"), "out: {}", out);
+    }
+
+    // ── Topic-card cover tests ──
+
+    fn topic_mblog(pic_url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "page_info": {
+                "type": "search_topic",
+                "page_pic": {"url": pic_url}
+            },
+            "pic_num": 0
+        })
+    }
+
+    #[test]
+    fn topic_cover_added_when_entry_has_no_media() {
+        let mblog = topic_mblog("https://wx3.sinaimg.cn/large/topic.jpg");
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert!(
+            body.contains(
+                r#"<img src="https://wx3.sinaimg.cn/large/topic.jpg" referrerpolicy="no-referrer">"#
+            ),
+            "body: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn topic_cover_accepts_string_form_and_escapes_url() {
+        let mblog = serde_json::json!({
+            "page_info": {
+                "type": "search_topic",
+                "page_pic": "https://wx3.sinaimg.cn/large/topic.jpg?a=1&b=2"
+            },
+            "pic_num": 0
+        });
+        let mut body = String::new();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert!(body.contains("a=1&amp;b=2"), "body: {}", body);
+    }
+
+    #[test]
+    fn topic_cover_skipped_when_body_has_media() {
+        let mblog = topic_mblog("https://wx3.sinaimg.cn/large/topic.jpg");
+        let original = r#"<img src="https://wx1.sinaimg.cn/large/pic.jpg">"#.to_string();
+        let mut body = original.clone();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn topic_cover_skipped_when_inline_image_exists() {
+        let mblog = topic_mblog("https://wx3.sinaimg.cn/large/topic.jpg");
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(
+            &mut body,
+            &mblog,
+            &["https://wx1.sinaimg.cn/large/inline.jpg".to_string()],
+        );
+        assert_eq!(body, "text");
+    }
+
+    #[test]
+    fn topic_cover_skipped_for_placeholder_image() {
+        let mblog = topic_mblog(
+            "https://n.sinaimg.cn/photo/5b5e52aa/20161115/topic_page_2x.png",
+        );
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert_eq!(body, "text");
+    }
+
+    #[test]
+    fn topic_cover_skipped_when_pic_num_declares_media() {
+        let mut mblog = topic_mblog("https://wx3.sinaimg.cn/large/topic.jpg");
+        mblog["pic_num"] = serde_json::json!(1);
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert_eq!(body, "text");
+    }
+
+    #[test]
+    fn topic_cover_skipped_when_retweet_declares_media() {
+        let mut mblog = topic_mblog("https://wx3.sinaimg.cn/large/topic.jpg");
+        mblog["retweeted_status"] = serde_json::json!({
+            "pic_num": 0,
+            "page_info": {"type": "video"}
+        });
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert_eq!(body, "text");
+    }
+
+    #[test]
+    fn topic_cover_skipped_for_other_page_info_types() {
+        let mblog = serde_json::json!({
+            "page_info": {
+                "type": "video",
+                "page_pic": {"url": "https://wx3.sinaimg.cn/large/cover.jpg"}
+            },
+            "pic_num": 0
+        });
+        let mut body = "text".to_string();
+        append_weibo_topic_cover(&mut body, &mblog, &[]);
+        assert_eq!(body, "text");
+    }
+
+    #[test]
+    fn mblog_to_entry_adds_topic_cover_to_media_less_poll_post() {
+        let mblog = serde_json::json!({
+            "id": 5357578391653803u64,
+            "bid": "Ro9Sn6Wef",
+            "text": "text #topic# <a href='http://t.cn/AXjti0FG'><span class='url-icon'><img style='width:1rem;height:1rem' src='//h5.sinaimg.cn/upload/2015/09/25/3/timeline_card_small_web_default.png'></span> <span class='surl-text'>网页链接</span></a>",
+            "created_at": "Sat Oct 24 16:14:00 +0800 2026",
+            "page_info": {
+                "type": "search_topic",
+                "page_pic": {"url": "https://wx3.sinaimg.cn/large/topic.jpg"}
+            },
+            "pic_num": 0
+        });
+        let vote = serde_json::json!({
+            "content": "question",
+            "is_multi_select": 0,
+            "vote_list": [{"content": "A"}, {"content": "B"}]
+        });
+        let (entry, meta) = mblog_to_entry(
+            &mblog,
+            "2334162530",
+            "1818黄金眼",
+            None,
+            None,
+            Some(&vote),
+            Lang::Zh,
+        )
+        .expect("entry should be built");
+        let body = entry.content.and_then(|c| c.body).unwrap_or_default();
+        assert!(body.contains("https://wx3.sinaimg.cn/large/topic.jpg"), "body: {}", body);
+        assert!(meta.poll.is_some());
     }
 
 }
