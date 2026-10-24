@@ -434,6 +434,20 @@ enum FeedStatus {
     Failed,
 }
 
+/// True when another sender already owns this entry: either it was delivered
+/// (possibly by the outbox retry, after the batch snapshot was taken) or it is
+/// queued in the outbox, which has sole retry authority. A DB error is an
+/// error, never "not handled": the caller must defer rather than send.
+async fn entry_already_handled(
+    state: &AppState,
+    chat_id: &str,
+    feed_url: &str,
+    entry_id: &str,
+) -> anyhow::Result<bool> {
+    let (sent, queued) = db::entry_dedup_state(&state.db, chat_id, feed_url, entry_id).await?;
+    Ok(sent || queued)
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -485,14 +499,21 @@ async fn process_feed(
     // proxy/network connection errors that recover on their own after a few
     // seconds; a single retry can save the round.
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
-    // Batch sent-entry set: platform fetchers use it to skip enrichment
-    // requests for already-pushed entries (Weibo detail/vote, X pagination),
-    // and the push filter below reuses it instead of one query per entry.
-    let known_sent = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+    // Batch sent-entry snapshot for platform enrichment only (Weibo detail /
+    // vote, X pagination). It is deliberately not used for the final push
+    // filter: it is taken before the fetch and can go stale while an
+    // overlapping outbox retry finishes the same entry. A failed read must
+    // also fail closed — treating it as "nothing sent" would re-push the whole
+    // source window.
+    let known_sent_snapshot = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(feed = %cfg.feed_url, error = %e, "sent-entry batch query failed, treating as empty");
-            std::collections::HashSet::new()
+            warn!(
+                feed = %cfg.feed_url,
+                error = %e,
+                "sent-entry batch query failed, deferring feed"
+            );
+            return Ok(FeedStatus::Failed);
         }
     };
     let result = fetcher::fetch_feed(
@@ -500,7 +521,7 @@ async fn process_feed(
         &sub.feed_url,
         sub.http_etag.as_deref(),
         sub.http_last_modified.as_deref(),
-        Some(&known_sent),
+        Some(&known_sent_snapshot),
     )
     .await;
     let result = match result {
@@ -524,7 +545,7 @@ async fn process_feed(
                 &sub.feed_url,
                 sub.http_etag.as_deref(),
                 sub.http_last_modified.as_deref(),
-                Some(&known_sent),
+                Some(&known_sent_snapshot),
             )
             .await
         }
@@ -623,14 +644,31 @@ async fn process_feed(
             // channel's message stream.
             // Cross-cycle double-send guard: an entry queued in the outbox but
             // not yet in sent_entries must be skipped — the outbox has sole
-            // retry authority. Both sets are batch-queried once per feed
-            // instead of two queries per entry; the outbox batch keeps the
-            // documented fail-open semantics (a query error acts as empty).
+            // retry authority. These sets are queried again after the fetch:
+            // the pre-fetch snapshot is only for enrichment and may be stale
+            // (an overlapping outbox retry can finish while the fetch runs).
+            // A read error must fail closed and leave the headers untouched,
+            // so the whole feed is retried next round instead of being pushed.
+            let known_sent = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        feed = %cfg.feed_url,
+                        error = %e,
+                        "sent-entry batch query failed after fetch, deferring feed"
+                    );
+                    return Ok(FeedStatus::Failed);
+                }
+            };
             let outbox_ids = match db::outbox_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(feed = %cfg.feed_url, error = %e, "outbox batch query failed, treating as empty");
-                    std::collections::HashSet::new()
+                    warn!(
+                        feed = %cfg.feed_url,
+                        error = %e,
+                        "outbox batch query failed after fetch, deferring feed"
+                    );
+                    return Ok(FeedStatus::Failed);
                 }
             };
             // Cooperative deadline covers filtering too: a 20MB feed can hold
@@ -640,6 +678,10 @@ async fn process_feed(
                 + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
             let mut deferred = false;
             let mut pending: Vec<&feed_rs::model::Entry> = Vec::new();
+            // The same source can repeat an entry id within one response; the
+            // sent-entry sets cannot know about the copy sent earlier in this
+            // loop, so dedupe explicitly.
+            let mut seen_eids: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (idx, entry) in fr.entries.iter().enumerate() {
                 if idx % 256 == 0 && tokio::time::Instant::now() >= deadline {
                     warn!(
@@ -650,6 +692,9 @@ async fn process_feed(
                     break;
                 }
                 let eid = fetcher::entry_id(entry);
+                if !seen_eids.insert(eid.clone()) {
+                    continue;
+                }
                 if known_sent.contains(&eid) {
                     continue;
                 }
@@ -692,6 +737,28 @@ async fn process_feed(
                     break;
                 }
                 let eid = fetcher::entry_id(entry);
+                // Recheck right before doing any work: the batch sets were
+                // queried after the fetch but an overlapping outbox retry can
+                // still finish between that query and this entry. Skipping a
+                // delivered/queued entry is safe; a DB error is not, because
+                // sending without dedup could double-post.
+                match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, &eid).await {
+                    Ok(true) => {
+                        debug!(feed = %cfg.feed_url, entry_id = %eid, "entry already handled, skipping");
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            feed = %cfg.feed_url,
+                            entry_id = %eid,
+                            error = %e,
+                            "entry dedup recheck failed, deferring remaining entries"
+                        );
+                        deferred = true;
+                        break;
+                    }
+                }
                 // Group-C sidecar: look up structured metadata by entry_id
                 // (populated by platform sources, always empty for RSS sources).
                 let meta = fr.metas.get(&eid);
@@ -821,6 +888,29 @@ async fn process_feed(
                 if opts.mode == ContentMode::MediaOnly {
                     let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
                     db::delete_setting(&state.db, &retry_key).await.ok();
+                }
+
+                // Second recheck directly before the send: media preparation
+                // can take minutes (downloads + ffprobe), long enough for an
+                // overlapping outbox retry to deliver this same entry. The
+                // batch sets are already stale by now; this is the last cheap
+                // guard before the Telegram call.
+                match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, &eid).await {
+                    Ok(true) => {
+                        debug!(feed = %cfg.feed_url, entry_id = %eid, "entry handled during preparation, skipping send");
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            feed = %cfg.feed_url,
+                            entry_id = %eid,
+                            error = %e,
+                            "pre-send dedup recheck failed, deferring remaining entries"
+                        );
+                        deferred = true;
+                        break;
+                    }
                 }
 
                 let author = fetcher::entry_author(entry);

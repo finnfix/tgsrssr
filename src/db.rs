@@ -441,6 +441,30 @@ pub async fn outbox_entry_ids(
     Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
 }
 
+/// Ask both dedup tables about one entry in a single query. The scheduler
+/// rechecks this immediately before sending: the batch snapshots taken before
+/// the fetch can go stale while an overlapping outbox retry finishes the same
+/// entry, and a duplicate push is worse than one extra indexed lookup.
+/// Returns (already_sent, queued_in_outbox). Callers must fail closed on Err.
+pub async fn entry_dedup_state(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    entry_id: &str,
+) -> anyhow::Result<(bool, bool)> {
+    let row = sqlx::query(
+        r#"SELECT
+             EXISTS(SELECT 1 FROM sent_entries WHERE chat_id = ?1 AND feed_url = ?2 AND entry_id = ?3) AS sent,
+             EXISTS(SELECT 1 FROM outbox WHERE chat_id = ?1 AND feed_url = ?2 AND entry_id = ?3) AS queued"#,
+    )
+    .bind(chat_id)
+    .bind(feed_url)
+    .bind(entry_id)
+    .fetch_one(db)
+    .await?;
+    Ok((row.get::<i64, _>("sent") != 0, row.get::<i64, _>("queued") != 0))
+}
+
 pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     // Drop pending outbox retries for this subscription first (while the
     // subscriptions row still exists so the correlated lookup works).
@@ -1448,5 +1472,57 @@ mod tests {
         assert_eq!(DEFAULT_SOURCE_DISPLAY, "source");
         assert_eq!(DEFAULT_CAPTION_ABOVE_MEDIA, 0);
         assert_eq!(DEFAULT_LINK_PREVIEW, 1);
+    }
+
+    #[tokio::test]
+    async fn entry_dedup_state_reports_sent_and_queued() {
+        // Single connection: every sqlite::memory: connection would otherwise
+        // see its own empty database.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        mark_entry_sent(&pool, "1", "https://example.com/feed", "sent-entry")
+            .await
+            .unwrap();
+        outbox_insert(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "queued-entry",
+            "Feed",
+            "{}",
+            "[]",
+            "",
+            "title_link",
+            "source",
+            true,
+            false,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "sent-entry").await.unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "queued-entry").await.unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "new-entry").await.unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            entry_dedup_state(&pool, "1", "https://example.com/other", "sent-entry").await.unwrap(),
+            (false, false)
+        );
     }
 }
