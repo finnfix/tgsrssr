@@ -615,7 +615,7 @@ pub fn html_to_telegram_html(html: &str) -> String {
     buf.push_str(&s[last..]);
 
     // 4) Flatten remaining markup, decode entities, escape for Telegram.
-    //    `decode_entities` is the visible-text decoder: it maps HTML 4.01
+    //    `decode_entities` is the visible-text decoder: it maps HTML5
     //    named entities like `&nbsp;`/`&mdash;` and numeric references in a
     //    single pass (so `&amp;lt;` decodes once, not twice). The URL decoder
     //    `unescape_html` leaves named entities literal, and the following

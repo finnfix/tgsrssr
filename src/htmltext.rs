@@ -300,7 +300,7 @@ pub fn format_chat_title_html(title: &str, chat_id: &str) -> String {
     }
 }
 
-/// Decode HTML entities for visible text: HTML 4.01 named references plus
+/// Decode HTML entities for visible text: HTML5 named references plus
 /// numeric references `&#NNN;` / `&#xHHH;`. The scan is single-pass, so an
 /// encoded entity (`&amp;lt;`) decodes exactly once instead of being re-read
 /// as a new entity.
@@ -378,7 +378,7 @@ pub fn strip_html_tags(s: &str) -> String {
 /// Semantically different from decode_entities: this function targets URL
 /// attribute decoding (numeric references first, no characters dropped, only
 /// the markup-critical names), while decode_entities targets visible text
-/// (HTML 4.01 names in a single pass, whitespace control characters kept,
+/// (HTML5 names in a single pass, whitespace control characters kept,
 /// other control characters dropped).
 pub fn unescape_html(s: &str) -> String {
     static RE_ENTITY_NUM: std::sync::LazyLock<regex::Regex> =
@@ -1185,12 +1185,15 @@ mod tests {
     // ===== decode_entities =====
 
     #[test]
-    fn decodes_html4_named_entities() {
+    fn decodes_html5_named_entities() {
         assert_eq!(
             decode_entities("A &mdash; B &hellip; C &rsquo;"),
             "A — B … C ’"
         );
         assert_eq!(decode_entities("x&nbsp;y &copy;"), "x y ©");
+        // HTML5-only names and multi-codepoint replacements.
+        assert_eq!(decode_entities("&check; &NotEqualTilde;"), "✓ \u{2242}\u{338}");
+        assert_eq!(decode_entities("a&NewLine;b"), "a\nb");
         assert_eq!(decode_entities("&amp;lt;"), "&lt;", "entity must decode exactly once");
     }
 
