@@ -308,20 +308,41 @@ async fn wait_for_bot_api(bot: &Bot) -> anyhow::Result<String> {
 
 /// Register the periodic cleanup job.
 async fn register_cleanup_job(sched: &JobScheduler, state: AppState) -> anyhow::Result<()> {
-    let interval = state.config.cleanup_interval_minutes;
-    // The cron minute-field step only accepts 1-59. The default 60 (hourly)
-    // uses the on-the-hour expression directly, avoiding clamp(1,59) turning
-    // 60 into 59, which would trigger twice per hour (minutes 0 and 59).
-    let (expr, interval) = if interval >= 60 || interval == 0 {
-        ("0 0 * * * *".to_string(), 60u64)
+    let interval = if state.config.cleanup_interval_minutes == 0 {
+        60
     } else {
-        (format!("0 */{} * * * *", interval), interval)
+        state.config.cleanup_interval_minutes
     };
+    // The cron minute-field step only accepts 1-59. Intervals of an hour or
+    // more run an hourly tick and gate execution with the configured interval
+    // (previously every value >=60 was silently coerced to hourly, so 120/180
+    // never meant what the README said).
+    let (expr, gate_secs) = if interval >= 60 {
+        ("0 0 * * * *".to_string(), Some(interval.saturating_mul(60)))
+    } else {
+        (format!("0 */{} * * * *", interval), None)
+    };
+    // Startup cleanup already ran; count it as the last run so a long
+    // interval is honored from process start.
+    let last_run = std::sync::Arc::new(std::sync::Mutex::new(Some(std::time::Instant::now())));
 
     sched
         .add(Job::new_async(expr.as_str(), move |_uuid, _l| {
             let state = state.clone();
+            let last_run = last_run.clone();
             Box::pin(async move {
+                if let Some(gate_secs) = gate_secs {
+                    let now = std::time::Instant::now();
+                    let mut last = match last_run.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if last.is_some_and(|prev| now.duration_since(prev).as_secs() < gate_secs) {
+                        return;
+                    }
+                    *last = Some(now);
+                    drop(last);
+                }
                 // Reentrancy protection: a single cleanup round (scanning
                 // multi-GB media dirs + quota + backup) can outlive the
                 // trigger interval; overlapping rounds waste IO. Mirrors the
