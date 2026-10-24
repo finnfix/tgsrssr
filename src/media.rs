@@ -599,6 +599,12 @@ pub struct PreparedMedia {
     /// Videos skipped for exceeding MAX_VIDEO_PUSH_MB (dedicated owner
     /// notice; the entry itself is pushed as text).
     pub oversized_videos: Vec<OversizedVideo>,
+    /// The media storage directory could not be created before any candidate
+    /// was fetched. This is not a per-item download failure: the caller must
+    /// defer the entry instead of retrying the media-only counter or falling
+    /// back to text and marking the entry sent (which would lose the media
+    /// permanently).
+    pub setup_failed: bool,
 }
 
 impl PreparedMedia {
@@ -607,8 +613,23 @@ impl PreparedMedia {
     /// Shared by the scheduler and /test to avoid drift between two
     /// hand-written struct literals.
     pub fn empty() -> Self {
-        Self { items: Vec::new(), warnings: Vec::new(), oversized_videos: Vec::new() }
+        Self {
+            items: Vec::new(),
+            warnings: Vec::new(),
+            oversized_videos: Vec::new(),
+            setup_failed: false,
+        }
     }
+}
+
+/// Create (and return) today's outbound directory. Split out so the failure
+/// path is testable without an AppState: a missing/unwritable media volume is
+/// an environment error, not "the entry has no media".
+fn ensure_outbound_dir(media_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    let date_dir = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let outbound = media_dir.join("outbound").join(date_dir);
+    std::fs::create_dir_all(&outbound)?;
+    Ok(outbound)
 }
 
 /// Outcome of downloading one media item.
@@ -895,12 +916,17 @@ pub async fn prepare_entry_media(
     // write side and delete side must stay paired on the same clock,
     // otherwise a deployment with TZ set (e.g. Asia/Shanghai) would drift
     // media dirs vs the log day boundary.
-    let date_dir = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let outbound = state.config.media_dir.join("outbound").join(&date_dir);
-    if let Err(e) = std::fs::create_dir_all(&outbound) {
-        warn!(dir = %outbound.display(), error = %e, "cannot create outbound dir");
-        return out;
-    }
+    let outbound = match ensure_outbound_dir(&state.config.media_dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!(media_dir = %state.config.media_dir.display(), error = %e, "cannot create outbound dir");
+            // The caller must defer this entry rather than treating an empty
+            // candidate list as "no media": in MediaOnly mode that would mark
+            // the entry sent and lose it forever.
+            out.setup_failed = true;
+            return out;
+        }
+    };
 
     for (raw_url, kind, mime, is_retweet) in candidates {
         // title_summary single-media mode: skip candidates that can never be
@@ -1623,6 +1649,24 @@ mod tests {
         std::fs::write(&path, b"\x89PNG\r\n").unwrap();
         assert!(!sniff_gif(&path));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ensure_outbound_dir_creates_utc_date_dir() {
+        let base = std::env::temp_dir().join(format!("tgsrssr_media_ok_{}", uuid::Uuid::new_v4()));
+        let dir = ensure_outbound_dir(&base).expect("temp media dir should be creatable");
+        assert!(dir.is_dir(), "outbound date dir was not created: {}", dir.display());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ensure_outbound_dir_reports_unusable_media_root() {
+        // A regular file where the media root should be makes create_dir_all
+        // fail deterministically, without touching the filesystem layout.
+        let base = std::env::temp_dir().join(format!("tgsrssr_media_bad_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&base, b"not a directory").unwrap();
+        assert!(ensure_outbound_dir(&base).is_err());
+        std::fs::remove_file(&base).ok();
     }
 
     #[test]

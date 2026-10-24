@@ -677,6 +677,9 @@ async fn process_feed(
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
             let mut deferred = false;
+            // One storage-failure notice per feed per round: a global volume
+            // outage would otherwise send one notice per media entry.
+            let mut storage_notice_sent = false;
             let mut pending: Vec<&feed_rs::model::Entry> = Vec::new();
             // The same source can repeat an entry id within one response; the
             // sent-entry sets cannot know about the copy sent earlier in this
@@ -782,6 +785,22 @@ async fn process_feed(
                     )
                     .await
                 };
+                // The media root/year-level directory could not be created.
+                // This is an environment failure, not "the entry has no
+                // media": defer the entry so nothing is marked sent as text,
+                // keep the negotiation headers stale, and notify the owner
+                // once for this feed. Text-only entries continue normally.
+                if prepared.setup_failed {
+                    deferred = true;
+                    if !storage_notice_sent {
+                        storage_notice_sent = true;
+                        let name = if feed_title.is_empty() { &cfg.feed_url } else { &feed_title };
+                        let msg = i18n::t(lang, "notif_media_storage")
+                            .replacen("{}", &push::escape_html(name), 1);
+                        notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                    }
+                    continue;
+                }
                 let download_warnings = prepared.warnings;
 
                 // Oversized videos: stash for now, record after a successful

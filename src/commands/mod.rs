@@ -649,6 +649,15 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         "/test: media prepared"
     );
 
+    // Media storage could not even be created: do not pretend this entry has
+    // no media (that would silently hide the environment failure).
+    if prepared.setup_failed {
+        let name = if feed_title.is_empty() { &feed_url } else { &feed_title };
+        let notice = i18n::t(lang, "notif_media_storage").replacen("{}", name, 1);
+        test_report(bot, msg.chat.id, progress_id, notice).await;
+        return Ok(());
+    }
+
     // Media-only mode but no media: inform the user explicitly
     if opts.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
         test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_media_only_empty").to_string()).await;

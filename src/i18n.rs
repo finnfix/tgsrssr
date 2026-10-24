@@ -498,6 +498,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "media_dl_empty") => "Media download failed ({}, empty response)",
         (Lang::Zh, "media_dl_failed") => "媒体下载失败（{}）",
         (Lang::En, "media_dl_failed") => "Media download failed ({})",
+        (Lang::Zh, "notif_media_storage") => "媒体存储不可用，本轮已跳过源「{}」，恢复后会自动重试。请检查媒体目录与磁盘空间。",
+        (Lang::En, "notif_media_storage") => "Media storage is unavailable; source \"{}\" was deferred this round and will retry automatically. Check the media directory and disk space.",
 
         // ===== Language switch =====
         (Lang::Zh, "lang_btn") => "语言：中文",
